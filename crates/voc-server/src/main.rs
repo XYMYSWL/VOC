@@ -107,6 +107,8 @@ impl State {
                 deafened: u.deafened,
                 sharing: u.sharing.clone(),
                 decoders: u.decoders.clone(),
+                p2p: u.p2p.is_some(),
+                udp: u.voice_udp,
             })
             .collect();
         users.sort_by_key(|u| u.id);
@@ -738,7 +740,10 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
         ClientMsg::Hello { .. } => {}
         ClientMsg::Transport { udp } => {
             if let Some(u) = st.users.get_mut(&uid) {
-                u.voice_udp = udp;
+                if u.voice_udp != udp {
+                    u.voice_udp = udp;
+                    st.broadcast_state();
+                }
             }
         }
         ClientMsg::JoinChannel { channel_id } => {
@@ -814,14 +819,21 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 .take(8)
                 .collect();
             if let Some(u) = st.users.get_mut(&uid) {
+                let was = u.p2p.is_some();
                 u.p2p = Some(local);
+                if !was {
+                    st.broadcast_state();
+                }
             }
         }
         ClientMsg::P2pDisable => {
             if let Some(u) = st.users.get_mut(&uid) {
-                u.p2p = None;
+                let was = u.p2p.take().is_some();
                 u.direct.clear();
                 u.direct_video.clear();
+                if was {
+                    st.broadcast_state();
+                }
             }
         }
         ClientMsg::E2eAnnounce { mut entry } => {

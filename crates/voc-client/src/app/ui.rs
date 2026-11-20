@@ -195,6 +195,11 @@ impl App {
                 self.demo.quality.iter().filter(|(_, x)| x.2).map(|(id, _)| *id).collect(),
             ),
         };
+        // 打洞状态
+        let (punch, my_p2p): (HashMap<u32, voice::PunchState>, bool) = match self.voice.current_link() {
+            Some(l) => (l.punch_states(), l.p2p_on()),
+            None => (self.demo.punch.clone(), true),
+        };
         // 成员中继路线（me = 我的用户 id）
         let (relay_routes, me_id) = match self.voice.current_link() {
             Some(l) => (l.relays(), Some(l.my_id())),
@@ -423,7 +428,21 @@ impl App {
                                 Some(me) if is_me => relay_routes.iter().filter(|r| r.via == me).count(),
                                 _ => 0,
                             };
-                            if q.is_some() || u.sharing.is_some() || via.is_some() || relaying > 0 {
+                            // 和同频道的人之间的直连状态（自己不显示）
+                            let link_state = if is_me || !here {
+                                None
+                            } else if let Some(st) = punch.get(&u.id) {
+                                Some(th::LinkState::Punch(*st))
+                            } else if !my_p2p {
+                                Some(th::LinkState::MeOff)
+                            } else if !u.p2p {
+                                Some(th::LinkState::ThemOff)
+                            } else if !u.udp {
+                                Some(th::LinkState::ThemTcp)
+                            } else {
+                                Some(th::LinkState::Preparing)
+                            };
+                            if link_state.is_some() || u.sharing.is_some() || relaying > 0 {
                                 ui.horizontal(|ui| {
                                     ui.add_space(48.0);
                                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -433,13 +452,17 @@ impl App {
                                             th::relay_chip(ui, &name_of(r.via), r.ms, r.server_ms, q);
                                         }
                                         (_, Some(q)) => th::quality_chip(ui, q, voice_direct, alloc_video.contains(&u.id)),
-                                        _ => {}
+                                        _ => {
+                                            if let Some(st) = link_state {
+                                                th::link_state_chip(ui, st);
+                                            }
+                                        }
                                     }
                                     if relaying > 0 {
                                         let me = me_id.unwrap_or_default();
-                                        let lines: Vec<String> = relay_routes
+                                        let mine: Vec<&voc_proto::RelayRoute> = relay_routes.iter().filter(|r| r.via == me).collect();
+                                        let lines: Vec<String> = mine
                                             .iter()
-                                            .filter(|r| r.via == me)
                                             .map(|r| {
                                                 format!(
                                                     "{} → {}：{} ms（服务器 {} ms，快 {} ms）",
@@ -451,9 +474,19 @@ impl App {
                                                 )
                                             })
                                             .collect();
-                                        th::pill(ui, format!("🔁 中继 {relaying} 路"), th::GREEN, th::GREEN_SOFT).on_hover_text(format!(
-                                            "你和队友的直连又快又稳，服务器安排你帮 {relaying} 路语音转发（约占上行 {:.2} Mbps）：\n{}\n可以在 设置 → 网络 里关闭。",
-                                            relaying as f64 * voice::VOICE_COST_BPS as f64 / 1e6,
+                                        let mut pairs: Vec<(u32, u32)> = mine.iter().map(|r| (r.from.min(r.to), r.from.max(r.to))).collect();
+                                        pairs.sort();
+                                        pairs.dedup();
+                                        let mut people: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+                                        people.sort();
+                                        people.dedup();
+                                        let label = match pairs.as_slice() {
+                                            [(a, b)] => format!("🔁 帮 {} ↔ {} 中转", name_of(*a), name_of(*b)),
+                                            _ => format!("🔁 帮 {} 人中转", people.len()),
+                                        };
+                                        th::pill(ui, label, th::GREEN, th::GREEN_SOFT).on_hover_text(format!(
+                                            "你和队友的直连又快又稳，服务器安排你帮他们转发语音（约占上行 {:.2} Mbps）：\n{}\n可以在 设置 → 网络 里关闭。",
+                                            mine.len() as f64 * voice::VOICE_COST_BPS as f64 / 1e6,
                                             lines.join("\n")
                                         ));
                                     }
@@ -818,10 +851,13 @@ impl App {
                                 let bad = all.values().filter(|q| q.unstable).count();
                                 let me = l.my_id();
                                 let routes = l.relays();
-                                let relaying = routes.iter().filter(|r| r.via == me).count();
+                                let mut helped: Vec<u32> = routes.iter().filter(|r| r.via == me).flat_map(|r| [r.from, r.to]).collect();
+                                helped.sort();
+                                helped.dedup();
+                                let relaying = helped.len();
                                 let via_others = routes.iter().filter(|r| r.to == me).count();
                                 format!(
-                                    "已打通 {} 人 · 语音直连 {} 人 · 画面直连 {} 人 · 不稳改中转 {} 人 · 经队友中继收听 {} 人 · 我在中继 {} 路",
+                                    "已打通 {} 人 · 语音直连 {} 人 · 画面直连 {} 人 · 不稳改中转 {} 人 · 经队友中继收听 {} 人 · 我在帮 {} 人中转",
                                     all.len(),
                                     v.len(),
                                     d.len(),

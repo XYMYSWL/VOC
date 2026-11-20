@@ -28,22 +28,30 @@ pub enum Chime {
 
 /// 合成提示音（16 kHz 单声道）：两个带包络的柔和正弦音，叠一点二次谐波让声音更圆润
 pub fn chime(kind: Chime) -> Vec<i16> {
-    let (a, b) = (659.25f32, 987.77f32); // E5 → B5
+    // 「噔、噔」两声：每声约 0.17 秒，中间停 0.06 秒；进入低→高，离开高→低
+    let (a, b) = (659.25f32, 987.77f32); // E5、B5
     let notes = match kind {
-        Chime::Join => [(a, 0.085f32), (b, 0.16)],
-        Chime::Leave => [(b, 0.085), (a, 0.16)],
+        Chime::Join => [a, b],
+        Chime::Leave => [b, a],
     };
+    const NOTE: f32 = 0.17;
+    const GAP: f32 = 0.06;
     let sr = SAMPLE_RATE as f32;
     let mut out = Vec::new();
-    for (freq, dur) in notes {
-        let n = (dur * sr) as usize;
+    for (k, freq) in notes.into_iter().enumerate() {
+        if k > 0 {
+            out.extend(std::iter::repeat_n(0i16, (GAP * sr) as usize));
+        }
+        let n = (NOTE * sr) as usize;
         for i in 0..n {
             let t = i as f32 / sr;
-            let attack = (t / 0.006).min(1.0);
-            let release = (-(t / dur) * 4.0).exp();
-            let env = attack * release;
+            let attack = (t / 0.008).min(1.0);
+            // 衰减放慢，尾音更圆；最后 15 ms 淡出到 0，避免咔哒声
+            let release = (-(t / NOTE) * 2.6).exp();
+            let tail = ((NOTE - t) / 0.015).clamp(0.0, 1.0);
+            let env = attack * release * tail;
             let w = std::f32::consts::TAU * freq * t;
-            let v = (w.sin() + 0.25 * (2.0 * w).sin()) * env * 0.22;
+            let v = (w.sin() + 0.3 * (2.0 * w).sin() + 0.08 * (3.0 * w).sin()) * env * 0.2;
             out.push((v * 32767.0) as i16);
         }
     }
@@ -465,6 +473,34 @@ mod tests {
         assert!(j.iter().map(|x| x.unsigned_abs()).max().unwrap() > 3000, "audible");
         assert!(j.iter().map(|x| x.unsigned_abs()).max().unwrap() < 12000, "not too loud");
         assert_ne!(j, l, "join and leave sound different");
+        // 两声之间有停顿，总长约 0.4 秒
+        let secs = j.len() as f32 / SAMPLE_RATE as f32;
+        assert!((0.38..0.5).contains(&secs), "{secs}");
+        let mid = (0.17 * SAMPLE_RATE as f32) as usize + 200;
+        assert!(j[mid..mid + 400].iter().all(|&x| x == 0), "gap between the two notes");
+        // 导出试听：VOC_CHIME_WAV=目录 cargo test -p voc-client chimes
+        if let Ok(dir) = std::env::var("VOC_CHIME_WAV") {
+            for (name, pcm) in [("join.wav", &j), ("leave.wav", &l)] {
+                let mut w = Vec::new();
+                let data_len = (pcm.len() * 2) as u32;
+                w.extend_from_slice(b"RIFF");
+                w.extend_from_slice(&(36 + data_len).to_le_bytes());
+                w.extend_from_slice(b"WAVEfmt ");
+                w.extend_from_slice(&16u32.to_le_bytes());
+                w.extend_from_slice(&1u16.to_le_bytes());
+                w.extend_from_slice(&1u16.to_le_bytes());
+                w.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+                w.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+                w.extend_from_slice(&2u16.to_le_bytes());
+                w.extend_from_slice(&16u16.to_le_bytes());
+                w.extend_from_slice(b"data");
+                w.extend_from_slice(&data_len.to_le_bytes());
+                for s in pcm.iter() {
+                    w.extend_from_slice(&s.to_le_bytes());
+                }
+                std::fs::write(std::path::Path::new(&dir).join(name), w).unwrap();
+            }
+        }
     }
 
     #[test]

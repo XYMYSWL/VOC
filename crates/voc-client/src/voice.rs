@@ -181,6 +181,22 @@ pub struct PeerQuality {
     pub unstable: bool,
 }
 
+/// 和某个成员之间的打洞状态（显示用）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PunchState {
+    /// 端到端成对密钥还没就绪（刚进频道，几秒内就会好）
+    WaitingKeys,
+    /// 正在打洞（已经打了多少秒）
+    Punching(u32),
+    /// 打了 15 秒以上还没打通（之后每 2 秒继续试）
+    Failed(u32),
+    /// 已打通
+    Connected(PeerQuality),
+}
+
+/// 打洞超过这么久没通就算「打不通」（之后仍每 2 秒重试）
+pub const PUNCH_FAST_SECS: u32 = 15;
+
 /// 丢包 ≥ 15%、平均延迟 > 350 ms 或抖动 > 80 ms 视为不稳
 pub fn quality_is_bad(loss_pct: u8, rtt_ms: u32, jitter_ms: u32) -> bool {
     loss_pct >= 15 || rtt_ms > 350 || jitter_ms > 80
@@ -567,6 +583,35 @@ impl Link {
         }
     }
 
+    /// 本机是否开启了 P2P
+    pub fn p2p_on(&self) -> bool {
+        self.p2p_active()
+    }
+
+    /// 每个可直连成员（对方也开了 P2P、UDP 可用）的打洞状态
+    pub fn punch_states(&self) -> HashMap<u32, PunchState> {
+        let peers = self.peers.lock().unwrap();
+        peers
+            .map
+            .iter()
+            .map(|(id, p)| {
+                let st = if p.sealer.is_none() {
+                    PunchState::WaitingKeys
+                } else if p.confirmed {
+                    PunchState::Connected(p.quality)
+                } else {
+                    let secs = p.punch_started.map_or(0, |t| t.elapsed().as_secs() as u32);
+                    if secs < PUNCH_FAST_SECS {
+                        PunchState::Punching(secs)
+                    } else {
+                        PunchState::Failed(secs)
+                    }
+                };
+                (*id, st)
+            })
+            .collect()
+    }
+
     /// 已打通直连的成员及链路质量
     pub fn direct_peers(&self) -> HashMap<u32, PeerQuality> {
         let peers = self.peers.lock().unwrap();
@@ -628,7 +673,7 @@ impl Link {
             if !p.confirmed {
                 // 头 15 秒每 200 ms 打一次洞，之后每 2 秒试一次（对方换了网络等情况）
                 let started = *p.punch_started.get_or_insert(now);
-                let interval = if now.duration_since(started) < Duration::from_secs(15) {
+                let interval = if now.duration_since(started) < Duration::from_secs(PUNCH_FAST_SECS as u64) {
                     Duration::from_millis(200)
                 } else {
                     Duration::from_secs(2)

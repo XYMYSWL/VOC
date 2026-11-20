@@ -574,6 +574,7 @@ struct Demo {
     transport: Option<bool>,
     ping: u32,
     relays: Vec<voc_proto::RelayRoute>,
+    punch: HashMap<u32, voice::PunchState>,
 }
 
 impl App {
@@ -602,6 +603,8 @@ impl App {
             muted,
             deafened,
             sharing: sharing.map(Into::into),
+            p2p: true,
+            udp: true,
         };
         let (_tx, events) = mpsc::channel();
         let mut s = Session {
@@ -617,6 +620,8 @@ impl App {
                 u(3, "阿杰", Some(2), true, false, None),
                 u(4, "小鱼", Some(2), false, false, None),
                 u(5, "Mia", Some(2), false, true, None),
+                u(10, "小林", Some(2), false, false, None),
+                UserInfo { udp: false, ..u(11, "大熊", Some(2), false, false, None) },
                 u(6, "老王", Some(1), false, false, None),
                 u(7, "七七", Some(1), false, false, None),
                 u(9, "豆豆", Some(3), false, false, None),
@@ -657,6 +662,16 @@ impl App {
         // 小鱼和我打不通，经阿豪中继；我帮阿豪把语音转给 Mia
         let rt = |from, to, via, ms, server_ms| voc_proto::RelayRoute { from, to, via, ms, server_ms };
         self.demo.relays = vec![rt(4, 1, 2, 62, 148), rt(1, 4, 2, 62, 148), rt(2, 5, 1, 64, 133)];
+        use voice::PunchState::*;
+        self.demo.punch = [
+            (2, Connected(q(23, 0, 3, false))),
+            (3, Connected(q(48, 1, 6, false))),
+            (4, Failed(42)),
+            (5, Connected(q(37, 0, 4, false))),
+            (10, Punching(3)),
+        ]
+        .into();
+        self.demo.quality.remove(&4); // 小鱼打不通，经阿豪中继
         self.demo.speaking = vec![2];
         self.demo.transport = Some(true);
         self.demo.ping = 49;

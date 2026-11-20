@@ -259,6 +259,68 @@ pub fn relay_chip(ui: &mut egui::Ui, via_name: &str, ms: u32, server_ms: u32, di
     pill(ui, format!("↪ 经 {via_name} {ms} ms"), fg, bg).on_hover_text(relay_compare(via_name, ms, server_ms, direct))
 }
 
+/// 和某个成员之间的直连状态（成员名字下面显示）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkState {
+    Punch(crate::voice::PunchState),
+    /// 我没开 P2P
+    MeOff,
+    /// 对方没开 P2P
+    ThemOff,
+    /// 对方 UDP 不通（走 TCP 隧道）
+    ThemTcp,
+    /// 双方都开了 P2P，等服务器交换地址
+    Preparing,
+}
+
+/// 打洞状态徽章（已打通的用 quality_chip，不走这里）
+pub fn link_state_chip(ui: &mut egui::Ui, st: LinkState) -> egui::Response {
+    use crate::voice::PunchState::*;
+    let fast = crate::voice::PUNCH_FAST_SECS;
+    let (text, tip, fg, bg) = match st {
+        LinkState::Punch(WaitingKeys) | LinkState::Preparing => (
+            "⇄ 准备直连".to_string(),
+            "正在交换端到端密钥和地址，马上开始打洞。现在语音走服务器。".to_string(),
+            TEXT_FAINT,
+            BG_ELEVATED,
+        ),
+        LinkState::Punch(Punching(s)) => (
+            format!("⇄ 打洞中 {s}s"),
+            format!("正在和他建立 P2P 直连（最多快速尝试 {fast} 秒）。打通前语音走服务器。"),
+            YELLOW,
+            YELLOW_SOFT,
+        ),
+        LinkState::Punch(Failed(s)) => (
+            "⇄ 打不通·走服务器".to_string(),
+            format!(
+                "已经尝试 {s} 秒还没打通（通常是两边的路由器都比较严格），语音走服务器；有合适的队友时会改由队友中继。\n仍会每 2 秒重试一次。"
+            ),
+            TEXT_FAINT,
+            BG_ELEVATED,
+        ),
+        LinkState::Punch(Connected(_)) => ("⇄ 已打通".to_string(), String::new(), GREEN, GREEN_SOFT),
+        LinkState::MeOff => (
+            "⇄ 你未开直连".to_string(),
+            "你关闭了 P2P 直连，语音走服务器。可以在 设置 → 网络 打开。".to_string(),
+            TEXT_FAINT,
+            BG_ELEVATED,
+        ),
+        LinkState::ThemOff => ("⇄ 对方未开直连".to_string(), "对方关闭了 P2P 直连，语音走服务器。".to_string(), TEXT_FAINT, BG_ELEVATED),
+        LinkState::ThemTcp => (
+            "⇄ 对方 UDP 不通".to_string(),
+            "对方的网络封锁了 UDP，只能经服务器的加密 TCP 通道，无法直连，延迟会高一些。".to_string(),
+            TEXT_FAINT,
+            BG_ELEVATED,
+        ),
+    };
+    let r = pill(ui, text, fg, bg);
+    if tip.is_empty() {
+        r
+    } else {
+        r.on_hover_text(tip)
+    }
+}
+
 /// 分段选择（像一排胶囊按钮）
 pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let mut changed = false;

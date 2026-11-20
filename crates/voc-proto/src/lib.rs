@@ -220,6 +220,12 @@ pub struct UserInfo {
     /// 能解码的视频格式；旧版客户端为空（视为只支持 h264）
     #[serde(default)]
     pub decoders: Vec<String>,
+    /// 开启了 P2P 直连（显示打洞状态用）
+    #[serde(default)]
+    pub p2p: bool,
+    /// 语音走 UDP（false = UDP 不通，走 TCP 隧道，无法直连）
+    #[serde(default)]
+    pub udp: bool,
 }
 
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
