@@ -44,6 +44,10 @@ struct Persisted {
     p2p_budget_mbps: u32,
     /// 允许帮队友中转语音（成员中继）
     relay: bool,
+    /// 关闭窗口时缩到托盘（语音不断）
+    close_to_tray: bool,
+    /// 上次所在的语音频道（按服务器），开机自启自动登录后回到这里
+    last_channel: HashMap<String, u32>,
     /// 观看屏幕共享时用显卡硬解
     hw_decode: bool,
     /// 启动时检查更新
@@ -86,6 +90,8 @@ impl Default for Persisted {
             share: ShareConfig::default(),
             p2p_budget_mbps: 15,
             relay: true,
+            close_to_tray: true,
+            last_channel: HashMap::new(),
             hw_decode: false,
             auto_update: true,
             sfx: true,
@@ -242,6 +248,14 @@ pub struct App {
     egui_ctx: egui::Context,
     /// VOC_AUTOLOGIN 测试模式：不保存配置
     test_mode: bool,
+    tray: Option<crate::tray::Tray>,
+    /// 用户选了「退出」：真正关闭，不缩到托盘
+    quitting: bool,
+    /// 窗口当前是否隐藏在托盘
+    hidden: bool,
+    autostart: crate::autostart::AutoStart,
+    devices: Arc<Mutex<Option<audio::DeviceSnapshot>>>,
+    last_device_check: std::time::Instant,
     demo: Demo,
 }
 
@@ -313,11 +327,33 @@ impl App {
             egui_ctx: cc.egui_ctx.clone(),
             demo: Demo::default(),
             test_mode: false,
+            tray: None,
+            quitting: false,
+            hidden: false,
+            autostart: crate::autostart::AutoStart::Off,
+            devices: audio::watch_devices(cc.egui_ctx.clone()),
+            last_device_check: std::time::Instant::now(),
         };
         app.restart_audio();
         app.apply_denoise();
+        if std::env::var("VOC_DEMO").is_err() {
+            let icon = crate::window_icon();
+            app.tray = crate::tray::Tray::new(&cc.egui_ctx, icon.rgba, icon.width, icon.height);
+            app.autostart = crate::autostart::state();
+        }
+        let at_startup = crate::autostart::launched_at_startup();
+        app.hidden = at_startup;
+        if at_startup && app.tray.is_none() {
+            // 托盘建不起来就别藏窗口
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            app.hidden = false;
+        }
         if let Ok(kind) = std::env::var("VOC_DEMO") {
             app.load_demo(&kind);
+        } else if at_startup && !app.cfg.server.trim().is_empty() && !app.code_input.trim().is_empty() {
+            // 开机自启：自动登录上次的服务器并回到上次的频道
+            app.start_connect(&cc.egui_ctx);
+            app.rejoin = app.cfg.last_channel.get(app.cfg.server.trim()).copied();
         } else if let Ok(spec) = std::env::var("VOC_AUTOLOGIN") {
             // 测试用：VOC_AUTOLOGIN="地址|昵称|授权码|频道ID"，自动登录并进频道；不读写保存的配置
             let parts: Vec<&str> = spec.split('|').collect();
@@ -513,6 +549,95 @@ impl App {
         d
     }
 
+    /// 窗口隐藏时也要跑的事：网络、托盘、关窗口缩托盘、更新、设备拔插
+    fn background(&mut self, ctx: &egui::Context) {
+        if self.updater.get() == crate::update::UpdateState::Launched {
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if let Some(d) = self.poll_network() {
+            if d.retry && !self.demo.active {
+                self.begin_reconnect(d.reason);
+            } else {
+                self.go_login(Some(d.reason));
+            }
+        }
+        // 托盘
+        let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        for a in actions {
+            match a {
+                crate::tray::TrayAction::Show => {
+                    self.hidden = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                crate::tray::TrayAction::ToggleMute => {
+                    self.settings.muted.fetch_xor(true, Ordering::Relaxed);
+                    self.sync_voice_state();
+                }
+                crate::tray::TrayAction::ToggleDeaf => {
+                    self.settings.deafened.fetch_xor(true, Ordering::Relaxed);
+                    self.sync_voice_state();
+                }
+                crate::tray::TrayAction::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if let Some(t) = &self.tray {
+            let (m, d) = (self.settings.muted.load(Ordering::Relaxed), self.settings.deafened.load(Ordering::Relaxed));
+            let status = match &self.screen {
+                Screen::Main(s) => {
+                    let ch = s.me().and_then(|u| u.channel_id).and_then(|c| s.channels.iter().find(|x| x.id == c)).map(|c| c.name.clone());
+                    let mut st = ch.map(|c| format!("在「{c}」")).unwrap_or_else(|| "已连接".into());
+                    if d {
+                        st.push_str(" · 已静音");
+                    } else if m {
+                        st.push_str(" · 已闭麦");
+                    }
+                    st
+                }
+                Screen::Reconnecting(_) => "正在重连…".into(),
+                _ => "未连接".into(),
+            };
+            t.set_state(m, d, &status);
+        }
+        // 关窗口 → 缩到托盘
+        if ctx.input(|i| i.viewport().close_requested()) && self.cfg.close_to_tray && self.tray.is_some() && !self.quitting && !self.demo.active {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hidden = true;
+        }
+        // 耳机 / 麦克风拔插、默认设备变化：每 2 秒对一次
+        if self.last_device_check.elapsed() >= Duration::from_secs(2) && !self.demo.active {
+            self.last_device_check = std::time::Instant::now();
+            let snap = self.devices.lock().unwrap().clone();
+            if let (Some(snap), Some(st)) = (snap, &self.streams) {
+                let want_in = audio::wanted_device(self.cfg.input_device.as_deref(), &snap.inputs, snap.default_input.as_ref());
+                let want_out = audio::wanted_device(self.cfg.output_device.as_deref(), &snap.outputs, snap.default_output.as_ref());
+                let failed = st.failed.load(Ordering::Relaxed);
+                let in_changed = want_in.as_deref().unwrap_or("") != st.input_name;
+                let out_changed = want_out.as_deref().unwrap_or("") != st.output_name;
+                if failed || in_changed || out_changed {
+                    self.restart_audio();
+                    self.input_devices = snap.inputs.clone();
+                    self.output_devices = snap.outputs.clone();
+                    if let (Screen::Main(s), Some(st)) = (&mut self.screen, &self.streams) {
+                        if in_changed && !st.input_name.is_empty() {
+                            s.chat.push(ChatLine::System(format!("麦克风已切换到：{}", st.input_name)));
+                        }
+                        if out_changed && !st.output_name.is_empty() {
+                            s.chat.push(ChatLine::System(format!("扬声器已切换到：{}", st.output_name)));
+                        }
+                    }
+                }
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(if self.hidden { 100 } else { 50 }));
+    }
+
     fn go_login(&mut self, error: Option<String>) {
         self.leave_main();
         self.rejoin = None;
@@ -613,6 +738,11 @@ impl App {
                     ServerMsg::State { channels, users } => {
                         s.channels = channels;
                         s.users = users;
+                        if let Some(ch) = s.me().and_then(|u| u.channel_id) {
+                            if !self.test_mode {
+                                self.cfg.last_channel.insert(s.server_key.clone(), ch);
+                            }
+                        }
                         // 重连后回到原来的语音频道
                         if let (Some(ch), Some(me)) = (self.rejoin, s.me()) {
                             if me.channel_id.is_none() && s.channels.iter().any(|c| c.id == ch) {

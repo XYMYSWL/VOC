@@ -4,8 +4,9 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
-  IgnorableNamespaces="uap rescap desktop2">
+  IgnorableNamespaces="uap rescap desktop desktop2">
 
   <Identity Name="VOC.VoiceChat" Publisher="{PUBLISHER}" Version="{VERSION}" ProcessorArchitecture="x64" />
 
@@ -33,6 +34,12 @@
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+        <!-- 开机自启（默认关闭，在 VOC 设置里打开；任务管理器「启动应用」里也能管理） -->
+        <desktop:Extension Category="windows.startupTask" Executable="VOC.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="VOCStartup" Enabled="false" DisplayName="VOC" />
+        </desktop:Extension>
+      </Extensions>
     </Application>
   </Applications>
 

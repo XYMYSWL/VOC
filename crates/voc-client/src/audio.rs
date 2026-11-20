@@ -321,6 +321,55 @@ pub struct AudioStreams {
     _output: Option<cpal::Stream>,
     pub input_desc: String,
     pub output_desc: String,
+    /// 实际打开的设备名（没打开为空）
+    pub input_name: String,
+    pub output_name: String,
+    /// 设备出错（被拔掉等），需要重新打开
+    pub failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 设备快照（后台线程每 2 秒刷新），用来发现拔插和默认设备变化
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct DeviceSnapshot {
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+    pub default_input: Option<String>,
+    pub default_output: Option<String>,
+}
+
+/// 启动设备监视线程
+pub fn watch_devices(ctx: eframe::egui::Context) -> Arc<Mutex<Option<DeviceSnapshot>>> {
+    let snap = Arc::new(Mutex::new(None));
+    let out = snap.clone();
+    let _ = std::thread::Builder::new().name("device-watch".into()).spawn(move || loop {
+        let host = cpal::default_host();
+        let name = |d: cpal::Device| d.description().ok().map(|n| n.name().to_string());
+        let s = DeviceSnapshot {
+            inputs: input_device_names(),
+            outputs: output_device_names(),
+            default_input: host.default_input_device().and_then(name),
+            default_output: host.default_output_device().and_then(name),
+        };
+        let changed = {
+            let mut g = out.lock().unwrap();
+            let c = g.as_ref() != Some(&s);
+            *g = Some(s);
+            c
+        };
+        if changed {
+            ctx.request_repaint();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    });
+    snap
+}
+
+/// 按用户的选择，现在应该用哪个设备：选的设备还在就用它，否则用系统默认
+pub fn wanted_device(choice: Option<&str>, available: &[String], default: Option<&String>) -> Option<String> {
+    match choice {
+        Some(c) if available.iter().any(|a| a == c) => Some(c.to_string()),
+        _ => default.cloned(),
+    }
 }
 
 pub fn start_streams(
@@ -331,48 +380,54 @@ pub fn start_streams(
     settings: Arc<Settings>,
 ) -> (AudioStreams, Vec<String>) {
     let mut errors = Vec::new();
-    let (input, input_desc) = match start_input(input_name, frames_tx) {
-        Ok((s, d)) => (Some(s), d),
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (input, input_desc, in_name) = match start_input(input_name, frames_tx, failed.clone()) {
+        Ok((s, d, n)) => (Some(s), d, n),
         Err(e) => {
             errors.push(format!("麦克风启动失败：{e}"));
-            (None, "无".into())
+            (None, "无".into(), String::new())
         }
     };
-    let (output, output_desc) = match start_output(output_name, mixer, settings) {
-        Ok((s, d)) => (Some(s), d),
+    let (output, output_desc, out_name) = match start_output(output_name, mixer, settings, failed.clone()) {
+        Ok((s, d, n)) => (Some(s), d, n),
         Err(e) => {
             errors.push(format!("扬声器启动失败：{e}"));
-            (None, "无".into())
+            (None, "无".into(), String::new())
         }
     };
-    (AudioStreams { _input: input, _output: output, input_desc, output_desc }, errors)
+    (
+        AudioStreams { _input: input, _output: output, input_desc, output_desc, input_name: in_name, output_name: out_name, failed },
+        errors,
+    )
 }
 
 fn start_input(
     name: Option<&str>,
     frames_tx: SyncSender<Vec<f32>>,
-) -> Result<(cpal::Stream, String), String> {
+    failed: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(cpal::Stream, String, String), String> {
     let dev = find_device(true, name).ok_or("找不到输入设备")?;
     let dname = dev.description().map(|d| d.name().to_string()).unwrap_or_default();
     let sup = dev.default_input_config().map_err(|e| e.to_string())?;
     let cfg = sup.config();
     let desc = format!("{dname}（{} Hz, {} 声道）", cfg.sample_rate, cfg.channels);
     let stream = match sup.sample_format() {
-        SampleFormat::F32 => build_input::<f32>(&dev, cfg, frames_tx),
-        SampleFormat::I16 => build_input::<i16>(&dev, cfg, frames_tx),
-        SampleFormat::U16 => build_input::<u16>(&dev, cfg, frames_tx),
-        SampleFormat::I32 => build_input::<i32>(&dev, cfg, frames_tx),
-        SampleFormat::U8 => build_input::<u8>(&dev, cfg, frames_tx),
+        SampleFormat::F32 => build_input::<f32>(&dev, cfg, frames_tx, failed),
+        SampleFormat::I16 => build_input::<i16>(&dev, cfg, frames_tx, failed),
+        SampleFormat::U16 => build_input::<u16>(&dev, cfg, frames_tx, failed),
+        SampleFormat::I32 => build_input::<i32>(&dev, cfg, frames_tx, failed),
+        SampleFormat::U8 => build_input::<u8>(&dev, cfg, frames_tx, failed),
         f => return Err(format!("不支持的采样格式 {f:?}")),
     }?;
     stream.play().map_err(|e| e.to_string())?;
-    Ok((stream, desc))
+    Ok((stream, desc, dname))
 }
 
 fn build_input<T>(
     dev: &cpal::Device,
     cfg: cpal::StreamConfig,
     frames_tx: SyncSender<Vec<f32>>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample,
@@ -395,7 +450,10 @@ where
                 });
             }
         },
-        |e| eprintln!("输入流错误：{e}"),
+        move |e| {
+            eprintln!("输入流错误：{e}");
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )
     .map_err(|e| e.to_string())
@@ -405,22 +463,23 @@ fn start_output(
     name: Option<&str>,
     mixer: Arc<Mutex<Mixer>>,
     settings: Arc<Settings>,
-) -> Result<(cpal::Stream, String), String> {
+    failed: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(cpal::Stream, String, String), String> {
     let dev = find_device(false, name).ok_or("找不到输出设备")?;
     let dname = dev.description().map(|d| d.name().to_string()).unwrap_or_default();
     let sup = dev.default_output_config().map_err(|e| e.to_string())?;
     let cfg = sup.config();
     let desc = format!("{dname}（{} Hz, {} 声道）", cfg.sample_rate, cfg.channels);
     let stream = match sup.sample_format() {
-        SampleFormat::F32 => build_output::<f32>(&dev, cfg, mixer, settings),
-        SampleFormat::I16 => build_output::<i16>(&dev, cfg, mixer, settings),
-        SampleFormat::U16 => build_output::<u16>(&dev, cfg, mixer, settings),
-        SampleFormat::I32 => build_output::<i32>(&dev, cfg, mixer, settings),
-        SampleFormat::U8 => build_output::<u8>(&dev, cfg, mixer, settings),
+        SampleFormat::F32 => build_output::<f32>(&dev, cfg, mixer, settings, failed),
+        SampleFormat::I16 => build_output::<i16>(&dev, cfg, mixer, settings, failed),
+        SampleFormat::U16 => build_output::<u16>(&dev, cfg, mixer, settings, failed),
+        SampleFormat::I32 => build_output::<i32>(&dev, cfg, mixer, settings, failed),
+        SampleFormat::U8 => build_output::<u8>(&dev, cfg, mixer, settings, failed),
         f => return Err(format!("不支持的采样格式 {f:?}")),
     }?;
     stream.play().map_err(|e| e.to_string())?;
-    Ok((stream, desc))
+    Ok((stream, desc, dname))
 }
 
 fn build_output<T>(
@@ -428,6 +487,7 @@ fn build_output<T>(
     cfg: cpal::StreamConfig,
     mixer: Arc<Mutex<Mixer>>,
     settings: Arc<Settings>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -455,7 +515,10 @@ where
                 }
             }
         },
-        |e| eprintln!("输出流错误：{e}"),
+        move |e| {
+            eprintln!("输出流错误：{e}");
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )
     .map_err(|e| e.to_string())
@@ -464,6 +527,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_choice_follows_plug_and_default() {
+        let avail = vec!["耳机".to_string(), "扬声器".to_string()];
+        let def = Some("扬声器".to_string());
+        // 用户选了耳机且耳机在：用耳机
+        assert_eq!(wanted_device(Some("耳机"), &avail, def.as_ref()), Some("耳机".into()));
+        // 耳机拔了：退回系统默认
+        assert_eq!(wanted_device(Some("耳机"), &avail[1..], def.as_ref()), Some("扬声器".into()));
+        // 选「系统默认」：跟着系统默认变
+        assert_eq!(wanted_device(None, &avail, Some(&"耳机".to_string())), Some("耳机".into()));
+        assert_eq!(wanted_device(None, &[], None), None);
+    }
 
     #[test]
     fn chimes() {

@@ -2,11 +2,13 @@
 
 mod app;
 mod audio;
+mod autostart;
 mod denoise;
 mod e2e;
 mod mf;
 mod net;
 mod theme;
+mod tray;
 mod update;
 mod video;
 mod voice;
@@ -39,8 +41,8 @@ pub fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 窗口 / 任务栏图标（与 MSIX 包里的图标相同）
-fn window_icon() -> egui::IconData {
+/// 窗口 / 任务栏 / 托盘图标（与 MSIX 包里的图标相同）
+pub fn window_icon() -> egui::IconData {
     let bytes: &[u8] = include_bytes!("../../../deploy/windows/Assets/icon-256.png");
     let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
@@ -60,6 +62,9 @@ fn main() -> eframe::Result {
     if std::env::var("VOC_SHOT").is_ok() {
         // 截图模式：窗口放到屏幕外、不抢焦点
         viewport = viewport.with_position([-4000.0, -4000.0]).with_active(false);
+    } else if autostart::launched_at_startup() {
+        // 开机自启：直接缩到托盘
+        viewport = viewport.with_visible(false);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("voc", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

@@ -922,6 +922,31 @@ impl App {
                     );
                     ui.label(RichText::new("开源协议：MIT").size(12.0).color(th::TEXT_DIM));
                     ui.add_space(8.0);
+                    th::section(ui, "启动与托盘");
+                    ui.checkbox(&mut self.cfg.close_to_tray, "关闭窗口时缩到托盘（语音不断）")
+                        .on_hover_text("点右上角 ✕ 后 VOC 留在右下角托盘里继续语音；右键托盘图标可以闭麦、静音或退出。");
+                    if self.tray.is_none() && !self.demo.active {
+                        ui.label(RichText::new("托盘图标没能创建，关闭窗口会直接退出。").size(11.5).color(th::YELLOW));
+                    }
+                    let mut on = self.autostart == crate::autostart::AutoStart::On;
+                    let blocked = self.autostart == crate::autostart::AutoStart::BlockedByUser;
+                    if ui
+                        .add_enabled(!blocked, egui::Checkbox::new(&mut on, "开机自动启动"))
+                        .on_hover_text("开机后自动登录上次的服务器、回到上次的语音频道，窗口缩在托盘里。需要记住授权码。")
+                        .changed()
+                    {
+                        self.autostart = crate::autostart::set(on);
+                    }
+                    match &self.autostart {
+                        crate::autostart::AutoStart::BlockedByUser => {
+                            ui.label(RichText::new("已在任务管理器「启动应用」里被禁用，请在那里重新启用。").size(11.5).color(th::YELLOW));
+                        }
+                        crate::autostart::AutoStart::Unsupported(e) => {
+                            ui.label(RichText::new(format!("无法设置开机自启：{e}")).size(11.5).color(th::RED));
+                        }
+                        _ => {}
+                    }
+                    ui.add_space(8.0);
                     th::section(ui, "诊断");
                     ui.horizontal(|ui| {
                         if ui.button("📋 复制诊断信息").on_hover_text("复制到剪贴板，可以直接粘贴发给帮你排查问题的人").clicked() {
@@ -1302,17 +1327,12 @@ fn level_meter(ui: &mut egui::Ui, level_db: f32, thr_db: f32, active: bool) {
 // ============================================================ eframe 入口
 
 impl eframe::App for App {
+    /// 窗口隐藏（缩到托盘）时 eframe 不调用 ui()，只调用 logic()：网络和托盘都放这里
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.background(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.updater.get() == crate::update::UpdateState::Launched {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if let Some(d) = self.poll_network() {
-            if d.retry && !self.demo.active {
-                self.begin_reconnect(d.reason);
-            } else {
-                self.go_login(Some(d.reason));
-            }
-        }
         let (m, d) = ui.input(|i| {
             (i.modifiers.command && i.key_pressed(egui::Key::M), i.modifiers.command && i.key_pressed(egui::Key::D))
         });
@@ -1339,7 +1359,6 @@ impl eframe::App for App {
         self.ui_share(&ctx);
         self.ui_viewers(&ctx);
         self.demo_screenshot(&ctx);
-        ctx.request_repaint_after(Duration::from_millis(50));
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
