@@ -1008,6 +1008,7 @@ pub fn connect(
     let l = link;
     let mut opener = DatagramOpener::new(&keys.udp_s2c, &keys.udp_s2c_hp);
     std::thread::Builder::new().name("udp-recv".into()).spawn(move || {
+        crate::audio::boost_audio_thread();
         let mut buf = [0u8; 2048];
         let mut out = Vec::new();
         let mut pcm = Vec::with_capacity(FRAME_SAMPLES * 3);
@@ -1102,7 +1103,9 @@ pub fn spawn_encoder(
     std::thread::Builder::new()
         .name("encoder".into())
         .spawn(move || {
-            let mut down = PushResampler::new(CAPTURE_RATE, SAMPLE_RATE);
+            crate::audio::boost_audio_thread();
+            // 采集和编码都是 48 kHz 时不需要重采样（省掉一次插值和滤波延迟）
+            let mut down = (CAPTURE_RATE != SAMPLE_RATE).then(|| PushResampler::new(CAPTURE_RATE, SAMPLE_RATE));
             let mut acc: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2);
             let mut tx = Transmitter::new(settings.clone(), state, mixer);
             loop {
@@ -1122,8 +1125,13 @@ pub fn spawn_encoder(
                 if let Some(d) = denoise.lock().unwrap().as_mut() {
                     d.process(&mut frame);
                 }
-                for &x in &frame {
-                    down.push(x, |y| acc.push(y));
+                match down.as_mut() {
+                    Some(d) => {
+                        for &x in &frame {
+                            d.push(x, |y| acc.push(y));
+                        }
+                    }
+                    None => acc.extend_from_slice(&frame),
                 }
                 while acc.len() >= FRAME_SAMPLES {
                     tx.on_frame(&acc[..FRAME_SAMPLES]);

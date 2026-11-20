@@ -163,6 +163,28 @@ enum Screen {
     Reconnecting(Box<Reconnect>),
 }
 
+/// 估算嘴到耳延迟要用的本机参数
+pub struct LatencyInputs {
+    device_ms: u32,
+    denoise_ms: u32,
+    mixer: Arc<Mutex<Mixer>>,
+}
+
+impl LatencyInputs {
+    /// 估算「他说话 → 我听到」的延迟（ms）和各部分说明。network_one_way：当前线路的单程网络延迟
+    pub fn mouth_to_ear(&self, user: u32, network_one_way: u32) -> (u32, String) {
+        let device = self.device_ms;
+        // 采集声卡 + 降噪 + 20 ms 打包 + Opus 预读约 7 ms（按对方和我用同样设置估算）
+        let capture = device + self.denoise_ms + 20 + 7;
+        let buffer = self.mixer.lock().unwrap().buffer_ms(user).unwrap_or(20);
+        let total = capture + network_one_way + buffer + device;
+        (
+            total,
+            format!("对方采集与编码约 {capture} ms + 网络约 {network_one_way} ms + 抖动缓冲 {buffer} ms + 你的声卡 {device} ms"),
+        )
+    }
+}
+
 /// 自动重连的状态
 struct Reconnect {
     /// 上次断开 / 连接失败的原因
@@ -256,6 +278,9 @@ pub struct App {
     autostart: crate::autostart::AutoStart,
     devices: Arc<Mutex<Option<audio::DeviceSnapshot>>>,
     last_device_check: std::time::Instant,
+    /// 10 ms 小缓冲老是欠载：这次运行期间改用默认缓冲
+    big_audio_buffer: bool,
+    last_xruns: u32,
     demo: Demo,
 }
 
@@ -333,6 +358,8 @@ impl App {
             autostart: crate::autostart::AutoStart::Off,
             devices: audio::watch_devices(cc.egui_ctx.clone()),
             last_device_check: std::time::Instant::now(),
+            big_audio_buffer: false,
+            last_xruns: 0,
         };
         app.restart_audio();
         app.apply_denoise();
@@ -387,13 +414,15 @@ impl App {
 
     fn restart_audio(&mut self) {
         self.streams = None; // 先释放旧设备
-        let (s, errs) = audio::start_streams(
+        let (s, errs) = audio::start_streams_with(
             self.cfg.input_device.as_deref(),
             self.cfg.output_device.as_deref(),
             self.frames_tx.clone(),
             self.mixer.clone(),
             self.settings.clone(),
+            !self.big_audio_buffer,
         );
+        self.last_xruns = 0;
         self.streams = Some(s);
         self.audio_errors = errs;
     }
@@ -618,9 +647,16 @@ impl App {
                 let want_in = audio::wanted_device(self.cfg.input_device.as_deref(), &snap.inputs, snap.default_input.as_ref());
                 let want_out = audio::wanted_device(self.cfg.output_device.as_deref(), &snap.outputs, snap.default_output.as_ref());
                 let failed = st.failed.load(Ordering::Relaxed);
+                // 2 秒里欠载 / 溢出超过 5 次：小缓冲扛不住，改用默认缓冲
+                let xruns = st.xruns.load(Ordering::Relaxed);
+                let too_many_xruns = st.small_buffer && xruns.saturating_sub(self.last_xruns) > 5;
+                self.last_xruns = xruns;
+                if too_many_xruns {
+                    self.big_audio_buffer = true;
+                }
                 let in_changed = want_in.as_deref().unwrap_or("") != st.input_name;
                 let out_changed = want_out.as_deref().unwrap_or("") != st.output_name;
-                if failed || in_changed || out_changed {
+                if failed || in_changed || out_changed || too_many_xruns {
                     self.restart_audio();
                     self.input_devices = snap.inputs.clone();
                     self.output_devices = snap.outputs.clone();
@@ -636,6 +672,15 @@ impl App {
             }
         }
         ctx.request_repaint_after(Duration::from_millis(if self.hidden { 100 } else { 50 }));
+    }
+
+    /// 估算嘴到耳延迟要用的本机参数
+    fn latency_inputs(&self) -> LatencyInputs {
+        LatencyInputs {
+            device_ms: if self.streams.as_ref().is_some_and(|s| s.small_buffer) { 10 } else { 20 },
+            denoise_ms: if self.cfg.denoise == DenoiseMode::Off { 0 } else { 10 },
+            mixer: self.mixer.clone(),
+        }
     }
 
     fn go_login(&mut self, error: Option<String>) {

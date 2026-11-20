@@ -16,9 +16,10 @@ pub mod udp;
 
 pub const PROTOCOL_VERSION: u32 = 6;
 pub const DEFAULT_PORT: u16 = 7878;
-pub const SAMPLE_RATE: u32 = 16_000;
-/// 20 ms @ 16 kHz
-pub const FRAME_SAMPLES: usize = 320;
+/// 语音编解码 / 混音的采样率。Opus 码流和采样率无关：16 kHz 的旧版客户端和 48 kHz 的新版可以互相解码。
+pub const SAMPLE_RATE: u32 = 48_000;
+/// 20 ms @ 48 kHz
+pub const FRAME_SAMPLES: usize = 960;
 pub const MAX_NAME_LEN: usize = 32;
 /// 单个语音频道的人数上限
 pub const MAX_CHANNEL_USERS: usize = 20;

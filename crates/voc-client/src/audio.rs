@@ -9,7 +9,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
 /// 采集端输出 48 kHz 单声道、10 ms 一帧（RNNoise / Krisp 都用这个格式），
-/// 编码线程降噪后再降到 16 kHz。
+/// 编码和混音也是 48 kHz，不再重采样。
 pub const CAPTURE_RATE: u32 = 48_000;
 pub const CAPTURE_FRAME: usize = 480;
 
@@ -26,7 +26,7 @@ pub enum Chime {
     Leave,
 }
 
-/// 合成提示音（16 kHz 单声道）：两个带包络的柔和正弦音，叠一点二次谐波让声音更圆润
+/// 合成提示音（混音采样率，单声道）：两个带包络的柔和正弦音，叠一点二次谐波让声音更圆润
 pub fn chime(kind: Chime) -> Vec<i16> {
     // 「噔、噔」两声：每声约 0.17 秒，中间停 0.06 秒；进入低→高，离开高→低
     let (a, b) = (659.25f32, 987.77f32); // E5、B5
@@ -199,15 +199,85 @@ impl PullResampler {
 
 // ---------------------------------------------------------------- 混音
 
-/// 起播前预缓冲 60 ms
-const PREBUFFER: usize = FRAME_SAMPLES * 3;
-/// 缓冲超过 200 ms 时丢弃旧数据，控制延迟
-const MAX_BUFFER: usize = FRAME_SAMPLES * 10;
+/// 每帧时长（ms）
+const FRAME_MS: f32 = FRAME_SAMPLES as f32 * 1000.0 / SAMPLE_RATE as f32;
+/// 抖动缓冲目标的上下限（ms）
+const JB_MIN_MS: f32 = 20.0;
+const JB_MAX_MS: f32 = 160.0;
+/// 提示音 / 麦克风测试这种本地声音：固定 20 ms
+const LOCAL_PREBUFFER: usize = FRAME_SAMPLES;
+/// 缓冲比目标多出这么多（ms）就丢掉多余部分，把延迟拉回来
+const JB_EXCESS_MS: f32 = 60.0;
+
+/// 自适应抖动缓冲：按到达间隔的抖动决定先攒多少再播。
+/// 目标 = 一帧 + 3 × 抖动估计 + 欠载补偿；欠载（播空）一次补偿加 20 ms，稳定时每秒减 1 ms。
+#[derive(Clone, Debug)]
+pub struct JitterEstimator {
+    last_arrival: Option<std::time::Instant>,
+    /// 到达间隔偏差的平滑估计（ms），算法同 RFC 3550
+    jitter_ms: f32,
+    /// 欠载后额外加的缓冲（ms）
+    penalty_ms: f32,
+    last_decay: std::time::Instant,
+}
+
+impl Default for JitterEstimator {
+    fn default() -> Self {
+        Self { last_arrival: None, jitter_ms: 0.0, penalty_ms: 0.0, last_decay: std::time::Instant::now() }
+    }
+}
+
+impl JitterEstimator {
+    /// 收到 `frames` 帧（丢包补出来的帧会一次到好几帧）
+    pub fn on_arrival(&mut self, now: std::time::Instant, frames: usize) {
+        if let Some(last) = self.last_arrival {
+            let gap = now.duration_since(last).as_secs_f32() * 1000.0;
+            // 说话停顿后的第一包不算抖动
+            if gap < 400.0 {
+                let expected = FRAME_MS * frames.max(1) as f32;
+                let d = (gap - expected).abs();
+                self.jitter_ms += (d - self.jitter_ms) / 16.0;
+            }
+        }
+        self.last_arrival = Some(now);
+        let secs = now.duration_since(self.last_decay).as_secs_f32();
+        if secs >= 1.0 {
+            self.penalty_ms = (self.penalty_ms - secs).max(0.0);
+            self.last_decay = now;
+        }
+    }
+
+    pub fn on_underrun(&mut self) {
+        self.penalty_ms = (self.penalty_ms + 20.0).min(100.0);
+    }
+
+    /// 当前的缓冲目标（ms）
+    pub fn target_ms(&self) -> f32 {
+        (FRAME_MS + 3.0 * self.jitter_ms + self.penalty_ms).clamp(JB_MIN_MS, JB_MAX_MS)
+    }
+}
+
+fn ms_to_samples(ms: f32) -> usize {
+    (ms * SAMPLE_RATE as f32 / 1000.0) as usize
+}
 
 struct Stream {
     buf: VecDeque<f32>,
     playing: bool,
     last_seq: Option<u16>,
+    jitter: JitterEstimator,
+    /// 本地声音（提示音 / 麦克风测试），不做自适应
+    local: bool,
+}
+
+impl Stream {
+    fn prebuffer(&self) -> usize {
+        if self.local {
+            LOCAL_PREBUFFER
+        } else {
+            ms_to_samples(self.jitter.target_ms())
+        }
+    }
 }
 
 #[derive(Default)]
@@ -219,9 +289,11 @@ pub struct Mixer {
 impl Mixer {
     pub fn push(&mut self, user: u32, seq: u16, pcm: &[i16]) {
         let s = self.streams.entry(user).or_insert_with(|| Stream {
-            buf: VecDeque::with_capacity(MAX_BUFFER + FRAME_SAMPLES),
+            buf: VecDeque::with_capacity(FRAME_SAMPLES * 12),
             playing: false,
             last_seq: None,
+            jitter: JitterEstimator::default(),
+            local: user == LOOPBACK_ID || user == SFX_ID,
         });
         if let Some(last) = s.last_seq {
             // 乱序/重复包直接丢弃（距离太远则视为重新开始）
@@ -230,11 +302,26 @@ impl Mixer {
             }
         }
         s.last_seq = Some(seq);
+        if !s.local {
+            s.jitter.on_arrival(std::time::Instant::now(), pcm.len().div_ceil(FRAME_SAMPLES));
+        }
         s.buf.extend(pcm.iter().map(|&x| x as f32 / 32768.0));
-        if s.buf.len() > MAX_BUFFER {
-            let drop = s.buf.len() - PREBUFFER;
+        // 攒得比目标多太多（网络恢复后一下子到了一堆）：丢掉旧的，把延迟拉回目标
+        if !s.local {
+            let target = s.prebuffer();
+            if s.buf.len() > target + ms_to_samples(JB_EXCESS_MS) {
+                let drop = s.buf.len() - target;
+                s.buf.drain(..drop);
+            }
+        } else if s.buf.len() > FRAME_SAMPLES * 50 {
+            let drop = s.buf.len() - FRAME_SAMPLES * 50;
             s.buf.drain(..drop);
         }
+    }
+
+    /// 某人当前的抖动缓冲目标（ms），显示延迟用
+    pub fn buffer_ms(&self, user: u32) -> Option<u32> {
+        self.streams.get(&user).map(|s| s.jitter.target_ms().round() as u32)
     }
 
     pub fn set_volume(&mut self, user: u32, v: f32) {
@@ -252,12 +339,12 @@ impl Mixer {
         self.streams.clear();
     }
 
-    /// 取出一个 16 kHz 混音样本
+    /// 取出一个混音样本
     fn next_sample(&mut self) -> f32 {
         let mut sum = 0.0;
         for (id, s) in self.streams.iter_mut() {
             if !s.playing {
-                if s.buf.len() >= PREBUFFER {
+                if s.buf.len() >= s.prebuffer() {
                     s.playing = true;
                 } else {
                     continue;
@@ -265,7 +352,13 @@ impl Mixer {
             }
             match s.buf.pop_front() {
                 Some(x) => sum += x * self.volumes.get(id).copied().unwrap_or(1.0),
-                None => s.playing = false, // 欠载，重新预缓冲
+                None => {
+                    // 欠载：重新预缓冲。距上一包很近说明是网络抖动（不是说完话），加大缓冲
+                    s.playing = false;
+                    if !s.local && s.jitter.last_arrival.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(200)) {
+                        s.jitter.on_underrun();
+                    }
+                }
             }
         }
         sum
@@ -297,6 +390,29 @@ pub fn output_device_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 声卡缓冲目标：10 ms（越小延迟越低；设备不支持时退回系统默认）
+const DEVICE_BUFFER_MS: u32 = 10;
+
+/// 按设备支持的范围选一个约 10 ms 的固定缓冲
+fn low_latency_buffer(sup: &cpal::SupportedStreamConfig) -> cpal::BufferSize {
+    let want = sup.sample_rate() * DEVICE_BUFFER_MS / 1000;
+    match sup.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => cpal::BufferSize::Fixed(want.clamp(*min, *max)),
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(want),
+    }
+}
+
+/// 把当前线程登记为 Windows「专业音频」多媒体线程（MMCSS），调度优先级更高，小缓冲下不容易断音
+pub fn boost_audio_thread() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::w;
+        use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+        let mut idx = 0u32;
+        let _ = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut idx);
+    }
+}
+
 fn find_device(input: bool, name: Option<&str>) -> Option<cpal::Device> {
     let host = cpal::default_host();
     if let Some(name) = name {
@@ -326,6 +442,34 @@ pub struct AudioStreams {
     pub output_name: String,
     /// 设备出错（被拔掉等），需要重新打开
     pub failed: Arc<std::sync::atomic::AtomicBool>,
+    /// 缓冲欠载 / 溢出次数（小缓冲扛不住时退回默认缓冲）
+    pub xruns: Arc<AtomicU32>,
+    /// 用的是 10 ms 小缓冲
+    pub small_buffer: bool,
+}
+
+/// 设备错误的去向：只有设备没了 / 失效才需要重新打开；欠载溢出只计数
+#[derive(Clone)]
+pub struct StreamHealth {
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    xruns: Arc<AtomicU32>,
+}
+
+impl StreamHealth {
+    fn report(&self, e: &cpal::Error) {
+        use cpal::ErrorKind as K;
+        match e.kind() {
+            K::Xrun => {
+                self.xruns.fetch_add(1, Ordering::Relaxed);
+            }
+            K::RealtimeDenied => {}
+            K::DeviceNotAvailable | K::StreamInvalidated | K::DeviceChanged | K::BackendError | K::Other => {
+                eprintln!("音频设备错误：{e}");
+                self.failed.store(true, Ordering::Relaxed);
+            }
+            _ => eprintln!("音频设备错误：{e}"),
+        }
+    }
 }
 
 /// 设备快照（后台线程每 2 秒刷新），用来发现拔插和默认设备变化
@@ -372,6 +516,7 @@ pub fn wanted_device(choice: Option<&str>, available: &[String], default: Option
     }
 }
 
+#[cfg(test)]
 pub fn start_streams(
     input_name: Option<&str>,
     output_name: Option<&str>,
@@ -379,16 +524,30 @@ pub fn start_streams(
     mixer: Arc<Mutex<Mixer>>,
     settings: Arc<Settings>,
 ) -> (AudioStreams, Vec<String>) {
+    start_streams_with(input_name, output_name, frames_tx, mixer, settings, true)
+}
+
+/// small = 先试 10 ms 小缓冲（扛不住时调用方传 false 重开）
+pub fn start_streams_with(
+    input_name: Option<&str>,
+    output_name: Option<&str>,
+    frames_tx: SyncSender<Vec<f32>>,
+    mixer: Arc<Mutex<Mixer>>,
+    settings: Arc<Settings>,
+    small: bool,
+) -> (AudioStreams, Vec<String>) {
     let mut errors = Vec::new();
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (input, input_desc, in_name) = match start_input(input_name, frames_tx, failed.clone()) {
+    let xruns = Arc::new(AtomicU32::new(0));
+    let health = StreamHealth { failed: failed.clone(), xruns: xruns.clone() };
+    let (input, input_desc, in_name) = match start_input(input_name, frames_tx, health.clone(), small) {
         Ok((s, d, n)) => (Some(s), d, n),
         Err(e) => {
             errors.push(format!("麦克风启动失败：{e}"));
             (None, "无".into(), String::new())
         }
     };
-    let (output, output_desc, out_name) = match start_output(output_name, mixer, settings, failed.clone()) {
+    let (output, output_desc, out_name) = match start_output(output_name, mixer, settings, health, small) {
         Ok((s, d, n)) => (Some(s), d, n),
         Err(e) => {
             errors.push(format!("扬声器启动失败：{e}"));
@@ -396,7 +555,17 @@ pub fn start_streams(
         }
     };
     (
-        AudioStreams { _input: input, _output: output, input_desc, output_desc, input_name: in_name, output_name: out_name, failed },
+        AudioStreams {
+            _input: input,
+            _output: output,
+            input_desc,
+            output_desc,
+            input_name: in_name,
+            output_name: out_name,
+            failed,
+            xruns,
+            small_buffer: small,
+        },
         errors,
     )
 }
@@ -404,21 +573,31 @@ pub fn start_streams(
 fn start_input(
     name: Option<&str>,
     frames_tx: SyncSender<Vec<f32>>,
-    failed: Arc<std::sync::atomic::AtomicBool>,
+    health: StreamHealth,
+    small: bool,
 ) -> Result<(cpal::Stream, String, String), String> {
     let dev = find_device(true, name).ok_or("找不到输入设备")?;
     let dname = dev.description().map(|d| d.name().to_string()).unwrap_or_default();
     let sup = dev.default_input_config().map_err(|e| e.to_string())?;
-    let cfg = sup.config();
-    let desc = format!("{dname}（{} Hz, {} 声道）", cfg.sample_rate, cfg.channels);
-    let stream = match sup.sample_format() {
-        SampleFormat::F32 => build_input::<f32>(&dev, cfg, frames_tx, failed),
-        SampleFormat::I16 => build_input::<i16>(&dev, cfg, frames_tx, failed),
-        SampleFormat::U16 => build_input::<u16>(&dev, cfg, frames_tx, failed),
-        SampleFormat::I32 => build_input::<i32>(&dev, cfg, frames_tx, failed),
-        SampleFormat::U8 => build_input::<u8>(&dev, cfg, frames_tx, failed),
-        f => return Err(format!("不支持的采样格式 {f:?}")),
-    }?;
+    let mut cfg = sup.config();
+    let build = |cfg: cpal::StreamConfig| match sup.sample_format() {
+        SampleFormat::F32 => build_input::<f32>(&dev, cfg, frames_tx.clone(), health.clone()),
+        SampleFormat::I16 => build_input::<i16>(&dev, cfg, frames_tx.clone(), health.clone()),
+        SampleFormat::U16 => build_input::<u16>(&dev, cfg, frames_tx.clone(), health.clone()),
+        SampleFormat::I32 => build_input::<i32>(&dev, cfg, frames_tx.clone(), health.clone()),
+        SampleFormat::U8 => build_input::<u8>(&dev, cfg, frames_tx.clone(), health.clone()),
+        f => Err(format!("不支持的采样格式 {f:?}")),
+    };
+    // 先试 10 ms 小缓冲，设备不接受就用默认
+    let small_cfg = cpal::StreamConfig { buffer_size: low_latency_buffer(&sup), ..cfg.clone() };
+    let (stream, buf_desc) = match small.then(|| build(small_cfg)).and_then(|r| r.ok()) {
+        Some(s) => (s, format!("{DEVICE_BUFFER_MS} ms 缓冲")),
+        None => {
+            cfg.buffer_size = cpal::BufferSize::Default;
+            (build(cfg.clone())?, "默认缓冲".to_string())
+        }
+    };
+    let desc = format!("{dname}（{} Hz, {} 声道，{buf_desc}）", cfg.sample_rate, cfg.channels);
     stream.play().map_err(|e| e.to_string())?;
     Ok((stream, desc, dname))
 }
@@ -427,7 +606,7 @@ fn build_input<T>(
     dev: &cpal::Device,
     cfg: cpal::StreamConfig,
     frames_tx: SyncSender<Vec<f32>>,
-    failed: Arc<std::sync::atomic::AtomicBool>,
+    health: StreamHealth,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample,
@@ -450,10 +629,7 @@ where
                 });
             }
         },
-        move |e| {
-            eprintln!("输入流错误：{e}");
-            failed.store(true, Ordering::Relaxed);
-        },
+        move |e| health.report(&e),
         None,
     )
     .map_err(|e| e.to_string())
@@ -463,21 +639,30 @@ fn start_output(
     name: Option<&str>,
     mixer: Arc<Mutex<Mixer>>,
     settings: Arc<Settings>,
-    failed: Arc<std::sync::atomic::AtomicBool>,
+    health: StreamHealth,
+    small: bool,
 ) -> Result<(cpal::Stream, String, String), String> {
     let dev = find_device(false, name).ok_or("找不到输出设备")?;
     let dname = dev.description().map(|d| d.name().to_string()).unwrap_or_default();
     let sup = dev.default_output_config().map_err(|e| e.to_string())?;
-    let cfg = sup.config();
-    let desc = format!("{dname}（{} Hz, {} 声道）", cfg.sample_rate, cfg.channels);
-    let stream = match sup.sample_format() {
-        SampleFormat::F32 => build_output::<f32>(&dev, cfg, mixer, settings, failed),
-        SampleFormat::I16 => build_output::<i16>(&dev, cfg, mixer, settings, failed),
-        SampleFormat::U16 => build_output::<u16>(&dev, cfg, mixer, settings, failed),
-        SampleFormat::I32 => build_output::<i32>(&dev, cfg, mixer, settings, failed),
-        SampleFormat::U8 => build_output::<u8>(&dev, cfg, mixer, settings, failed),
-        f => return Err(format!("不支持的采样格式 {f:?}")),
-    }?;
+    let mut cfg = sup.config();
+    let build = |cfg: cpal::StreamConfig| match sup.sample_format() {
+        SampleFormat::F32 => build_output::<f32>(&dev, cfg, mixer.clone(), settings.clone(), health.clone()),
+        SampleFormat::I16 => build_output::<i16>(&dev, cfg, mixer.clone(), settings.clone(), health.clone()),
+        SampleFormat::U16 => build_output::<u16>(&dev, cfg, mixer.clone(), settings.clone(), health.clone()),
+        SampleFormat::I32 => build_output::<i32>(&dev, cfg, mixer.clone(), settings.clone(), health.clone()),
+        SampleFormat::U8 => build_output::<u8>(&dev, cfg, mixer.clone(), settings.clone(), health.clone()),
+        f => Err(format!("不支持的采样格式 {f:?}")),
+    };
+    let small_cfg = cpal::StreamConfig { buffer_size: low_latency_buffer(&sup), ..cfg.clone() };
+    let (stream, buf_desc) = match small.then(|| build(small_cfg)).and_then(|r| r.ok()) {
+        Some(s) => (s, format!("{DEVICE_BUFFER_MS} ms 缓冲")),
+        None => {
+            cfg.buffer_size = cpal::BufferSize::Default;
+            (build(cfg.clone())?, "默认缓冲".to_string())
+        }
+    };
+    let desc = format!("{dname}（{} Hz, {} 声道，{buf_desc}）", cfg.sample_rate, cfg.channels);
     stream.play().map_err(|e| e.to_string())?;
     Ok((stream, desc, dname))
 }
@@ -487,7 +672,7 @@ fn build_output<T>(
     cfg: cpal::StreamConfig,
     mixer: Arc<Mutex<Mixer>>,
     settings: Arc<Settings>,
-    failed: Arc<std::sync::atomic::AtomicBool>,
+    health: StreamHealth,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -515,10 +700,7 @@ where
                 }
             }
         },
-        move |e| {
-            eprintln!("输出流错误：{e}");
-            failed.store(true, Ordering::Relaxed);
-        },
+        move |e| health.report(&e),
         None,
     )
     .map_err(|e| e.to_string())
@@ -527,6 +709,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真实设备：cargo test -p voc-client real_device_buffers -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_device_buffers() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+        let (st, errs) = start_streams(None, None, tx, Arc::new(Mutex::new(Mixer::default())), Arc::new(Settings::default()));
+        println!("输入：{}
+输出：{}
+错误：{errs:?}", st.input_desc, st.output_desc);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        println!("5 秒内欠载 / 溢出：{} 次", st.xruns.load(Ordering::Relaxed));
+        assert!(!st.failed.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn device_choice_follows_plug_and_default() {
@@ -603,11 +799,54 @@ mod tests {
     fn mixer_prebuffer_and_order() {
         let mut m = Mixer::default();
         let f = vec![16384i16; FRAME_SAMPLES];
-        m.push(5, 1, &f);
-        assert_eq!(m.next_sample(), 0.0); // 预缓冲未满
+        let half = vec![16384i16; FRAME_SAMPLES / 2];
+        m.push(5, 1, &half);
+        assert_eq!(m.next_sample(), 0.0); // 不到一帧（20 ms）：还在预缓冲
         m.push(5, 0, &f); // 旧包丢弃
+        // 测试里两包是同时到的（真实网络约隔 20 ms），会算出一点抖动，所以攒到一帧多一点就开播
         m.push(5, 2, &f);
-        m.push(5, 3, &f);
         assert!((m.next_sample() - 0.5).abs() < 1e-6);
+        assert!(m.buffer_ms(5).unwrap() <= 25);
+    }
+
+    #[test]
+    fn jitter_buffer_adapts() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        // 每 20 ms 准时到：目标保持最小 20 ms
+        let mut j = JitterEstimator::default();
+        for i in 0..100u64 {
+            j.on_arrival(t0 + Duration::from_millis(20 * i), 1);
+        }
+        assert_eq!(j.target_ms().round() as u32, 20);
+        // 到达时间忽早忽晚 ±15 ms：目标明显变大，但不超过上限
+        let mut j = JitterEstimator::default();
+        for i in 0..200u64 {
+            let wobble = if i % 2 == 0 { 0 } else { 30 };
+            j.on_arrival(t0 + Duration::from_millis(20 * i + wobble), 1);
+        }
+        let t = j.target_ms();
+        assert!(t > 60.0 && t <= JB_MAX_MS, "{t}");
+        // 欠载一次多攒 20 ms
+        let before = j.target_ms();
+        j.on_underrun();
+        assert!(j.target_ms() >= (before + 19.0).min(JB_MAX_MS));
+        // 说话停顿后的第一包不算抖动
+        let mut j = JitterEstimator::default();
+        j.on_arrival(t0, 1);
+        j.on_arrival(t0 + Duration::from_secs(3), 1);
+        assert_eq!(j.target_ms().round() as u32, 20);
+    }
+
+    #[test]
+    fn jitter_buffer_drains_excess() {
+        let mut m = Mixer::default();
+        let f = vec![1000i16; FRAME_SAMPLES];
+        // 网络卡了一下，一次到了 10 帧（200 ms）：只保留目标量，不把延迟一直拖着
+        for seq in 0..10u16 {
+            m.push(9, seq, &f);
+        }
+        let len = m.streams[&9].buf.len();
+        assert!(len <= ms_to_samples(m.streams[&9].jitter.target_ms() + JB_EXCESS_MS), "{len}");
     }
 }

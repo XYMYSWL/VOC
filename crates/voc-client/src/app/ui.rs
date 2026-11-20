@@ -211,6 +211,7 @@ impl App {
     // ============================================================ 主界面
 
     fn ui_main(&mut self, ui: &mut egui::Ui) {
+        let latency = self.latency_inputs();
         let Screen::Main(s) = &mut self.screen else { return };
         let me = s.me().cloned();
         let my_channel = me.as_ref().and_then(|u| u.channel_id);
@@ -560,6 +561,15 @@ impl App {
                                             m.set_volume(u.id, v / 100.0);
                                         }
                                     }
+                                    // 嘴到耳延迟：按实际走的线路估算
+                                    let one_way = match (via, direct.get(&u.id)) {
+                                        (Some(r), _) => r.ms / 2,
+                                        (None, Some(q)) if alloc_voice.contains(&u.id) && !q.unstable => q.rtt_ms / 2,
+                                        _ => self.voice.ping_ms.load(Ordering::Relaxed).max(1),
+                                    };
+                                    let (m2e, parts) = latency.mouth_to_ear(u.id, one_way);
+                                    ui.label(RichText::new(format!("听他说话的延迟：约 {m2e} ms")).size(12.5).color(th::TEXT));
+                                    ui.label(RichText::new(parts).size(11.0).color(th::TEXT_FAINT));
                                     if let Some(r) = via {
                                         ui.label(
                                             RichText::new(th::relay_compare(&name_of(r.via), r.ms, r.server_ms, direct.get(&u.id)))
