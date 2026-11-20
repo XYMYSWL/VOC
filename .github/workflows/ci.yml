@@ -1,0 +1,43 @@
+# 每次推送 / PR：编译并运行全部测试
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    name: Windows（客户端 + 服务端）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust（MSVC）
+        run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: 启用 Media Foundation（视频编解码依赖）
+        shell: powershell
+        run: |
+          if ((Get-WindowsFeature Server-Media-Foundation -ErrorAction SilentlyContinue).InstallState -ne 'Installed') {
+            Install-WindowsFeature Server-Media-Foundation | Out-Null
+          }
+      - name: 编译
+        run: cargo +stable-x86_64-pc-windows-msvc build --workspace --locked
+      - name: 测试
+        run: cargo +stable-x86_64-pc-windows-msvc test --workspace --locked
+
+  linux:
+    name: Linux（服务端）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: 测试协议和服务端
+        run: cargo test -p voc-proto -p voc-server --locked
+      - name: 静态编译服务端（x86_64 / arm64）
+        run: |
+          cargo build --release -p voc-server --target x86_64-unknown-linux-musl --locked
+          cargo build --release -p voc-server --target aarch64-unknown-linux-musl --locked

@@ -1,0 +1,64 @@
+# 推送版本标签（例如 v0.3.0）时：打包并发布 GitHub Release。
+#
+# MSIX 和 VOC-Setup.exe 需要签名私钥，放在仓库的 Secrets 里：
+#   VOC_PFX_BASE64    VOC.pfx 的 base64（本机 %USERPROFILE%\.voc-signing\VOC.pfx）
+#   VOC_PFX_PASSWORD  pfx-password.txt 的内容
+# 没有配置时只发布不需要签名的文件（绿色版客户端、Linux 服务端、get.sh），并在日志里提示。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust（MSVC + musl 交叉编译）
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          rustup +stable-x86_64-pc-windows-msvc target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: 版本号要和标签一致
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$ver" -ne "${{ github.ref_name }}") { throw "Cargo.toml 版本 $ver 和标签 ${{ github.ref_name }} 不一致" }
+      - name: 准备签名证书
+        id: sign
+        shell: pwsh
+        env:
+          PFX: ${{ secrets.VOC_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.VOC_PFX_PASSWORD }}
+        run: |
+          if (-not $env:PFX) { "signed=false" >> $env:GITHUB_OUTPUT; Write-Warning "没有配置签名私钥，跳过 MSIX / VOC-Setup.exe"; exit 0 }
+          $dir = Join-Path $env:USERPROFILE ".voc-signing"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $dir "VOC.pfx"), [Convert]::FromBase64String($env:PFX))
+          Set-Content -Path (Join-Path $dir "pfx-password.txt") -Value $env:PFX_PASSWORD -NoNewline
+          "signed=true" >> $env:GITHUB_OUTPUT
+      - name: 打包（含签名）
+        if: steps.sign.outputs.signed == 'true'
+        shell: pwsh
+        run: .\build.ps1
+      - name: 打包（不含签名）
+        if: steps.sign.outputs.signed != 'true'
+        shell: pwsh
+        run: .\build.ps1 -NoSign
+      - name: 发布
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Copy-Item deploy\linux\get.sh dist\get.sh -Force
+          $files = @("dist\get.sh", "dist\VOC-portable.zip", "dist\voc-server-linux.tar.gz")
+          if ("${{ steps.sign.outputs.signed }}" -eq "true") { $files += @("dist\VOC-Setup.exe", "dist\VOC.cer") + (Get-ChildItem dist\VOC-*.msix).FullName }
+          gh release create "${{ github.ref_name }}" --title "VOC ${{ github.ref_name }}" --generate-notes @files
+      - name: 清除签名私钥
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Recurse -Force (Join-Path $env:USERPROFILE ".voc-signing") -ErrorAction SilentlyContinue
