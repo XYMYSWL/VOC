@@ -307,6 +307,34 @@ pub mod tests {
         chats
     }
 
+    /// 模拟服务器：多方之间按收件人投递，直到没有待发消息（三人以上的测试用）
+    pub fn route_all(es: &mut [E2e]) {
+        for _ in 0..8 {
+            let mut mail: Vec<(u32, ClientMsg)> = Vec::new();
+            for e in es.iter_mut() {
+                let me = e.my_id;
+                mail.extend(e.take_outgoing().into_iter().map(|m| (me, m)));
+            }
+            if mail.is_empty() {
+                return;
+            }
+            for (from, m) in mail {
+                for to in es.iter_mut().filter(|e| e.my_id != from) {
+                    match &m {
+                        ClientMsg::E2eAnnounce { entry } => {
+                            let _ = to.on_entry(entry.clone());
+                        }
+                        ClientMsg::PeerKey { to: t, ct, sig } if *t == to.my_id => to.on_peer_key(from, ct, sig),
+                        ClientMsg::E2eBlob { to: t, blob } if *t == to.my_id => {
+                            to.on_blob(from, blob);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     pub fn pair_up(a: &mut E2e, b: &mut E2e) {
         for _ in 0..3 {
             relay(a, b);

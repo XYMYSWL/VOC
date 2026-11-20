@@ -195,6 +195,13 @@ impl App {
                 self.demo.quality.iter().filter(|(_, x)| x.2).map(|(id, _)| *id).collect(),
             ),
         };
+        // 成员中继路线（me = 我的用户 id）
+        let (relay_routes, me_id) = match self.voice.current_link() {
+            Some(l) => (l.relays(), Some(l.my_id())),
+            None => (self.demo.relays.clone(), Some(s.user_id)),
+        };
+        let names: HashMap<u32, String> = s.users.iter().map(|u| (u.id, u.name.clone())).collect();
+        let name_of = move |id: u32| names.get(&id).cloned().unwrap_or_else(|| format!("#{id}"));
         let e2e_info: HashMap<u32, (Trust, String, bool)> = match &s.e2e {
             Some(e) => {
                 let e = e.lock().unwrap();
@@ -403,12 +410,52 @@ impl App {
                             let resp = resp.on_hover_text(e2e_tip);
                             // 第二行：直连质量、屏幕共享
                             let q = if is_me { None } else { direct.get(&u.id) };
-                            if q.is_some() || u.sharing.is_some() {
+                            // 我和他之间的语音经某个成员中转
+                            let via = match me_id {
+                                Some(me) if !is_me => relay_routes
+                                    .iter()
+                                    .find(|r| (r.from == u.id && r.to == me) || (r.from == me && r.to == u.id))
+                                    .copied(),
+                                _ => None,
+                            };
+                            // 我正在帮几路语音中转
+                            let relaying = match me_id {
+                                Some(me) if is_me => relay_routes.iter().filter(|r| r.via == me).count(),
+                                _ => 0,
+                            };
+                            if q.is_some() || u.sharing.is_some() || via.is_some() || relaying > 0 {
                                 ui.horizontal(|ui| {
                                     ui.add_space(48.0);
                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                    if let Some(q) = q {
-                                        th::quality_chip(ui, q, alloc_voice.contains(&u.id), alloc_video.contains(&u.id));
+                                    let voice_direct = alloc_voice.contains(&u.id);
+                                    match (via, q) {
+                                        (Some(r), q) if !q.is_some_and(|q| voice_direct && !q.unstable) => {
+                                            th::relay_chip(ui, &name_of(r.via), r.ms, r.server_ms, q);
+                                        }
+                                        (_, Some(q)) => th::quality_chip(ui, q, voice_direct, alloc_video.contains(&u.id)),
+                                        _ => {}
+                                    }
+                                    if relaying > 0 {
+                                        let me = me_id.unwrap_or_default();
+                                        let lines: Vec<String> = relay_routes
+                                            .iter()
+                                            .filter(|r| r.via == me)
+                                            .map(|r| {
+                                                format!(
+                                                    "{} → {}：{} ms（服务器 {} ms，快 {} ms）",
+                                                    name_of(r.from),
+                                                    name_of(r.to),
+                                                    r.ms,
+                                                    r.server_ms,
+                                                    r.server_ms.saturating_sub(r.ms)
+                                                )
+                                            })
+                                            .collect();
+                                        th::pill(ui, format!("🔁 中继 {relaying} 路"), th::GREEN, th::GREEN_SOFT).on_hover_text(format!(
+                                            "你和队友的直连又快又稳，服务器安排你帮 {relaying} 路语音转发（约占上行 {:.2} Mbps）：\n{}\n可以在 设置 → 网络 里关闭。",
+                                            relaying as f64 * voice::VOICE_COST_BPS as f64 / 1e6,
+                                            lines.join("\n")
+                                        ));
                                     }
                                     if let Some(desc) = &u.sharing {
                                         if is_me {
@@ -444,7 +491,13 @@ impl App {
                                             m.set_volume(u.id, v / 100.0);
                                         }
                                     }
-                                    if let Some(q) = direct.get(&u.id) {
+                                    if let Some(r) = via {
+                                        ui.label(
+                                            RichText::new(th::relay_compare(&name_of(r.via), r.ms, r.server_ms, direct.get(&u.id)))
+                                                .size(12.0)
+                                                .color(th::TEXT_DIM),
+                                        );
+                                    } else if let Some(q) = direct.get(&u.id) {
                                         ui.label(
                                             RichText::new(format!(
                                                 "P2P：延迟 {} ms · 丢包 {}% · 抖动 {} ms",
@@ -746,12 +799,36 @@ impl App {
                                 l.set_budget(self.cfg.p2p_budget_mbps * 1_000_000);
                             }
                         }
+                        if ui
+                            .checkbox(&mut self.cfg.relay, "帮队友中转语音（成员中继）")
+                            .on_hover_text(
+                                "两个队友之间打不通直连时，服务器会挑一个和双方都直连良好、延迟最低的人帮忙转发语音，比服务器中转更快。\n\
+                                 每路约占 0.06 Mbps 上行，只用直连上行预算里剩下的部分，最多 8 路。转发的是端到端加密后的包。",
+                            )
+                            .changed()
+                        {
+                            if let Some(l) = self.voice.current_link() {
+                                l.set_relay_enabled(self.cfg.relay);
+                            }
+                        }
                         let summary = match self.voice.current_link() {
                             Some(l) => {
                                 let (v, d) = l.allocation();
                                 let all = l.direct_peers();
                                 let bad = all.values().filter(|q| q.unstable).count();
-                                format!("已打通 {} 人 · 语音直连 {} 人 · 画面直连 {} 人 · 不稳改中转 {} 人", all.len(), v.len(), d.len(), bad)
+                                let me = l.my_id();
+                                let routes = l.relays();
+                                let relaying = routes.iter().filter(|r| r.via == me).count();
+                                let via_others = routes.iter().filter(|r| r.to == me).count();
+                                format!(
+                                    "已打通 {} 人 · 语音直连 {} 人 · 画面直连 {} 人 · 不稳改中转 {} 人 · 经队友中继收听 {} 人 · 我在中继 {} 路",
+                                    all.len(),
+                                    v.len(),
+                                    d.len(),
+                                    bad,
+                                    via_others,
+                                    relaying
+                                )
                             }
                             None => "未连接".into(),
                         };

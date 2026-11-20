@@ -221,6 +221,44 @@ pub fn quality_chip(ui: &mut egui::Ui, q: &PeerQuality, voice_direct: bool, vide
     }
 }
 
+/// 按往返延迟选颜色（和直连徽章一致）
+fn latency_colors(ms: u32) -> (Color32, Color32) {
+    if ms < 80 {
+        (GREEN, GREEN_SOFT)
+    } else if ms < 200 {
+        (YELLOW, YELLOW_SOFT)
+    } else {
+        (RED, RED_SOFT)
+    }
+}
+
+/// 我和某人之间三条线路的对比（往返延迟）：经队友中继 / 经服务器 / 直连
+pub fn relay_compare(via_name: &str, ms: u32, server_ms: u32, direct: Option<&PeerQuality>) -> String {
+    let saved = server_ms.saturating_sub(ms);
+    let direct_line = match direct {
+        Some(q) if q.unstable => {
+            format!("直连：不稳定（{} ms · 丢包 {}% · 抖动 {} ms）", q.rtt_ms, q.loss_pct, q.jitter_ms)
+        }
+        Some(q) => format!("直连：已打通 {} ms，但超出你的上行预算", q.rtt_ms),
+        None => "直连：打不通".to_string(),
+    };
+    [
+        "线路对比（往返延迟，按实测链路估算）".to_string(),
+        format!("✔ 经 {via_name} 中转：{ms} ms（当前）"),
+        format!("    经服务器中转：{server_ms} ms（慢 {saved} ms）"),
+        format!("    {direct_line}"),
+        format!("语音仍是端到端加密的，{via_name} 只是原样转交。"),
+    ]
+    .join("
+")
+}
+
+/// 「↪ 经 某人 62 ms」徽章，悬停显示线路对比
+pub fn relay_chip(ui: &mut egui::Ui, via_name: &str, ms: u32, server_ms: u32, direct: Option<&PeerQuality>) -> egui::Response {
+    let (fg, bg) = latency_colors(ms);
+    pill(ui, format!("↪ 经 {via_name} {ms} ms"), fg, bg).on_hover_text(relay_compare(via_name, ms, server_ms, direct))
+}
+
 /// 分段选择（像一排胶囊按钮）
 pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let mut changed = false;
@@ -247,4 +285,22 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options:
 pub fn fmt_time(ts_ms: u64) -> String {
     let secs = ts_ms / 1000 + 8 * 3600;
     format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_comparison_text() {
+        let t = relay_compare("阿豪", 62, 148, None);
+        println!("{t}");
+        assert!(t.contains("经 阿豪 中转：62 ms（当前）"));
+        assert!(t.contains("经服务器中转：148 ms（慢 86 ms）"));
+        assert!(t.contains("直连：打不通"));
+        let q = PeerQuality { rtt_ms: 161, loss_pct: 22, jitter_ms: 95, unstable: true };
+        assert!(relay_compare("阿豪", 62, 148, Some(&q)).contains("直连：不稳定（161 ms · 丢包 22% · 抖动 95 ms）"));
+        let q = PeerQuality { rtt_ms: 40, loss_pct: 0, jitter_ms: 2, unstable: false };
+        assert!(relay_compare("阿豪", 62, 148, Some(&q)).contains("直连：已打通 40 ms，但超出你的上行预算"));
+    }
 }

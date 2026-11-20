@@ -693,3 +693,58 @@ fn voice_and_video_direct_lists_are_independent() {
     let old: ClientMsg = serde_json::from_str(raw).unwrap();
     assert_eq!(old, ClientMsg::DirectPeers { ids: vec![], video: vec![] });
 }
+
+/// 成员中继：alice、bob 互相打不通，carol 和两人都直连且延迟低 → 服务器安排 carol 中转，
+/// 并且不再替 alice 把语音转给 bob；carol 关掉中继后服务器恢复转发。
+#[test]
+fn member_relay_is_planned_and_server_stops_forwarding() {
+    use voc_proto::{PeerStat, RelayRoute};
+    let srv = Server::start(9);
+    let codes = srv.gen_codes(3);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
+    let mut r = Client::connect(srv.port, &codes[2], "carol").unwrap();
+    for x in [&mut a, &mut b, &mut r] {
+        x.enable_udp();
+        x.send(ClientMsg::P2pEnable { local_addrs: vec![] });
+        x.send(ClientMsg::JoinChannel { channel_id: 1 });
+    }
+    for x in [&mut a, &mut b, &mut r] {
+        x.wait_for(|m| matches!(m, ServerMsg::Peers { peers } if peers.len() == 2));
+    }
+    let (ia, ib, ir) = (a.id, b.id, r.id);
+    let stat = |id: u32| PeerStat { id, rtt: 20, loss: 0, jitter: 2 };
+    a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
+    b.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
+    r.send(ClientMsg::DirectPeers { ids: vec![ia, ib], video: vec![] });
+    a.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0 });
+    b.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0 });
+    // carol 顺带报了一个不在频道里的 id，服务器应忽略
+    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib), stat(999)], relay_slots: 4 });
+
+    // 经 carol：20 + 20 + 4 = 44 ms；经服务器：150 + 150 = 300 ms
+    let want = vec![
+        RelayRoute { from: ia, to: ib, via: ir, ms: 44, server_ms: 300 },
+        RelayRoute { from: ib, to: ia, via: ir, ms: 44, server_ms: 300 },
+    ];
+    let mut expected = want.clone();
+    expected.sort();
+    for x in [&mut a, &mut b, &mut r] {
+        x.wait_for(|m| matches!(m, ServerMsg::Relays { routes } if *routes == expected));
+    }
+
+    // alice 发语音：bob 由 carol 中继，carol 是直连 → 服务器谁都不转
+    a.udp_send(udp::VOICE, &udp::client_voice(1, &frame()));
+    assert!(b.udp_recv().is_none(), "server must not forward a relayed path");
+    assert!(r.udp_recv().is_none());
+
+    // carol 关掉中继（名额 0）→ 路线撤销，服务器恢复转发给 bob
+    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib)], relay_slots: 0 });
+    for x in [&mut a, &mut b, &mut r] {
+        x.wait_for(|m| matches!(m, ServerMsg::Relays { routes } if routes.is_empty()));
+    }
+    a.udp_send(udp::VOICE, &udp::client_voice(2, &frame()));
+    let (k, d) = b.udp_recv().expect("server forwards again after the relay is withdrawn");
+    assert_eq!(k, udp::VOICE);
+    assert_eq!(udp::read_server_voice(&d).unwrap().0, ia);
+}

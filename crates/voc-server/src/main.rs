@@ -1,13 +1,14 @@
 //! VOC 服务器：授权码登录、ML-KEM-768 加密、抗 DPI 传输；语音 SFU 转发（不混音）。
 
 mod codes;
+mod relay;
 
 use codes::CodeStore;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -54,7 +55,22 @@ struct User {
     last_watchers: Vec<u32>,
     /// 能解码的视频格式
     decoders: Vec<String>,
+    /// 最近一次链路质量上报（成员中继用）
+    stats: Option<LinkReport>,
+    /// 上次发给我的中继路线
+    last_relays: Vec<RelayRoute>,
 }
+
+/// 客户端上报的链路质量
+struct LinkReport {
+    at: Instant,
+    server_rtt: u32,
+    peers: Vec<PeerStat>,
+    slots: u16,
+}
+
+/// 链路上报超过这么久没更新就不再采信
+const STATS_TTL: Duration = Duration::from_secs(6);
 
 impl User {
     fn send(&self, m: ServerMsg) {
@@ -72,6 +88,8 @@ struct State {
     next_channel: u32,
     codes: CodeStore,
     replay: ReplayCache,
+    /// 成员中继路线：(说话的人, 听的人) → 中继成员
+    relays: HashMap<(u32, u32), u32>,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -177,6 +195,48 @@ impl State {
         }
     }
 
+    /// 重新规划各频道的成员中继路线，有变化就通知频道成员
+    fn push_relays(&mut self) {
+        let now = Instant::now();
+        let mut by_channel: HashMap<u32, Vec<relay::Member>> = HashMap::new();
+        for (id, u) in &self.users {
+            let Some(ch) = u.channel else { continue };
+            let mut m = relay::Member {
+                id: *id,
+                muted: u.muted,
+                deafened: u.deafened,
+                direct: u.direct.clone(),
+                ..Default::default()
+            };
+            if let Some(r) = u.stats.as_ref().filter(|r| now.duration_since(r.at) < STATS_TTL && u.p2p.is_some()) {
+                m.server_rtt = Some(r.server_rtt.max(1));
+                m.links = r.peers.iter().map(|p| (p.id, (p.rtt, p.loss, p.jitter))).collect();
+                m.slots = r.slots;
+            }
+            by_channel.entry(ch).or_default().push(m);
+        }
+        let mut all: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut per_channel: HashMap<u32, Vec<RelayRoute>> = HashMap::new();
+        for (ch, members) in &by_channel {
+            let ids: HashSet<u32> = members.iter().map(|m| m.id).collect();
+            let current: HashMap<(u32, u32), u32> =
+                self.relays.iter().filter(|((f, _), _)| ids.contains(f)).map(|(k, v)| (*k, *v)).collect();
+            let routes = relay::plan(members, &current);
+            for r in &routes {
+                all.insert((r.from, r.to), r.via);
+            }
+            per_channel.insert(*ch, routes);
+        }
+        self.relays = all;
+        for u in self.users.values_mut() {
+            let routes = u.channel.and_then(|ch| per_channel.get(&ch).cloned()).unwrap_or_default();
+            if routes != u.last_relays {
+                u.last_relays = routes.clone();
+                u.send(ServerMsg::Relays { routes });
+            }
+        }
+    }
+
     /// 转发一个视频分片给正在观看的人（已 P2P 直连的除外）
     fn forward_video(&mut self, from: u32, frag: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
         let Some(u) = self.users.get(&from) else { return Vec::new() };
@@ -210,11 +270,15 @@ impl State {
         let Some(u) = self.users.get(&from) else { return Vec::new() };
         let (Some(ch), false) = (u.channel, u.muted) else { return Vec::new() };
         let direct = u.direct.clone();
+        let relayed: HashSet<u32> = self.relays.keys().filter(|(f, _)| *f == from).map(|(_, t)| *t).collect();
         let payload = udp::server_voice(from, seq, frame);
         let mut out = Vec::new();
         for (id, other) in self.users.iter_mut() {
             if *id == from || other.channel != Some(ch) || other.deafened || direct.contains(id) {
                 continue;
+            }
+            if relayed.contains(id) {
+                continue; // 由成员中继转发
             }
             match (other.voice_udp, other.udp) {
                 (true, Some(addr)) => {
@@ -389,6 +453,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         addr_map: HashMap::new(),
         codes,
         replay: ReplayCache::default(),
+        relays: HashMap::new(),
     }));
 
     println!("[VOC] 服务器「{}」已启动：TCP/UDP {}", cfg.name, cfg.bind);
@@ -401,6 +466,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
 
     tokio::spawn(udp_loop(state.clone(), udp_sock.clone()));
     tokio::spawn(revocation_loop(state.clone()));
+    tokio::spawn(relay_loop(state.clone()));
 
     loop {
         tokio::select! {
@@ -589,6 +655,8 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 watching: HashSet::new(),
                 last_watchers: Vec::new(),
                 decoders: Vec::new(),
+                stats: None,
+                last_relays: Vec::new(),
             },
         );
         st.broadcast_state();
@@ -648,6 +716,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
             st.system(format!("{name} 离开了服务器"));
             st.push_peers();
             st.push_watchers();
+            st.push_relays();
         }
     }
     // 发送队列的 Sender 已随 User 释放，写任务会把剩余消息（例如踢下线原因）发完再退出
@@ -661,6 +730,7 @@ fn handle_msg(state: &Shared, uid: u32, msg: ClientMsg) {
     handle_msg_locked(&mut st, uid, msg);
     st.push_peers();
     st.push_watchers();
+    st.push_relays();
 }
 
 fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
@@ -688,6 +758,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             }
             let Some(u) = st.users.get_mut(&uid) else { return };
             u.channel = Some(channel_id);
+            u.stats = None;
             u.direct.clear();
             u.direct_video.clear();
             // 换频道：停止共享和观看
@@ -700,6 +771,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
         ClientMsg::LeaveChannel => {
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.channel.take().is_some() {
+                    u.stats = None;
                     u.direct.clear();
                     u.direct_video.clear();
                     u.sharing = None;
@@ -839,6 +911,12 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
+        ClientMsg::LinkStats { server_rtt, peers, relay_slots } => {
+            let Some(u) = st.users.get_mut(&uid) else { return };
+            let allowed: HashSet<u32> = u.last_peers.iter().map(|p| p.id).collect();
+            let peers: Vec<PeerStat> = peers.into_iter().filter(|p| allowed.contains(&p.id)).take(32).collect();
+            u.stats = Some(LinkReport { at: Instant::now(), server_rtt: server_rtt.min(10_000), peers, slots: relay_slots.min(16) });
+        }
         ClientMsg::DirectPeers { ids, video } => {
             let Some(u) = st.users.get(&uid) else { return };
             let allowed: HashSet<u32> = u.last_peers.iter().map(|p| p.id).collect();
@@ -877,8 +955,17 @@ async fn revocation_loop(state: Shared) {
                 st.system(format!("{name} 离开了服务器"));
                 st.push_peers();
                 st.push_watchers();
+                st.push_relays();
             }
         }
+    }
+}
+
+/// 每秒重新规划一次成员中继（上报过期、链路变化都会体现）
+async fn relay_loop(state: Shared) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        state.lock().unwrap().push_relays();
     }
 }
 

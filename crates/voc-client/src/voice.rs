@@ -5,6 +5,8 @@
 //! - 能直连的成员：语音直接发给对方（成对 ML-KEM 密钥加密，服务器看不到）；
 //!   直连不了的成员：发一份给服务器中转。全部直连时服务器完全不经手语音。
 //! - UDP 被封锁/严重丢包时（4 秒收不到服务器 pong）语音改走加密 TCP；恢复后自动切回。
+//! - 成员中继：互相打不通的两人，由服务器安排一个和双方都直连良好、延迟最低的成员转发语音
+//!   （每 2 秒上报链路质量，服务器规划路线，见 voc-server/src/relay.rs）。转发的是端到端加密后的原包。
 
 use crate::audio::{Mixer, PushResampler, Settings, CAPTURE_RATE, LOOPBACK_ID};
 use crate::denoise::DenoiseSlot;
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 use voc_proto::crypto::{DatagramOpener, DatagramSealer, SessionKeys};
 use voc_proto::p2p;
 use voc_proto::udp::seq_newer;
-use voc_proto::{now_millis, udp, ClientMsg, PeerInfo, FRAME_SAMPLES, SAMPLE_RATE};
+use voc_proto::{now_millis, udp, ClientMsg, PeerInfo, PeerStat, RelayRoute, FRAME_SAMPLES, SAMPLE_RATE};
 
 /// VAD 关闭前的保持帧数（20 ms × 15 = 300 ms），避免句尾被截断
 const VAD_HANGOVER: u32 = 15;
@@ -36,6 +38,23 @@ const PORT_SPRAY: u16 = 8;
 pub const VOICE_COST_BPS: u64 = 60_000;
 /// 默认 P2P 上行预算
 pub const DEFAULT_BUDGET_BPS: u32 = 15_000_000;
+/// 链路质量上报间隔（成员中继用）
+const STATS_INTERVAL: Duration = Duration::from_secs(2);
+/// 最多帮别人中转几路语音
+const MAX_RELAY_SLOTS: u64 = 8;
+
+/// 按上行预算扣掉自己的直连开销后，还能帮别人中转几路语音
+pub fn relay_slots(budget_bps: u32, voice_direct: usize, others: usize, video_bps: u32, video_direct: usize, watchers: usize) -> u16 {
+    let video_cost = video_bps as u64 * 105 / 100;
+    let mut used = voice_direct as u64 * VOICE_COST_BPS + video_direct as u64 * video_cost;
+    if voice_direct < others {
+        used += VOICE_COST_BPS; // 给服务器的一份
+    }
+    if video_direct < watchers {
+        used += video_cost;
+    }
+    ((budget_bps as u64).saturating_sub(used) / VOICE_COST_BPS).min(MAX_RELAY_SLOTS) as u16
+}
 
 /// 按上行带宽预算决定直连哪些人。
 /// - `voice_peers` / `video_peers`：已打通、按延迟从低到高排好的候选（同频道成员 / 观看者）
@@ -335,6 +354,14 @@ pub struct Link {
     video_bps: AtomicU32,
     /// 当前分配结果：(语音直连, 画面直连)
     alloc: Mutex<(Vec<u32>, Vec<u32>)>,
+    /// 到服务器的往返延迟（ms），0 = 未知
+    server_rtt: AtomicU32,
+    /// 允许帮队友中转语音
+    relay_enabled: AtomicBool,
+    /// 服务器安排的本频道中继路线
+    relays: Mutex<Vec<RelayRoute>>,
+    /// 上次上报链路质量的时间
+    last_stats: Mutex<Instant>,
 }
 
 impl Link {
@@ -354,7 +381,7 @@ impl Link {
     fn send_voice(&self, frame: &[u8], buf: &mut Vec<u8>) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let others = self.others.lock().unwrap().clone();
-        let mut direct_count = 0;
+        let mut sent: Vec<u32> = Vec::new();
         {
             let mut peers = self.peers.lock().unwrap();
             if self.p2p_active() {
@@ -365,13 +392,16 @@ impl Link {
                     if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
                         s.seal(udp::VOICE, &payload, buf);
                         self.send_raw(buf, path);
-                        direct_count += 1;
+                        sent.push(*id);
                     }
                 }
             }
         }
-        if others.is_empty() || direct_count == others.len() {
-            return; // 频道里只有自己，或全部直连：服务器不经手
+        // 经成员中继能送到的人：中继是我直连发到的人
+        let relayed: Vec<u32> =
+            self.relays.lock().unwrap().iter().filter(|r| r.from == self.my_id && sent.contains(&r.via)).map(|r| r.to).collect();
+        if others.iter().all(|o| sent.contains(o) || relayed.contains(o)) {
+            return; // 频道里只有自己，或全部直连 / 经成员中继：服务器不经手
         }
         let payload = udp::client_voice(seq, frame);
         if self.udp_ok.load(Ordering::Relaxed) {
@@ -401,6 +431,45 @@ impl Link {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
+    }
+
+    /// 是否允许帮队友中转语音（占用自己的上行带宽）
+    pub fn set_relay_enabled(&self, on: bool) {
+        self.relay_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// 服务器下发的本频道中继路线
+    pub fn set_relays(&self, routes: Vec<RelayRoute>) {
+        *self.relays.lock().unwrap() = routes;
+    }
+
+    pub fn relays(&self) -> Vec<RelayRoute> {
+        self.relays.lock().unwrap().clone()
+    }
+
+    pub fn my_id(&self) -> u32 {
+        self.my_id
+    }
+
+    /// 作为中继：把 peer 直连发来的、他自己的语音包原样转给路线上的听众（包已端到端加密）
+    fn relay_forward(&self, peer: u32, payload: &[u8], buf: &mut Vec<u8>) {
+        let Some((from, _, _)) = udp::read_server_voice(payload) else { return };
+        if from != peer {
+            return; // 只转发对方自己的语音，不转发转来的包
+        }
+        let targets: Vec<u32> =
+            self.relays.lock().unwrap().iter().filter(|r| r.via == self.my_id && r.from == from).map(|r| r.to).collect();
+        if targets.is_empty() || !self.relay_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut peers = self.peers.lock().unwrap();
+        for to in targets {
+            let Some(p) = peers.map.get_mut(&to) else { continue };
+            if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
+                s.seal(udp::VOICE, payload, buf);
+                self.send_raw(buf, path);
+            }
+        }
     }
 
     pub fn set_others(&self, ids: Vec<u32>) {
@@ -625,6 +694,32 @@ impl Link {
             (Vec::new(), Vec::new())
         };
         *self.alloc.lock().unwrap() = (voice.clone(), video.clone());
+        // 每 2 秒上报链路质量（服务器据此安排成员中继）
+        let udp_rtt = self.server_rtt.load(Ordering::Relaxed);
+        let due = now.duration_since(*self.last_stats.lock().unwrap()) >= STATS_INTERVAL;
+        if active && due && udp_rtt > 0 && self.in_channel.load(Ordering::Relaxed) && self.udp_ok.load(Ordering::Relaxed) {
+            *self.last_stats.lock().unwrap() = now;
+            let mut stats: Vec<PeerStat> = peers
+                .map
+                .iter()
+                .filter(|(id, p)| others.contains(id) && p.usable() && evaluate_pings(&p.pings, now).is_some())
+                .map(|(id, p)| PeerStat { id: *id, rtt: p.quality.rtt_ms.max(1), loss: p.quality.loss_pct, jitter: p.quality.jitter_ms })
+                .collect();
+            stats.sort_by_key(|p| p.id);
+            let slots = if self.relay_enabled.load(Ordering::Relaxed) {
+                relay_slots(
+                    self.budget_bps.load(Ordering::Relaxed),
+                    voice.len(),
+                    others.len(),
+                    self.video_bps.load(Ordering::Relaxed),
+                    video.len(),
+                    watchers.len(),
+                )
+            } else {
+                0
+            };
+            self.tcp_send(Outgoing::Msg(ClientMsg::LinkStats { server_rtt: udp_rtt, peers: stats, relay_slots: slots }));
+        }
         voice.sort();
         video.sort();
         if voice != peers.last_direct || video != peers.last_direct_video {
@@ -636,7 +731,7 @@ impl Link {
     }
 
     /// 处理来自非服务器地址的包。若是语音 / 视频，返回 (kind, 内容)（与服务器转发的格式相同）。
-    fn on_peer_packet(&self, from: SocketAddr, pkt: &[u8], buf: &mut Vec<u8>) -> Option<(u8, Vec<u8>)> {
+    fn on_peer_packet(&self, from: SocketAddr, pkt: &[u8], buf: &mut Vec<u8>) -> Option<(u32, u8, Vec<u8>)> {
         let mut peers = self.peers.lock().unwrap();
         // 先试地址匹配的对端，再试其余（对端 NAT 端口可能和候选不同）
         let mut ids: Vec<u32> = peers.map.keys().copied().collect();
@@ -674,7 +769,7 @@ impl Link {
                     p.on_pong(&data);
                     p.path = Some(from);
                 }
-                udp::VOICE | udp::VIDEO => return Some((kind, data)),
+                udp::VOICE | udp::VIDEO => return Some((id, kind, data)),
                 _ => {}
             }
             return None;
@@ -829,6 +924,10 @@ pub fn connect(
         budget_bps: AtomicU32::new(DEFAULT_BUDGET_BPS),
         video_bps: AtomicU32::new(0),
         alloc: Mutex::new((Vec::new(), Vec::new())),
+        server_rtt: AtomicU32::new(0),
+        relay_enabled: AtomicBool::new(true),
+        relays: Mutex::new(Vec::new()),
+        last_stats: Mutex::new(Instant::now()),
     });
     state.disconnect();
     *state.link.lock().unwrap() = Some(link.clone());
@@ -879,16 +978,21 @@ pub fn connect(
                         let sent = u64::from_le_bytes(data[..8].try_into().unwrap());
                         let now = now_millis();
                         l.last_pong_ms.store(now, Ordering::Relaxed);
-                        state.ping_ms.store((now.saturating_sub(sent) as u32).max(1), Ordering::Relaxed);
+                        let rtt = (now.saturating_sub(sent) as u32).max(1);
+                        state.ping_ms.store(rtt, Ordering::Relaxed);
+                        l.server_rtt.store(rtt, Ordering::Relaxed);
                     }
                     udp::VOICE => on_server_voice(&data, &state, &mixer, &mut pcm),
                     udp::VIDEO => on_server_video(&data, &state),
                     _ => {}
                 }
-            } else if let Some((kind, v)) = l.on_peer_packet(from, pkt, &mut out) {
+            } else if let Some((peer, kind, v)) = l.on_peer_packet(from, pkt, &mut out) {
                 match kind {
                     udp::VIDEO => on_server_video(&v, &state),
-                    _ => on_server_voice(&v, &state, &mixer, &mut pcm),
+                    _ => {
+                        l.relay_forward(peer, &v, &mut out);
+                        on_server_voice(&v, &state, &mixer, &mut pcm);
+                    }
                 }
             }
         }
@@ -1269,6 +1373,128 @@ mod tests {
             assert!(!matches!(o, Outgoing::Voice(_)), "voice must not go via server when all peers are direct");
         }
         sa.disconnect();
+        sb.disconnect();
+    }
+
+    #[test]
+    fn relay_capacity_from_budget() {
+        // 15 Mbps，5 人全部直连语音：用掉 0.3 Mbps，剩下的足够 → 封顶 8 路
+        assert_eq!(relay_slots(15_000_000, 5, 5, 0, 0, 0), 8);
+        // 0.5 Mbps，5 人直连 = 0.3 Mbps，剩 0.2 → 3 路
+        assert_eq!(relay_slots(500_000, 5, 5, 0, 0, 0), 3);
+        // 有人没直连，还要算给服务器的一份：0.36 → 剩 0.14 → 2 路
+        assert_eq!(relay_slots(500_000, 5, 9, 0, 0, 0), 2);
+        // 正在共享 1080p60 给 2 个直连观看者：预算用光了
+        assert_eq!(relay_slots(12_000_000, 5, 5, 5_500_000, 2, 2), 2); // 剩 0.15 Mbps
+        assert_eq!(relay_slots(11_800_000, 5, 5, 5_500_000, 2, 2), 0);
+    }
+
+    /// 三个真实 Link：A(3)、R(5)、B(7)。A–R、R–B 打通直连，A 和 B 互相不知道地址（模拟打不通）。
+    /// 服务器安排 A→B 经 R：B 要能听到 A，而且 A 不再把语音发给服务器。
+    #[test]
+    fn member_relay_delivers_voice() {
+        use std::sync::mpsc;
+        let keys = SessionKeys {
+            tcp_c2s: [1; 32],
+            tcp_s2c: [2; 32],
+            udp_c2s: [3; 32],
+            udp_s2c: [4; 32],
+            udp_c2s_hp: [5; 32],
+            udp_s2c_hp: [6; 32],
+        };
+        // 三方端到端密钥
+        let ids = [3u32, 5, 7];
+        let mut es: Vec<E2e> = ids.iter().map(|&i| E2e::new(i, &format!("user{i}"), Identity::generate(), HashMap::new())).collect();
+        crate::e2e::tests::route_all(&mut es);
+        for (k, e) in es.iter_mut().enumerate() {
+            e.set_channel_others(ids.iter().copied().filter(|&x| x != ids[k]).collect());
+        }
+        crate::e2e::tests::route_all(&mut es);
+        for e in &es {
+            for &o in ids.iter().filter(|&&o| o != e.my_id) {
+                assert!(e.pair_keys(o).is_some(), "{} has no pair key with {o}", e.my_id);
+            }
+        }
+        let es: Vec<Arc<Mutex<E2e>>> = es.into_iter().map(|e| Arc::new(Mutex::new(e))).collect();
+
+        let dummy_server: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mk = |id: u32, e2e: Arc<Mutex<E2e>>| {
+            let (tx, rx) = mpsc::channel::<Outgoing>();
+            let st = Arc::new(VoiceState::default());
+            let mx = Arc::new(Mutex::new(Mixer::default()));
+            connect(dummy_server, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            (st.current_link().unwrap(), st, rx)
+        };
+        let (la, sa, rxa) = mk(3, es[0].clone());
+        let (lr, sr, _rxr) = mk(5, es[1].clone());
+        let (lb, sb, _rxb) = mk(7, es[2].clone());
+        let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
+        for l in [&la, &lr, &lb] {
+            let me = l.my_id;
+            l.set_others(ids.iter().copied().filter(|&x| x != me).collect());
+        }
+        // A 只认识 R；B 只认识 R；R 认识两人
+        la.on_peers(vec![PeerInfo { id: 5, addrs: vec![addr(&lr)] }]);
+        lb.on_peers(vec![PeerInfo { id: 5, addrs: vec![addr(&lr)] }]);
+        lr.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }, PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
+        let t = Instant::now();
+        while !(la.direct_peers().contains_key(&5) && lb.direct_peers().contains_key(&5) && lr.direct_peers().len() == 2) {
+            assert!(t.elapsed() < Duration::from_secs(5), "hole punching did not complete");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 等 A 的分配把 R 列入直连
+        let t = Instant::now();
+        while !la.allocation().0.contains(&5) {
+            assert!(t.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 服务器下发的路线（双向都经 R）
+        let routes = vec![
+            RelayRoute { from: 3, to: 7, via: 5, ms: 20, server_ms: 120 },
+            RelayRoute { from: 7, to: 3, via: 5, ms: 20, server_ms: 120 },
+        ];
+        for l in [&la, &lr, &lb] {
+            l.set_relays(routes.clone());
+        }
+        while rxa.try_recv().is_ok() {}
+
+        let mut enc = new_encoder();
+        let mut buf = vec![0u8; MAX_OPUS_PACKET];
+        let pcm: Vec<i16> = (0..FRAME_SAMPLES).map(|i| ((i as f32 * 0.2).sin() * 8000.0) as i16).collect();
+        let n = enc.encode(&pcm, &mut buf).unwrap();
+        let sealed = es[0].lock().unwrap().encrypt_frame(&buf[..n]);
+        let mut scratch = Vec::new();
+        la.send_voice(&sealed, &mut scratch);
+        let t = Instant::now();
+        while !sb.is_speaking(3) {
+            assert!(t.elapsed() < Duration::from_secs(2), "B did not hear A through the relay");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sr.is_speaking(3), "the relay also hears A (it is a channel member)");
+        while let Ok(o) = rxa.try_recv() {
+            assert!(!matches!(o, Outgoing::Voice(_)), "A must not send voice to the server when everyone is covered");
+        }
+
+        // 中继关掉后：R 不再转发
+        lr.set_relay_enabled(false);
+        std::thread::sleep(Duration::from_millis(300));
+        let sealed = es[0].lock().unwrap().encrypt_frame(&buf[..n]);
+        sb.last_heard.lock().unwrap().clear();
+        la.send_voice(&sealed, &mut scratch);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!sb.is_speaking(3), "relay turned off must not forward");
+
+        // R 不转发「别人转来的」包：B 的语音经 R 到 A 是可以的，但 R 不会把 A 发来的、声称来自 B 的包转出去
+        lr.set_relay_enabled(true);
+        let forged = udp::server_voice(7, 1, &sealed); // A 冒充 B 的包
+        let mut out = Vec::new();
+        let before = sb.last_heard.lock().unwrap().len();
+        lr.relay_forward(3, &forged, &mut out);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(sb.last_heard.lock().unwrap().len(), before);
+
+        sa.disconnect();
+        sr.disconnect();
         sb.disconnect();
     }
 

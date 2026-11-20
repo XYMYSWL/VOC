@@ -93,6 +93,36 @@ pub enum ClientMsg {
     Caps {
         decoders: Vec<String>,
     },
+    /// 每 2 秒上报一次链路质量，服务器据此安排成员互相中转语音（成员中继）。
+    /// server_rtt：到服务器的往返延迟；peers：已打通且稳定的直连；relay_slots：还能帮别人中转几路语音（0 = 不当中继）
+    LinkStats {
+        server_rtt: u32,
+        peers: Vec<PeerStat>,
+        relay_slots: u16,
+    },
+}
+
+/// 一条直连链路的质量（最近 10 秒）
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerStat {
+    pub id: u32,
+    pub rtt: u32,
+    pub loss: u8,
+    pub jitter: u32,
+}
+
+/// 成员中继路线：from 的语音由 via 直连转发给 to（服务器不再转发这一路）
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RelayRoute {
+    pub from: u32,
+    pub to: u32,
+    pub via: u32,
+    /// 经中继的预计往返延迟（ms）：R–A 往返 + R–B 往返 + 转发开销
+    #[serde(default)]
+    pub ms: u32,
+    /// 同一对人走服务器中转的预计往返延迟（ms）：A–服务器往返 + B–服务器往返。界面用来对比
+    #[serde(default)]
+    pub server_ms: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -144,6 +174,10 @@ pub enum ServerMsg {
     /// 发给共享者：某观看者请求关键帧
     KeyframeRequest {
         by: u32,
+    },
+    /// 本频道当前的成员中继路线（有变化才发）
+    Relays {
+        routes: Vec<RelayRoute>,
     },
 }
 

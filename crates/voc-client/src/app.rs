@@ -42,6 +42,8 @@ struct Persisted {
     share: ShareConfig,
     /// P2P 直连可用的上行带宽（Mbps）：超出部分走服务器中转
     p2p_budget_mbps: u32,
+    /// 允许帮队友中转语音（成员中继）
+    relay: bool,
     /// 观看屏幕共享时用显卡硬解
     hw_decode: bool,
     /// 启动时检查更新
@@ -83,6 +85,7 @@ impl Default for Persisted {
             p2p: true,
             share: ShareConfig::default(),
             p2p_budget_mbps: 15,
+            relay: true,
             hw_decode: false,
             auto_update: true,
             sfx: true,
@@ -396,6 +399,7 @@ impl App {
                         }
                         if let Some(l) = self.voice.current_link() {
                             l.set_budget(self.cfg.p2p_budget_mbps * 1_000_000);
+                            l.set_relay_enabled(self.cfg.relay);
                         }
                         s.send(ClientMsg::Caps { decoders: video::local_decoders().iter().map(|c| c.key().to_string()).collect() });
                         s.send(ClientMsg::SetState {
@@ -506,6 +510,11 @@ impl App {
                             l.on_peers(peers);
                         }
                     }
+                    ServerMsg::Relays { routes } => {
+                        if let Some(l) = self.voice.current_link() {
+                            l.set_relays(routes);
+                        }
+                    }
                     ServerMsg::Directory { entries } => {
                         for entry in entries {
                             s.on_e2e_entry(entry);
@@ -564,6 +573,7 @@ struct Demo {
     speaking: Vec<u32>,
     transport: Option<bool>,
     ping: u32,
+    relays: Vec<voc_proto::RelayRoute>,
 }
 
 impl App {
@@ -644,6 +654,9 @@ impl App {
             (7, (Trust::New, code(7), false)),
         ]
         .into();
+        // 小鱼和我打不通，经阿豪中继；我帮阿豪把语音转给 Mia
+        let rt = |from, to, via, ms, server_ms| voc_proto::RelayRoute { from, to, via, ms, server_ms };
+        self.demo.relays = vec![rt(4, 1, 2, 62, 148), rt(1, 4, 2, 62, 148), rt(2, 5, 1, 64, 133)];
         self.demo.speaking = vec![2];
         self.demo.transport = Some(true);
         self.demo.ping = 49;
