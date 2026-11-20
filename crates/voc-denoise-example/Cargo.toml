@@ -1,0 +1,10 @@
+[package]
+name = "voc-denoise-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "降噪插件接口的最小示例（音量减半），用于测试插件加载"
+
+[lib]
+crate-type = ["cdylib"]

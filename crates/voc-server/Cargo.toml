@@ -1,0 +1,17 @@
+[package]
+name = "voc-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+voc-proto = { path = "../voc-proto" }
+serde_json.workspace = true
+serde.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+socket2 = "0.6"
+
+[dev-dependencies]
+serde_json.workspace = true
+serde.workspace = true

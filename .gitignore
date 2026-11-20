@@ -1,0 +1,12 @@
+# 编译产物
+/target/
+/dist/
+*.tmp
+
+# 安装包与签名私钥（私钥只在 %USERPROFILE%\.voc-signing，绝不要提交）
+*.msix
+*.pfx
+pfx-password.txt
+
+# 服务器授权码文件
+voc-codes.json

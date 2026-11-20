@@ -1,0 +1,10 @@
+# 交叉编译 Linux 服务端（musl 静态链接，用 Rust 自带的 lld 链接，无需 Linux 工具链）
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+
+# Windows 版静态链接 C 运行库：发给别人时不需要另装 VC++ 运行库
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

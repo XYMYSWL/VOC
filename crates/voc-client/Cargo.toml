@@ -1,0 +1,23 @@
+[package]
+name = "voc-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+voc-proto = { path = "../voc-proto" }
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.37", features = ["persistence"] }
+cpal = "0.18"
+nnnoiseless = { version = "0.5.2", default-features = false }
+libloading = "0.9.1"
+opus = "0.4"
+socket2 = { version = "0.6", features = ["all"] }
+openh264 = "0.9"
+windows-capture = "2"
+igd-next = "0.18"
+png = "0.18"
+windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_Variant", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D"] }
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
