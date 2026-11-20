@@ -886,6 +886,22 @@ impl App {
                     );
                     ui.label(RichText::new("开源协议：MIT").size(12.0).color(th::TEXT_DIM));
                     ui.add_space(8.0);
+                    th::section(ui, "诊断");
+                    ui.horizontal(|ui| {
+                        if ui.button("📋 复制诊断信息").on_hover_text("复制到剪贴板，可以直接粘贴发给帮你排查问题的人").clicked() {
+                            ctx.copy_text(self.diagnostics());
+                            self.diag_copied = Some(std::time::Instant::now());
+                        }
+                        if self.diag_copied.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)) {
+                            ui.label(RichText::new("已复制").color(th::GREEN));
+                        }
+                    });
+                    ui.label(
+                        RichText::new("包含版本、系统、网络质量、声卡和编解码器信息；不含聊天、密钥、授权码、服务器地址和任何人的 IP。")
+                            .size(11.5)
+                            .color(th::TEXT_FAINT),
+                    );
+                    ui.add_space(8.0);
                     th::section(ui, "更新");
                     ui.checkbox(&mut self.cfg.auto_update, "启动时自动检查更新");
                     ui.horizontal(|ui| {

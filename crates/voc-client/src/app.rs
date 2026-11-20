@@ -185,6 +185,8 @@ pub struct App {
     settings_tab: u8,
     sfx_seq: u16,
     updater: crate::update::Updater,
+    /// 上次点「复制诊断信息」的时间（显示「已复制」）
+    diag_copied: Option<std::time::Instant>,
     demo: Demo,
 }
 
@@ -250,6 +252,7 @@ impl App {
             settings_tab: 0,
             sfx_seq: 0,
             updater: crate::update::Updater::default(),
+            diag_copied: None,
             demo: Demo::default(),
         };
         app.restart_audio();
@@ -328,6 +331,63 @@ impl App {
                 deafened: self.settings.deafened.load(Ordering::Relaxed),
             });
         }
+    }
+
+    /// 诊断信息（给别人排查问题用）：版本、系统、网络、声卡、编解码器。
+    /// 不含聊天、密钥、授权码、服务器地址和任何人的 IP。
+    fn diagnostics(&self) -> String {
+        use std::fmt::Write;
+        let mut d = String::new();
+        let _ = writeln!(d, "VOC 诊断信息");
+        let _ = writeln!(d, "版本：{}", crate::update::VERSION);
+        let _ = writeln!(d, "系统：{}", os_version());
+        let _ = writeln!(d, "安装方式：{}", if crate::update::is_packaged() { "安装版（MSIX）" } else { "绿色版" });
+        let _ = writeln!(d, "\n[网络]");
+        match (&self.screen, self.voice.current_link()) {
+            (Screen::Main(_), Some(l)) => {
+                let tr = match self.voice.transport_udp() {
+                    Some(true) => "UDP",
+                    Some(false) => "TCP 隧道（UDP 不通）",
+                    None => "未知",
+                };
+                let _ = writeln!(d, "已连接：是 · 传输 {tr} · 到服务器 {} ms", self.voice.ping_ms.load(Ordering::Relaxed));
+                let _ = writeln!(d, "P2P：{} · 上行预算 {} Mbps · 帮队友中转：{}", if l.p2p_on() { "开" } else { "关" }, self.cfg.p2p_budget_mbps, if self.cfg.relay { "开" } else { "关" });
+                let states = l.punch_states();
+                let count = |f: &dyn Fn(&voice::PunchState) -> bool| states.values().filter(|s| f(s)).count();
+                let _ = writeln!(
+                    d,
+                    "直连：已打通 {} · 打洞中 {} · 打不通 {} · 等待密钥 {}",
+                    count(&|s| matches!(s, voice::PunchState::Connected(_))),
+                    count(&|s| matches!(s, voice::PunchState::Punching(_))),
+                    count(&|s| matches!(s, voice::PunchState::Failed(_))),
+                    count(&|s| matches!(s, voice::PunchState::WaitingKeys)),
+                );
+                for q in l.direct_peers().values() {
+                    let _ = writeln!(d, "  链路：{} ms · 丢包 {}% · 抖动 {} ms{}", q.rtt_ms, q.loss_pct, q.jitter_ms, if q.unstable { " · 不稳" } else { "" });
+                }
+                let me = l.my_id();
+                let routes = l.relays();
+                let _ = writeln!(
+                    d,
+                    "成员中继：经队友收听 {} 路 · 我在转发 {} 路",
+                    routes.iter().filter(|r| r.to == me).count(),
+                    routes.iter().filter(|r| r.via == me).count()
+                );
+            }
+            _ => {
+                let _ = writeln!(d, "已连接：否");
+            }
+        }
+        let _ = writeln!(d, "\n[声音]");
+        let _ = writeln!(d, "麦克风：{}", self.cfg.input_device.as_deref().unwrap_or("系统默认"));
+        let _ = writeln!(d, "扬声器：{}", self.cfg.output_device.as_deref().unwrap_or("系统默认"));
+        let _ = writeln!(d, "降噪：{:?} · 语音激活阈值 {} dB", self.cfg.denoise, self.cfg.vad_threshold_db);
+        let _ = writeln!(d, "\n[视频]");
+        let enc: Vec<String> = video::hw_encoders().iter().map(|e| format!("{} ({})", e.name, e.gpu)).collect();
+        let _ = writeln!(d, "硬件编码器：{}", if enc.is_empty() { "无".into() } else { enc.join("、") });
+        let dec: Vec<&str> = video::local_decoders().iter().map(|c| c.key()).collect();
+        let _ = writeln!(d, "可解码：{} · 解码方式 {}", dec.join(" / "), if self.cfg.hw_decode { "硬解" } else { "软解" });
+        d
     }
 
     fn go_login(&mut self, error: Option<String>) {
@@ -724,4 +784,20 @@ fn save_png(path: &str, img: &egui::ColorImage) -> Result<(), String> {
     let mut wr = enc.write_header().map_err(|e| e.to_string())?;
     let data: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
     wr.write_image_data(&data).map_err(|e| e.to_string())
+}
+
+/// Windows 版本（例如 "Microsoft Windows [版本 10.0.26200.xxxx]"）
+fn os_version() -> String {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if let Ok(o) = std::process::Command::new("cmd").args(["/c", "ver"]).creation_flags(CREATE_NO_WINDOW).output() {
+            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    std::env::consts::OS.to_string()
 }
