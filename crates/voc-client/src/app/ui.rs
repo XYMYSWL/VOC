@@ -7,6 +7,42 @@ use eframe::egui::{Align, Align2, Color32, CornerRadius, Layout, Margin, RichTex
 impl App {
     // ============================================================ 登录页
 
+    /// 网络断开、正在自动重连
+    fn ui_reconnecting(&mut self, ui: &mut egui::Ui) {
+        let Screen::Reconnecting(r) = &self.screen else { return };
+        let (reason, attempt, busy) = (r.reason.clone(), r.attempt, r.pending.is_some());
+        let wait = r.next_at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1;
+        let mut cancel = false;
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(th::BG_BASE)).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.28).max(40.0));
+                ui.label(RichText::new("与服务器的连接断开了").size(22.0).strong().color(th::TEXT));
+                ui.add_space(6.0);
+                ui.label(RichText::new(&reason).size(13.0).color(th::TEXT_DIM));
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    ui.add_space((ui.available_width() - 220.0).max(0.0) / 2.0);
+                    ui.spinner();
+                    let text = if busy {
+                        format!("正在重连…（第 {} 次）", attempt + 1)
+                    } else {
+                        format!("{wait} 秒后重连（已失败 {attempt} 次）")
+                    };
+                    ui.label(RichText::new(text).color(th::TEXT));
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("连上后会自动回到原来的语音频道，聊天记录还在。").size(12.0).color(th::TEXT_FAINT));
+                ui.add_space(16.0);
+                if ui.button("取消，回到登录页").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if cancel {
+            self.go_login(None);
+        }
+    }
+
     fn ui_login(&mut self, ui: &mut egui::Ui, error: Option<String>, connecting: bool) {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(th::BG_BASE)).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1270,8 +1306,12 @@ impl eframe::App for App {
         if self.updater.get() == crate::update::UpdateState::Launched {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if let Some(err) = self.poll_network() {
-            self.go_login(Some(err));
+        if let Some(d) = self.poll_network() {
+            if d.retry && !self.demo.active {
+                self.begin_reconnect(d.reason);
+            } else {
+                self.go_login(Some(d.reason));
+            }
         }
         let (m, d) = ui.input(|i| {
             (i.modifiers.command && i.key_pressed(egui::Key::M), i.modifiers.command && i.key_pressed(egui::Key::D))
@@ -1292,6 +1332,7 @@ impl eframe::App for App {
             }
             Screen::Connecting(_) => self.ui_login(ui, None, true),
             Screen::Main(_) => self.ui_main(ui),
+            Screen::Reconnecting(_) => self.ui_reconnecting(ui),
         }
         let ctx = ui.ctx().clone();
         self.ui_settings(&ctx);
@@ -1302,8 +1343,8 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if self.demo.active {
-            return; // 演示模式不覆盖真实配置
+        if self.demo.active || self.test_mode {
+            return; // 演示 / 测试模式不覆盖真实配置
         }
         if self.cfg.remember_code {
             self.cfg.code = self.code_input.trim().to_string();

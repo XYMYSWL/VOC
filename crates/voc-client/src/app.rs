@@ -153,6 +153,54 @@ enum Screen {
     Login { error: Option<String> },
     Connecting(Receiver<ConnectResult>),
     Main(Box<Session>),
+    /// 网络断开后自动重连
+    Reconnecting(Box<Reconnect>),
+}
+
+/// 自动重连的状态
+struct Reconnect {
+    /// 上次断开 / 连接失败的原因
+    reason: String,
+    /// 已经失败了几次
+    attempt: u32,
+    /// 下一次尝试的时间
+    next_at: std::time::Instant,
+    /// 正在进行的连接
+    pending: Option<Receiver<ConnectResult>>,
+}
+
+/// 第 n 次失败后等多久再试：1、2、5、10、20、30 秒，之后一直 30 秒
+pub fn reconnect_delay(attempt: u32) -> Duration {
+    const STEPS: [u64; 6] = [1, 2, 5, 10, 20, 30];
+    Duration::from_secs(STEPS[(attempt as usize).min(STEPS.len() - 1)])
+}
+
+/// 连接断开的原因，以及要不要自动重连
+pub struct Dropped {
+    pub reason: String,
+    /// true = 网络断开，自动重连；false = 服务器主动断开（吊销、顶号等）或登录失败
+    pub retry: bool,
+}
+
+/// 关闭 VOC 时清空聊天：先把内容覆盖成 0 再释放（阅后即焚）
+/// 把字符串内容覆盖成 0 再清空（全 0 字节仍是合法 UTF-8）
+fn wipe_string(s: &mut String) {
+    unsafe { s.as_bytes_mut().fill(0) };
+    s.clear();
+}
+
+fn wipe_chat(lines: &mut Vec<ChatLine>) {
+    let wipe = wipe_string;
+    for l in lines.iter_mut() {
+        match l {
+            ChatLine::User { from, text, .. } => {
+                wipe(from);
+                wipe(text);
+            }
+            ChatLine::System(t) => wipe(t),
+        }
+    }
+    lines.clear();
 }
 
 pub struct App {
@@ -187,6 +235,13 @@ pub struct App {
     updater: crate::update::Updater,
     /// 上次点「复制诊断信息」的时间（显示「已复制」）
     diag_copied: Option<std::time::Instant>,
+    /// 断开后保留的聊天（按服务器），只在内存里，关闭 VOC 时清空
+    chat_store: HashMap<String, Vec<ChatLine>>,
+    /// 重连成功后要回到的语音频道
+    rejoin: Option<u32>,
+    egui_ctx: egui::Context,
+    /// VOC_AUTOLOGIN 测试模式：不保存配置
+    test_mode: bool,
     demo: Demo,
 }
 
@@ -253,12 +308,26 @@ impl App {
             sfx_seq: 0,
             updater: crate::update::Updater::default(),
             diag_copied: None,
+            chat_store: HashMap::new(),
+            rejoin: None,
+            egui_ctx: cc.egui_ctx.clone(),
             demo: Demo::default(),
+            test_mode: false,
         };
         app.restart_audio();
         app.apply_denoise();
         if let Ok(kind) = std::env::var("VOC_DEMO") {
             app.load_demo(&kind);
+        } else if let Ok(spec) = std::env::var("VOC_AUTOLOGIN") {
+            // 测试用：VOC_AUTOLOGIN="地址|昵称|授权码|频道ID"，自动登录并进频道；不读写保存的配置
+            let parts: Vec<&str> = spec.split('|').collect();
+            app.test_mode = true;
+            app.cfg.server = parts.first().unwrap_or(&"").to_string();
+            app.cfg.name = parts.get(1).unwrap_or(&"tester").to_string();
+            app.code_input = parts.get(2).unwrap_or(&"").to_string();
+            app.cfg.pins.clear();
+            app.start_connect(&cc.egui_ctx);
+            app.rejoin = parts.get(3).and_then(|c| c.parse().ok());
         } else if app.cfg.auto_update {
             app.updater.check(cc.egui_ctx.clone());
         }
@@ -298,7 +367,14 @@ impl App {
         self.output_devices = audio::output_device_names();
     }
 
-    fn start_connect(&mut self, ctx: &egui::Context) {
+    fn start_connect(&mut self, _ctx: &egui::Context) {
+        self.rejoin = None;
+        self.screen = Screen::Connecting(self.spawn_connect());
+    }
+
+    /// 后台建立连接，结果从返回的通道里取
+    fn spawn_connect(&self) -> Receiver<ConnectResult> {
+        let ctx = &self.egui_ctx;
         let addr = self.cfg.server.clone();
         let name = self.cfg.name.clone();
         let code = self.code_input.clone();
@@ -321,7 +397,54 @@ impl App {
             let _ = tx.send(r);
             ctx2.request_repaint();
         });
-        self.screen = Screen::Connecting(rx);
+        rx
+    }
+
+    /// 离开主界面前：关掉共享 / 观看 / 语音，把聊天存起来（重新连上同一个服务器时接着显示）
+    fn leave_main(&mut self) {
+        self.sharer = None;
+        self.share_confirmed = false;
+        self.views.clear();
+        self.voice.disconnect();
+        self.mixer.lock().unwrap().clear();
+        if let Screen::Main(s) = &mut self.screen {
+            if s.conn.is_some() {
+                let chat = std::mem::take(&mut s.chat);
+                self.chat_store.insert(s.server_key.clone(), chat);
+            }
+        }
+    }
+
+    /// 网络断开：记住所在频道，开始自动重连
+    fn begin_reconnect(&mut self, reason: String) {
+        if let Screen::Main(s) = &self.screen {
+            self.rejoin = s.me().and_then(|u| u.channel_id);
+        }
+        self.leave_main();
+        self.screen = Screen::Reconnecting(Box::new(Reconnect {
+            reason,
+            attempt: 0,
+            next_at: std::time::Instant::now() + reconnect_delay(0),
+            pending: None,
+        }));
+    }
+
+    fn new_session(&mut self, conn: Conn, events: Receiver<NetEvent>) -> Session {
+        let server_key = self.cfg.server.trim().to_string();
+        Session {
+            conn: Some(conn),
+            last_members: None,
+            events,
+            user_id: 0,
+            server_name: String::new(),
+            channels: Vec::new(),
+            users: Vec::new(),
+            chat: self.chat_store.remove(&server_key).unwrap_or_default(),
+            chat_input: String::new(),
+            new_channel: String::new(),
+            server_key,
+            e2e: None,
+        }
     }
 
     fn sync_voice_state(&self) {
@@ -391,45 +514,64 @@ impl App {
     }
 
     fn go_login(&mut self, error: Option<String>) {
-        self.sharer = None;
-        self.share_confirmed = false;
-        self.views.clear();
-        self.voice.disconnect();
-        self.mixer.lock().unwrap().clear();
+        self.leave_main();
+        self.rejoin = None;
         self.screen = Screen::Login { error };
     }
 
-    /// 处理网络事件；返回 Some(原因) 表示连接已断开
-    fn poll_network(&mut self) -> Option<String> {
+    /// 处理网络事件；返回 Some 表示连接已断开
+    fn poll_network(&mut self) -> Option<Dropped> {
+        let fail = |reason: String| Some(Dropped { reason, retry: false });
         // 连接中
         if let Screen::Connecting(rx) = &self.screen {
             match rx.try_recv() {
                 Ok(Ok((conn, events))) => {
-                    self.screen = Screen::Main(Box::new(Session {
-                        conn: Some(conn),
-                        last_members: None,
-                        events,
-                        user_id: 0,
-                        server_name: String::new(),
-                        channels: Vec::new(),
-                        users: Vec::new(),
-                        chat: Vec::new(),
-                        chat_input: String::new(),
-                        new_channel: String::new(),
-                        server_key: self.cfg.server.trim().to_string(),
-                        e2e: None,
-                    }));
+                    let s = self.new_session(conn, events);
+                    self.screen = Screen::Main(Box::new(s));
                 }
-                Ok(Err(e)) => return Some(e),
+                Ok(Err(e)) => return fail(e),
                 Err(mpsc::TryRecvError::Empty) => return None,
-                Err(mpsc::TryRecvError::Disconnected) => return Some("连接线程异常退出".into()),
+                Err(mpsc::TryRecvError::Disconnected) => return fail("连接线程异常退出".into()),
+            }
+        }
+        // 自动重连
+        if let Screen::Reconnecting(r) = &mut self.screen {
+            match r.pending.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(Ok((conn, events)))) => {
+                    let mut s = self.new_session(conn, events);
+                    s.chat.push(ChatLine::System("已重新连接".into()));
+                    self.screen = Screen::Main(Box::new(s));
+                }
+                Some(Ok(Err(e))) => {
+                    r.attempt += 1;
+                    r.reason = e;
+                    r.pending = None;
+                    r.next_at = std::time::Instant::now() + reconnect_delay(r.attempt);
+                    return None;
+                }
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    r.attempt += 1;
+                    r.pending = None;
+                    r.next_at = std::time::Instant::now() + reconnect_delay(r.attempt);
+                    return None;
+                }
+                Some(Err(mpsc::TryRecvError::Empty)) => return None,
+                None => {
+                    if std::time::Instant::now() >= r.next_at {
+                        let rx = self.spawn_connect();
+                        if let Screen::Reconnecting(r) = &mut self.screen {
+                            r.pending = Some(rx);
+                        }
+                    }
+                    return None;
+                }
             }
         }
 
         let Screen::Main(s) = &mut self.screen else { return None };
         while let Ok(ev) = s.events.try_recv() {
             match ev {
-                NetEvent::Closed(reason) => return Some(reason),
+                NetEvent::Closed(reason) => return Some(Dropped { reason, retry: true }),
                 NetEvent::Msg(msg) => match msg {
                     ServerMsg::Welcome { user_id, udp_port, server_name } => {
                         s.user_id = user_id;
@@ -467,10 +609,17 @@ impl App {
                             deafened: self.settings.deafened.load(Ordering::Relaxed),
                         });
                     }
-                    ServerMsg::Error { message } => return Some(message),
+                    ServerMsg::Error { message } => return fail(message),
                     ServerMsg::State { channels, users } => {
                         s.channels = channels;
                         s.users = users;
+                        // 重连后回到原来的语音频道
+                        if let (Some(ch), Some(me)) = (self.rejoin, s.me()) {
+                            if me.channel_id.is_none() && s.channels.iter().any(|c| c.id == ch) {
+                                s.send(ClientMsg::JoinChannel { channel_id: ch });
+                            }
+                            self.rejoin = None;
+                        }
                         let in_ch = s.me().is_some_and(|u| u.channel_id.is_some());
                         if let Some(l) = self.voice.current_link() {
                             l.in_channel.store(in_ch, Ordering::Relaxed);
@@ -800,4 +949,45 @@ fn os_version() -> String {
         }
     }
     std::env::consts::OS.to_string()
+}
+
+impl Drop for App {
+    /// 关闭 VOC：聊天记录覆盖清零后释放，不留在内存里
+    fn drop(&mut self) {
+        if let Screen::Main(s) = &mut self.screen {
+            wipe_chat(&mut s.chat);
+        }
+        for chat in self.chat_store.values_mut() {
+            wipe_chat(chat);
+        }
+        self.chat_store.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff() {
+        let secs: Vec<u64> = (0..8).map(|a| reconnect_delay(a).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 5, 10, 20, 30, 30, 30]);
+    }
+
+    #[test]
+    fn chat_is_wiped() {
+        let mut t = String::from("密码是 1234");
+        let (p, n) = (t.as_ptr(), t.len());
+        wipe_string(&mut t);
+        assert!(t.is_empty());
+        // clear 不释放缓冲区，可以检查原来的字节已经被覆盖成 0
+        let old = unsafe { std::slice::from_raw_parts(p, n) };
+        assert!(old.iter().all(|&b| b == 0));
+        let mut chat = vec![
+            ChatLine::User { from: "小明".into(), text: "你好".into(), ts: 0, mine: false },
+            ChatLine::System("小明 进入了频道".into()),
+        ];
+        wipe_chat(&mut chat);
+        assert!(chat.is_empty());
+    }
 }
