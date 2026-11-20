@@ -1,5 +1,5 @@
 # VOC 一键安装：信任 VOC 的签名证书（只放进「受信任人」，不是根证书），然后安装 / 升级 MSIX。
-# 用法：双击同目录的「安装VOC.cmd」即可（会请求一次管理员权限，用来导入证书）。
+# 用法：双击同目录的「Install-VOC.cmd」即可（会请求一次管理员权限，用来导入证书）。
 param([switch]$Elevated)
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path

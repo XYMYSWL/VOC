@@ -108,4 +108,13 @@ mod tests {
         assert!(!is_newer("v0.2.0", "0.2.0"));
         assert!(!is_newer("v0.1.9", "0.2.0"));
     }
+
+    /// 真实访问 GitHub：cargo test -p voc-client live_fetch -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_fetch() {
+        let (tag, url) = fetch_latest().unwrap();
+        println!("latest = {tag} {url}");
+        assert!(tag.starts_with('v'));
+    }
 }

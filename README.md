@@ -47,11 +47,11 @@ plugins/
 
 ## 安装（Windows 客户端）
 
-到 [Releases](https://github.com/XYMYSWL/VOC/releases) 下载最新的 `VOC-<版本>.msix`、`VOC.cer`、`install.ps1`、`安装VOC.cmd`，
-放同一个文件夹，双击 **`安装VOC.cmd`**（会请求管理员权限）。
+到 [Releases](https://github.com/XYMYSWL/VOC/releases) 下载最新的 `VOC-<版本>.msix`、`VOC.cer`、`install.ps1`、`Install-VOC.cmd`，
+放同一个文件夹，双击 **`Install-VOC.cmd`**（会请求管理员权限）。
 
 - 安装包是**自签名**的：脚本会先把 `VOC.cer` 导入本机「受信任的人」证书库，再安装 MSIX。只需要做一次，以后升级直接双击新的 `.msix` 即可。
-- 不想装证书？下载 `VOC客户端.zip`，解压直接运行 `voc-client.exe`（绿色版）。
+- 不想装证书？下载 `VOC-portable.zip`，解压直接运行 `voc-client.exe`（绿色版）。
 - 卸载：开始菜单右键 VOC → 卸载。
 - 需要 Windows 10 1903 及以上。
 

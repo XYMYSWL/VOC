@@ -1,6 +1,6 @@
 # 一键编译发布版：
 #   dist\voc-client.exe / voc-server.exe            Windows 客户端 / 服务端
-#   dist\VOC-<版本>.msix + VOC.cer + 安装VOC.cmd    Windows 安装包（自签名）
+#   dist\VOC-<版本>.msix + VOC.cer + Install-VOC.cmd    Windows 安装包（自签名）
 #   dist\voc-server-linux.tar.gz                     Linux 服务端安装包
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -20,7 +20,7 @@ if (Test-Path $cli) { Remove-Item -Recurse -Force $cli }
 New-Item -ItemType Directory -Force $cli | Out-Null
 Copy-Item "$target\release\voc-client.exe" "$cli\VOC.exe"
 Copy-Item deploy\windows\使用说明.txt $cli
-Compress-Archive -Path $cli -DestinationPath dist\VOC客户端.zip -Force
+Compress-Archive -Path $cli -DestinationPath dist\VOC-portable.zip -Force
 
 # Linux 服务端
 $pkg = "dist\voc-server-linux"

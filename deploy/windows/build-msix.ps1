@@ -65,7 +65,7 @@ if ($LASTEXITCODE -ne 0) { throw "signtool 签名失败" }
 # 公钥证书（给别人信任用）
 $cer = Join-Path $Out "VOC.cer"
 [IO.File]::WriteAllBytes($cer, $pfxObj.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-Copy-Item (Join-Path $PSScriptRoot "安装VOC.cmd") $Out -Force
+Copy-Item (Join-Path $PSScriptRoot "Install-VOC.cmd") $Out -Force
 Copy-Item (Join-Path $PSScriptRoot "install.ps1") $Out -Force
 Remove-Item -Recurse -Force $stage
 Write-Host "完成：$msix（版本 $msixVer，签名 $Publisher，证书指纹 $($pfxObj.Thumbprint)）"
