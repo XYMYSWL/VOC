@@ -8,6 +8,7 @@
 #   sudo bash install.sh --upgrade                        # 只更新程序，保留配置和授权码
 #
 # 再次运行即为升级：授权码（/var/lib/voc）和配置（/etc/voc）都会保留。
+# 不想手动下载解压？用一键脚本：curl -fsSL https://github.com/XYMYSWL/VOC/releases/latest/download/get.sh | sudo bash
 
 set -euo pipefail
 
@@ -20,6 +21,7 @@ FIREWALL=1
 
 BIN=/usr/local/bin/voc-server
 ADMIN=/usr/local/bin/voc
+LIB=/usr/local/lib/voc
 CONF_DIR=/etc/voc
 CONF=$CONF_DIR/voc.conf
 DATA=/var/lib/voc
@@ -33,7 +35,7 @@ info()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
 die()   { red "错误：$*"; exit 1; }
 
 usage() {
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
     cat <<'EOF'
 选项：
   --port <端口>         监听端口（TCP+UDP 同端口），默认 7878；想更好地混在普通流量里可用 443
@@ -167,6 +169,8 @@ cat > "$ADMIN" <<EOF
 #   voc revoke-code <ID> / voc restore-code <ID>          吊销 / 恢复
 #   voc status | logs | restart | stop | start           服务管理
 #   voc config                                           编辑配置
+#   voc upgrade [vX.Y.Z]                                 升级到最新版（或指定版本），保留授权码和配置
+#   voc version                                          显示版本
 set -e
 [ "\$(id -u)" -eq 0 ] || { echo "请用 sudo 运行：sudo voc \$*"; exit 1; }
 case "\${1:-}" in
@@ -174,6 +178,10 @@ case "\${1:-}" in
     logs) exec journalctl -u voc-server -f -n 100 ;;
     restart|stop|start) exec systemctl "\$1" voc-server ;;
     config) "\${EDITOR:-nano}" $CONF && systemctl restart voc-server && echo "已重启生效" ;;
+    version) exec $BIN --version ;;
+    upgrade)
+        [ -n "\${2:-}" ] && export VOC_VERSION="\$2"
+        exec bash $LIB/get.sh --upgrade ;;
     gen-code|list-codes|revoke-code|restore-code)
         cd $DATA
         if command -v runuser >/dev/null 2>&1; then
@@ -181,10 +189,14 @@ case "\${1:-}" in
         else
             exec su -s /bin/sh $SVC_USER -c '$BIN "\$@" --codes $CODES' -- sh "\$@"
         fi ;;
-    *) sed -n '2,7p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,9p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 EOF
 chmod 0755 "$ADMIN"
+if [ -f "$HERE/get.sh" ]; then
+    install -d -m 0755 "$LIB"
+    install -m 0755 "$HERE/get.sh" "$LIB/get.sh"
+fi
 
 # ---------------------------------------------------------------- 时间同步（握手要求时钟偏差 < 10 分钟）
 if command -v timedatectl >/dev/null 2>&1; then
@@ -243,5 +255,6 @@ echo "  sudo voc gen-code --note 小明        给小明生成授权码"
 echo "  sudo voc gen-code -n 5 --days 30     生成 5 个 30 天有效的授权码"
 echo "  sudo voc list-codes / revoke-code <ID>"
 echo "  sudo voc status / logs / restart"
+echo "  sudo voc upgrade                     升级到最新版（保留授权码和配置）"
 echo
 red "⚠ 如果是云服务器（阿里云、腾讯云、AWS 等），还要在控制台的「安全组 / 防火墙」里放行 TCP 和 UDP 的 $VOC_PORT 端口。"

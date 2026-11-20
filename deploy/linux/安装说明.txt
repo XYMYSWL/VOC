@@ -5,6 +5,12 @@ VOC 服务器 —— Linux 安装说明
       Ubuntu 18.04+、Debian 10+、CentOS/Rocky/Alma 8+、openSUSE 等都可以。
 程序是静态编译的，不依赖系统里的任何库。
 
+最简单：服务器能访问 GitHub 的话，登录服务器后执行一行命令即可（装过就是升级）：
+
+    curl -fsSL https://github.com/XYMYSWL/VOC/releases/latest/download/get.sh | sudo bash
+
+服务器访问不了 GitHub 时，按下面的步骤离线安装：
+
 一、上传到服务器（在你自己的 Windows 电脑上，PowerShell 里执行）
 
     scp voc-server-linux.tar.gz root@你的服务器IP:/root/
@@ -43,8 +49,10 @@ VOC 服务器 —— Linux 安装说明
 
 五、升级
 
-    上传新的 voc-server-linux.tar.gz，解压后运行：
-    sudo bash install.sh --upgrade
+    sudo voc upgrade                  一键升级到最新版（需要能访问 GitHub）
+    sudo voc version                  查看当前版本
+
+    离线升级：上传新的 voc-server-linux.tar.gz，解压后运行 sudo bash install.sh --upgrade
     授权码和配置都会保留。
 
 六、卸载

@@ -18,20 +18,20 @@
 
 ### 1. 搭服务器（管理员做一次）
 
-找一台有公网 IP 的 Linux 服务器，下载 Release 里的 `voc-server-linux.tar.gz`：
+找一台有公网 IP 的 Linux 服务器，执行一行命令：
 
 ```bash
-tar xzf voc-server-linux.tar.gz && cd voc-server-linux
-sudo bash install.sh --name "我的 VOC 服"
+curl -fsSL https://github.com/XYMYSWL/VOC/releases/latest/download/get.sh | sudo bash
 ```
 
-装完会打印第一个授权码。给朋友生成授权码：
+装完会打印第一个授权码。以后的常用命令：
 
 ```bash
-sudo voc gen-code --note 小明
+sudo voc gen-code --note 小明    # 给朋友生成授权码
+sudo voc upgrade                 # 升级到最新版（授权码和配置都保留）
 ```
 
-> 云服务器记得在控制台「安全组」放行 **TCP 和 UDP 7878**。Windows 服务端、换端口、升级卸载见 [服务端部署](docs/服务端部署.md)。
+> 云服务器记得在控制台「安全组」放行 **TCP 和 UDP 7878**。Windows 服务端、换端口、离线安装、卸载见 [服务端部署](docs/服务端部署.md)。
 
 ### 2. 装客户端（每个人）
 

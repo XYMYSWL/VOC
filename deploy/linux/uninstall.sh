@@ -10,6 +10,7 @@ PURGE=0
 
 systemctl disable --now voc-server >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/voc-server.service /usr/local/bin/voc-server /usr/local/bin/voc
+rm -rf /usr/local/lib/voc
 systemctl daemon-reload || true
 
 if [ "$PURGE" -eq 1 ]; then

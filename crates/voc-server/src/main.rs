@@ -259,7 +259,9 @@ VOC 服务器
   voc-server gen-code [-n 数量] [--note 备注] [--days 有效天数] [--codes 文件]
   voc-server list-codes [--codes 文件]
   voc-server revoke-code <ID>   [--codes 文件]   吊销（在线的人会被立即踢下线）
-  voc-server restore-code <ID>  [--codes 文件]   取消吊销";
+  voc-server restore-code <ID>  [--codes 文件]   取消吊销
+
+  voc-server --version   显示版本";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -271,6 +273,9 @@ fn main() {
             codes_path = it.next().unwrap_or_else(|| die("--codes 需要一个参数")).into();
         } else if a == "-h" || a == "--help" {
             println!("{HELP}");
+            return;
+        } else if a == "-V" || a == "--version" {
+            println!("voc-server {}", env!("CARGO_PKG_VERSION"));
             return;
         } else {
             rest.push(a);

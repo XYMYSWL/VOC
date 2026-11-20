@@ -29,7 +29,7 @@ if (Test-Path $pkg) { Remove-Item -Recurse -Force $pkg }
 New-Item -ItemType Directory -Force "$pkg\bin\x86_64", "$pkg\bin\aarch64" | Out-Null
 Copy-Item "$target\x86_64-unknown-linux-musl\release\voc-server" "$pkg\bin\x86_64\"
 Copy-Item "$target\aarch64-unknown-linux-musl\release\voc-server" "$pkg\bin\aarch64\"
-Copy-Item deploy\linux\install.sh, deploy\linux\uninstall.sh, deploy\linux\安装说明.txt $pkg
+Copy-Item deploy\linux\install.sh, deploy\linux\uninstall.sh, deploy\linux\get.sh, deploy\linux\安装说明.txt $pkg
 tar -czf dist\voc-server-linux.tar.gz -C dist voc-server-linux
 
 # Windows 安装包（MSIX，自签名）
