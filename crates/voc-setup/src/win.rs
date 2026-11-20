@@ -134,8 +134,8 @@ pub fn add_package(path: &Path, progress: impl Fn(u32) + Send + 'static) -> Resu
     })
 }
 
-/// 打开已安装的 VOC
-pub fn launch_voc() {
+/// 已安装 VOC 的包族名（开始菜单入口用）
+fn package_family() -> Option<HSTRING> {
     let find = || -> windows::core::Result<Option<HSTRING>> {
         let pm = PackageManager::new()?;
         let pkgs = pm.FindPackagesByUserSecurityIdNamePublisher(&HSTRING::new(), &HSTRING::from(PKG_NAME), &HSTRING::from(PUBLISHER))?;
@@ -145,12 +145,44 @@ pub fn launch_voc() {
         }
         Ok(None)
     };
-    if let Ok(Some(fam)) = find() {
+    find().ok().flatten()
+}
+
+/// 打开已安装的 VOC
+pub fn launch_voc() {
+    if let Some(fam) = package_family() {
         let target = HSTRING::from(format!("shell:AppsFolder\\{fam}!VOC"));
         unsafe {
             ShellExecuteW(None, w!("open"), w!("explorer.exe"), &target, PCWSTR::null(), SW_SHOWNORMAL);
         }
     }
+}
+
+/// 在桌面创建「VOC」快捷方式。指向开始菜单里的 VOC 入口（和从开始菜单拖到桌面一样），
+/// 图标自动用 VOC 的，以后更新也一直有效。
+pub fn create_desktop_shortcut() -> Result<(), String> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{IShellLinkW, SHGetKnownFolderPath, SHParseDisplayName, ShellLink, FOLDERID_Desktop, KNOWN_FOLDER_FLAG};
+    let fam = package_family().ok_or("找不到已安装的 VOC")?;
+    let err = |e: windows::core::Error| e.message().to_string();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        SHParseDisplayName(&HSTRING::from(format!("shell:AppsFolder\\{fam}!VOC")), None, &mut pidl, 0, None).map_err(err)?;
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(err)?;
+        let r = link.SetIDList(pidl);
+        CoTaskMemFree(Some(pidl as *const _));
+        r.map_err(err)?;
+        link.SetDescription(w!("VOC 语音")).map_err(err)?;
+        let desktop = SHGetKnownFolderPath(&FOLDERID_Desktop, KNOWN_FOLDER_FLAG(0), None).map_err(err)?;
+        let dir = desktop.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(desktop.0 as *const _));
+        let file: IPersistFile = link.cast().map_err(err)?;
+        file.Save(&HSTRING::from(format!("{dir}\\VOC.lnk")), true).map_err(err)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -170,5 +202,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         println!("{err}");
         assert!(err.contains("签名证书不受信任"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    /// 需要本机已安装 VOC：cargo test -p voc-setup desktop_shortcut -- --ignored
+    #[test]
+    #[ignore]
+    fn desktop_shortcut() {
+        super::create_desktop_shortcut().unwrap();
     }
 }

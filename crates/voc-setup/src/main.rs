@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -46,7 +47,7 @@ fn main() -> eframe::Result {
     let viewport = egui::ViewportBuilder::default()
         .with_title(if update { "VOC 更新" } else { "安装 VOC" })
         .with_icon(icon())
-        .with_inner_size([440.0, 200.0])
+        .with_inner_size([440.0, 230.0])
         .with_resizable(false)
         .with_maximize_button(false);
     eframe::run_native(
@@ -60,13 +61,15 @@ struct Setup {
     update: bool,
     stage: Arc<Mutex<Stage>>,
     done_at: Option<Instant>,
+    /// 安装完成后在桌面创建快捷方式（全新安装时可取消勾选）
+    shortcut: Arc<AtomicBool>,
 }
 
 impl Setup {
     fn new(cc: &eframe::CreationContext, update: bool) -> Self {
         fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let s = Self { update, stage: Arc::new(Mutex::new(Stage::Starting)), done_at: None };
+        let s = Self { update, stage: Arc::new(Mutex::new(Stage::Starting)), done_at: None, shortcut: Arc::new(AtomicBool::new(true)) };
         s.start(&cc.egui_ctx);
         s
     }
@@ -74,9 +77,14 @@ impl Setup {
     fn start(&self, ctx: &egui::Context) {
         *self.stage.lock().unwrap() = Stage::Starting;
         let (st, ctx) = (self.stage.clone(), ctx.clone());
+        let (update, shortcut) = (self.update, self.shortcut.clone());
         std::thread::spawn(move || {
             let set = Setter(st, ctx);
             let r = install(&set);
+            #[cfg(windows)]
+            if r.is_ok() && std::env::var_os("VOC_SETUP_DRYRUN").is_none() {
+                desktop_shortcut(update, shortcut.load(Ordering::Relaxed));
+            }
             set.set(match r {
                 Ok(()) => Stage::Done,
                 Err(e) => Stage::Failed(e),
@@ -125,6 +133,21 @@ fn install(set: &Setter) -> Result<(), String> {
     r
 }
 
+/// 桌面快捷方式：全新安装按勾选；更新时只在从没处理过的情况下创建一次（用户删掉后不会再自动加回来）
+#[cfg(windows)]
+fn desktop_shortcut(update: bool, wanted: bool) {
+    let marker = std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("VOC").join("desktop-shortcut"));
+    let handled = marker.as_ref().is_some_and(|m| m.exists());
+    let create = if update { !handled } else { wanted };
+    if create {
+        let _ = win::create_desktop_shortcut(); // 失败不影响安装
+    }
+    if let Some(m) = marker {
+        let _ = std::fs::create_dir_all(m.parent().unwrap());
+        let _ = std::fs::write(m, if create { "created" } else { "declined" });
+    }
+}
+
 #[cfg(not(windows))]
 fn install(_: &Setter) -> Result<(), String> {
     Err("VOC 安装程序只支持 Windows".into())
@@ -159,7 +182,15 @@ impl eframe::App for Setup {
                     ui.label(egui::RichText::new("加密语音开黑 · 屏幕共享 · P2P 直连").weak());
                 });
             });
-            ui.add_space(20.0);
+            ui.add_space(14.0);
+            if !self.update {
+                let mut on = self.shortcut.load(Ordering::Relaxed);
+                let busy = !matches!(stage, Stage::Done | Stage::Failed(_));
+                if ui.add_enabled(busy, egui::Checkbox::new(&mut on, "创建桌面快捷方式")).changed() {
+                    self.shortcut.store(on, Ordering::Relaxed);
+                }
+                ui.add_space(6.0);
+            }
             let verb = if self.update { "更新" } else { "安装" };
             match &stage {
                 Stage::Starting => {
