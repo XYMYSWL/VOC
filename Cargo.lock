@@ -1078,6 +1078,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "egui_system_font_provider",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -4427,7 +4428,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voc-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cpal",
  "eframe",
@@ -4439,6 +4440,7 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "sha2",
  "socket2",
  "ureq",
  "voc-proto",
@@ -4448,11 +4450,11 @@ dependencies = [
 
 [[package]]
 name = "voc-denoise-example"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "voc-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
@@ -4467,13 +4469,23 @@ dependencies = [
 
 [[package]]
 name = "voc-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
  "socket2",
  "tokio",
  "voc-proto",
+]
+
+[[package]]
+name = "voc-setup"
+version = "0.2.1"
+dependencies = [
+ "eframe",
+ "png",
+ "windows",
+ "windows-future",
 ]
 
 [[package]]

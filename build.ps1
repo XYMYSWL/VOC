@@ -1,5 +1,6 @@
 # 一键编译发布版：
 #   dist\voc-client.exe / voc-server.exe            Windows 客户端 / 服务端
+#   dist\VOC-Setup.exe                               单文件安装程序（内含下面的 MSIX）
 #   dist\VOC-<版本>.msix + VOC.cer + Install-VOC.cmd    Windows 安装包（自签名）
 #   dist\voc-server-linux.tar.gz                     Linux 服务端安装包
 $ErrorActionPreference = "Stop"
@@ -33,4 +34,8 @@ tar -czf dist\voc-server-linux.tar.gz -C dist voc-server-linux
 
 # Windows 安装包（MSIX，自签名）
 & (Join-Path $PSScriptRoot "deploy\windows\build-msix.ps1") -Exe "$target\release\voc-client.exe"
+
+# 单文件安装程序（build.rs 会把刚打好的 dist\VOC-<版本>.msix 和 VOC.cer 嵌进去）
+cargo $tc build --release -p voc-setup
+Copy-Item "$target\release\VOC-Setup.exe" dist\
 Write-Host "完成：dist\ 下有 Windows 客户端 / 服务端、MSIX 安装包、Linux 服务端安装包"

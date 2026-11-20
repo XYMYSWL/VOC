@@ -17,8 +17,7 @@
 - **屏幕共享**：480P / 720P / 1080P × 30 / 60 帧可选，端到端加密，能直连的观看者走 P2P
 - **GPU 硬件编码**：自动挑最省带宽的编码器（AV1 > HEVC > H.264，按所有观看者都能解的来协商），可手动选用哪块 GPU（NVIDIA / AMD / Intel）或纯软件编码；解码可选硬解 / 软解
 - **进场 / 退场音效**：有人进出你所在的频道时播放提示音，音量可调、可关闭
-- **检查更新**：启动时（可关）查询 GitHub Releases，有新版在顶栏提示
-- **MSIX 安装包**：双击安装，开始菜单启动，自动添加防火墙规则
+- **一键安装 / 一键更新**：单个 `VOC-Setup.exe`（内含签名的 MSIX），双击安装，开始菜单启动，自动添加防火墙规则；有新版时客户端里点一下就更新
 - **P2P 直连语音**：同频道成员 UDP 打洞直连（IPv4 / IPv6，UPnP 端口映射，端口预测），成员旁直接显示直连延迟；打不通的人自动走服务器中转
 - **Opus 编码**：24 kbps，带内 FEC + 丢包补偿，带宽约为原来的一半、音质更好
 - 延迟（ping）与传输方式（UDP 直连 / TCP 隧道）显示
@@ -47,11 +46,13 @@ plugins/
 
 ## 安装（Windows 客户端）
 
-到 [Releases](https://github.com/XYMYSWL/VOC/releases) 下载最新的 `VOC-<版本>.msix`、`VOC.cer`、`install.ps1`、`Install-VOC.cmd`，
-放同一个文件夹，双击 **`Install-VOC.cmd`**（会请求管理员权限）。
+到 [Releases](https://github.com/XYMYSWL/VOC/releases) 下载 **`VOC-Setup.exe`**，双击即可：自动安装并打开 VOC。
 
-- 安装包是**自签名**的：脚本会先把 `VOC.cer` 导入本机「受信任的人」证书库，再安装 MSIX。只需要做一次，以后升级直接双击新的 `.msix` 即可。
-- 不想装证书？下载 `VOC-portable.zip`，解压直接运行 `voc-client.exe`（绿色版）。
+- 第一次安装会弹一次 UAC（点「是」）：安装包是**自签名**的，安装程序要把 VOC 的证书放进本机「受信任的人」证书库（不是根证书，不能用来冒充网站）。以后升级不会再弹。
+- 浏览器下载的 exe 可能出现「Windows 已保护你的电脑」：点「更多信息」→「仍要运行」（没有购买商业代码签名证书）。
+- **以后升级**：客户端发现新版本时点顶栏的「⬆ 新版本」即可一键更新（自动下载、核对 SHA-256、安装、重新打开）。
+- 不想安装？下载 `VOC-portable.zip`，解压直接运行 `VOC.exe`（绿色版，需要手动下载新版）。
+- 高级：`VOC-<版本>.msix` + `VOC.cer` 也在 Release 里，可以自己导入证书后用 `Add-AppxPackage` 安装（仓库里的 `deploy/windows/install.ps1` 就是这么做的）。
 - 卸载：开始菜单右键 VOC → 卸载。
 - 需要 Windows 10 1903 及以上。
 
@@ -63,7 +64,7 @@ plugins/
 cargo +stable-x86_64-pc-windows-msvc build --release
 ```
 
-或者直接运行 `.\build.ps1`：Windows 客户端 / 服务端、MSIX 安装包（首次会自动生成自签名证书，私钥存在
+或者直接运行 `.\build.ps1`：Windows 客户端 / 服务端、MSIX 安装包、单文件安装程序 `VOC-Setup.exe`（首次会自动生成自签名证书，私钥存在
 `%USERPROFILE%\.voc-signing\`，不在仓库里）、Linux 服务端安装包全部输出到 `dist\`。
 
 > 注：Windows 有 260 字符路径限制（libopus 的 MSBuild 尤其敏感）。项目放在很深的目录时，
@@ -214,7 +215,9 @@ Krisp SDK 不公开下载，需要先向 Krisp 申请开发者账号和商业授
 ## 检查更新
 
 启动时后台请求一次 `https://api.github.com/repos/XYMYSWL/VOC/releases/latest`（匿名，不带任何本机信息），
-发现新版本时顶栏出现「⬆ 新版本」按钮，点开 Releases 页面下载。设置 → 关于里可以手动检查或关闭自动检查。
+发现新版本时顶栏出现「⬆ 新版本」按钮。
+安装版点它就会一键更新：从 GitHub 下载 `VOC-Setup.exe`（只接受本仓库 Releases 的下载地址），核对 GitHub 公布的 SHA-256，
+运行安装程序并关闭客户端，装完自动重新打开。绿色版点它会打开 Releases 页面。设置 → 关于里可以手动检查或关闭自动检查。
 自己 fork 编译时可用环境变量 `VOC_REPO=你的用户名/仓库名` 改成你的仓库。
 
 ## 端到端加密
@@ -302,7 +305,7 @@ $env:VOC_REMOTE="服务器IP"; $env:VOC_CODE="授权码"; cargo +stable-x86_64-p
 ## 后续可以加的
 
 - 全局按键说话（PTT）、回声消除
-- 屏幕共享：选择单个窗口、共享系统声音、硬件编码（NVENC / QSV）
+- 屏幕共享：选择单个窗口、共享系统声音
 - TLS 伪装
 - 持久化频道、文字频道、私聊
 

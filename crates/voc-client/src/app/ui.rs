@@ -14,9 +14,22 @@ impl App {
                     ui.add_space((ui.available_height() * 0.10).max(28.0));
                     ui.label(RichText::new("VOC").size(46.0).strong().color(th::ACCENT_HOVER));
                     ui.label(RichText::new("加密语音开黑 · 屏幕共享 · P2P 直连").size(14.0).color(th::TEXT_DIM));
-                    if let crate::update::UpdateState::Available { version, url } = self.updater.get() {
-                        ui.add_space(6.0);
-                        ui.hyperlink_to(RichText::new(format!("⬆ 发现新版本 v{version}，点此下载")).color(th::ACCENT_HOVER), url);
+                    match self.updater.get() {
+                        crate::update::UpdateState::Available { version, url, .. } => {
+                            ui.add_space(6.0);
+                            if self.updater.can_auto_install() {
+                                if ui.link(RichText::new(format!("⬆ 发现新版本 v{version}，点此一键更新")).color(th::ACCENT_HOVER)).clicked() {
+                                    self.updater.install(ui.ctx().clone());
+                                }
+                            } else {
+                                ui.hyperlink_to(RichText::new(format!("⬆ 发现新版本 v{version}，点此下载")).color(th::ACCENT_HOVER), url);
+                            }
+                        }
+                        crate::update::UpdateState::Downloading { version, percent } => {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(format!("正在下载 v{version}… {percent}%")).color(th::TEXT_DIM));
+                        }
+                        _ => {}
                     }
                     ui.add_space(26.0);
 
@@ -231,13 +244,25 @@ impl App {
                         th::pill(ui, format!("{ping} ms"), fg, bg).on_hover_text("到服务器的往返延迟");
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if let crate::update::UpdateState::Available { version, url } = self.updater.get() {
-                            let b = egui::Button::new(RichText::new(format!("⬆ 新版本 v{version}")).size(12.0).color(Color32::WHITE))
-                                .fill(th::ACCENT)
-                                .corner_radius(CornerRadius::same(10));
-                            if ui.add(b).on_hover_text("打开下载页").clicked() {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                        match self.updater.get() {
+                            crate::update::UpdateState::Available { version, url, .. } => {
+                                let auto = self.updater.can_auto_install();
+                                let b = egui::Button::new(RichText::new(format!("⬆ 新版本 v{version}")).size(12.0).color(Color32::WHITE))
+                                    .fill(th::ACCENT)
+                                    .corner_radius(CornerRadius::same(10));
+                                let hint = if auto { "一键更新：下载并安装后自动重新打开（会断开当前语音）" } else { "打开下载页" };
+                                if ui.add(b).on_hover_text(hint).clicked() {
+                                    if auto {
+                                        self.updater.install(ui.ctx().clone());
+                                    } else {
+                                        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                    }
+                                }
                             }
+                            crate::update::UpdateState::Downloading { percent, .. } => {
+                                th::pill(ui, format!("⬇ 更新 {percent}%"), th::TEXT, th::BG_HOVER);
+                            }
+                            _ => {}
                         }
                         if ui.button(RichText::new("断开").color(th::TEXT_DIM)).on_hover_text("断开连接").clicked() {
                             disconnect = true;
@@ -762,8 +787,20 @@ impl App {
                             crate::update::UpdateState::UpToDate => {
                                 ui.label(RichText::new("已是最新版本").color(th::GREEN));
                             }
-                            crate::update::UpdateState::Available { version, url } => {
-                                ui.hyperlink_to(RichText::new(format!("发现新版本 v{version}，点此下载")).color(th::ACCENT_HOVER), url);
+                            crate::update::UpdateState::Available { version, url, .. } => {
+                                if self.updater.can_auto_install() {
+                                    if ui.button(RichText::new(format!("⬆ 一键更新到 v{version}")).color(th::ACCENT_HOVER)).clicked() {
+                                        self.updater.install(ctx.clone());
+                                    }
+                                } else {
+                                    ui.hyperlink_to(RichText::new(format!("发现新版本 v{version}，点此下载")).color(th::ACCENT_HOVER), url);
+                                }
+                            }
+                            crate::update::UpdateState::Downloading { percent, .. } => {
+                                ui.add(egui::ProgressBar::new(percent as f32 / 100.0).desired_width(160.0).show_percentage());
+                            }
+                            crate::update::UpdateState::Launched => {
+                                ui.label("正在启动安装程序…");
                             }
                             crate::update::UpdateState::Failed(e) => {
                                 ui.label(RichText::new(e).size(12.0).color(th::RED));
@@ -771,7 +808,7 @@ impl App {
                         }
                     });
                     ui.label(
-                        RichText::new("检查更新只访问 GitHub 公开的版本信息，不上传任何本机数据。下载新版 .msix 后双击安装即可覆盖升级，设置和身份密钥会保留。")
+                        RichText::new("检查更新只访问 GitHub 公开的版本信息，不上传任何本机数据。安装版可以一键更新（自动下载、校验 SHA-256、安装后重新打开）；绿色版请下载新的 zip。设置和身份密钥都会保留。")
                             .size(11.5)
                             .color(th::TEXT_FAINT),
                     );
@@ -1101,6 +1138,9 @@ fn level_meter(ui: &mut egui::Ui, level_db: f32, thr_db: f32, active: bool) {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.updater.get() == crate::update::UpdateState::Launched {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         if let Some(err) = self.poll_network() {
             self.go_login(Some(err));
         }
