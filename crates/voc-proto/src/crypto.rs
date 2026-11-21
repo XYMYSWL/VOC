@@ -54,6 +54,8 @@ pub const MAX_FRAME_DATA: usize = 60_000;
 pub const KIND_JSON: u8 = 0;
 pub const KIND_VOICE: u8 = 1;
 pub const KIND_VIDEO: u8 = 2;
+/// 图片分块（端到端加密的密文，见 file.rs）
+pub const KIND_FILE: u8 = 3;
 
 #[derive(Clone)]
 pub struct SessionKeys {

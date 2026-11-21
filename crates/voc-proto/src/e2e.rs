@@ -35,6 +35,8 @@ pub const CT_LEN: usize = 1088;
 /// 加密信封里的内容类型
 pub const BLOB_SENDER_KEY: u8 = 1;
 pub const BLOB_CHAT: u8 = 2;
+/// 图片密钥和信息（file::ImageMeta 的 JSON）
+pub const BLOB_IMAGE: u8 = 3;
 
 const CTX_EK: &[u8] = b"voc e2e ek v1";
 const CTX_PAIR: &[u8] = b"voc e2e pair v1";

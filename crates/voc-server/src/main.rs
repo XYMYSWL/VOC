@@ -22,7 +22,16 @@ enum Out {
     Json(ServerMsg),
     Voice(Vec<u8>),
     Video(Vec<u8>),
+    /// 图片分块（端到端加密的密文），只转发不保存
+    File(Vec<u8>),
 }
+
+/// 一个接收者还没发出去的图片数据超过这么多，就不再给他转这张图（防止慢的人把服务器内存撑爆）
+const MAX_PENDING_FILE: usize = 8 * 1024 * 1024;
+/// 每个人最多同时传几张图
+const MAX_UPLOADS: usize = 2;
+/// 传输多久没动静就作废
+const UPLOAD_TTL: Duration = Duration::from_secs(120);
 
 struct User {
     name: String,
@@ -59,6 +68,10 @@ struct User {
     stats: Option<LinkReport>,
     /// 上次发给我的中继路线
     last_relays: Vec<RelayRoute>,
+    /// 还在发送队列里的图片字节数
+    pending_file: Arc<std::sync::atomic::AtomicUsize>,
+    /// 我正在上传的图片：id → (块数, 已收块数, 最后一次收到的时间)
+    uploads: HashMap<u64, (u32, u32, Instant)>,
 }
 
 /// 客户端上报的链路质量
@@ -194,6 +207,42 @@ impl State {
                 u.last_watchers = w.clone();
                 u.send(ServerMsg::Watchers { ids: w });
             }
+        }
+    }
+
+    /// 转发一块图片给同频道的其他人（只转发不保存）
+    fn forward_file(&mut self, from: u32, chunk: &[u8]) {
+        let Some((id, _seq, total, _)) = voc_proto::file::read_client_chunk(chunk) else { return };
+        let Some(u) = self.users.get_mut(&from) else { return };
+        let Some(ch) = u.channel else { return };
+        let now = Instant::now();
+        u.uploads.retain(|_, (t, got, at)| *got < *t && now.duration_since(*at) < UPLOAD_TTL);
+        match u.uploads.get_mut(&id) {
+            Some((t, got, at)) => {
+                if *t != total {
+                    return;
+                }
+                *got += 1;
+                *at = now;
+            }
+            None => {
+                if u.uploads.len() >= MAX_UPLOADS {
+                    return;
+                }
+                u.uploads.insert(id, (total, 1, now));
+            }
+        }
+        let payload = voc_proto::file::server_chunk(from, chunk);
+        for (id, other) in self.users.iter() {
+            if *id == from || other.channel != Some(ch) {
+                continue;
+            }
+            let pending = other.pending_file.load(std::sync::atomic::Ordering::Relaxed);
+            if pending + payload.len() > MAX_PENDING_FILE {
+                continue; // 他收得太慢：这张图对他作废（客户端会超时提示）
+            }
+            other.pending_file.fetch_add(payload.len(), std::sync::atomic::Ordering::Relaxed);
+            let _ = other.tx.send(Out::File(payload.clone()));
         }
     }
 
@@ -621,6 +670,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
     let kick = Arc::new(Notify::new());
+    let pending_file = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let user_id = {
         let mut st = state.lock().unwrap();
         // 同一授权码只允许一个在线：踢掉旧的
@@ -659,6 +709,8 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 decoders: Vec::new(),
                 stats: None,
                 last_relays: Vec::new(),
+                pending_file: pending_file.clone(),
+                uploads: HashMap::new(),
             },
         );
         st.broadcast_state();
@@ -668,14 +720,24 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     };
     println!("[{addr}] {name} (#{user_id}, 授权码 {} {}) 已连接", entry.id, entry.note);
 
+    let pending_writer = pending_file.clone();
     let writer = tokio::spawn(async move {
         while let Some(o) = rx.recv().await {
+            let mut file_len = 0;
             let f = match o {
                 Out::Json(m) => sealer.seal(KIND_JSON, serde_json::to_string(&m).unwrap().as_bytes()),
                 Out::Voice(v) => sealer.seal(KIND_VOICE, &v),
                 Out::Video(v) => sealer.seal(KIND_VIDEO, &v),
+                Out::File(v) => {
+                    file_len = v.len();
+                    sealer.seal(KIND_FILE, &v)
+                }
             };
-            if wr.write_all(&f).await.is_err() {
+            let ok = wr.write_all(&f).await.is_ok();
+            if file_len > 0 {
+                pending_writer.fetch_sub(file_len, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !ok {
                 break;
             }
         }
@@ -706,6 +768,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                     let _ = udp_sock.send_to(&p, a).await;
                 }
             }
+            KIND_FILE => state.lock().unwrap().forward_file(user_id, &data),
             _ => {}
         }
     }

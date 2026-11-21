@@ -141,6 +141,29 @@ impl Client {
         self.s.write_all(&f).unwrap();
     }
 
+    fn send_raw_frame(&mut self, kind: u8, data: &[u8]) {
+        let f = self.seal.seal(kind, data);
+        self.s.write_all(&f).unwrap();
+    }
+
+    /// 等一个指定类型的帧（期间的其它帧丢掉），超时返回 None
+    fn wait_frame(&mut self, kind: u8, ms: u64) -> Option<Vec<u8>> {
+        self.s.set_read_timeout(Some(Duration::from_millis(ms))).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        let r = loop {
+            if Instant::now() > deadline {
+                break None;
+            }
+            match self.recv_frame() {
+                Some((k, d)) if k == kind => break Some(d),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        self.s.set_read_timeout(None).unwrap();
+        r
+    }
+
     fn recv_frame(&mut self) -> Option<(u8, Vec<u8>)> {
         read_frame(&mut self.s, &mut self.open)
     }
@@ -751,4 +774,44 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     let (k, d) = b.udp_recv().expect("server forwards again after the relay is withdrawn");
     assert_eq!(k, udp::VOICE);
     assert_eq!(udp::read_server_voice(&d).unwrap().0, ia);
+}
+
+
+/// 图片分块：只转给同频道的其他人，带上发送者；别的频道收不到；同时最多传 2 张
+#[test]
+fn image_chunks_go_to_same_channel_only() {
+    use voc_proto::crypto::KIND_FILE;
+    use voc_proto::file;
+    let srv = Server::start(10);
+    let codes = srv.gen_codes(3);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
+    let mut c = Client::connect(srv.port, &codes[2], "carol").unwrap();
+    both_in(&mut a, &mut b, 1);
+    c.send(ClientMsg::JoinChannel { channel_id: 2 });
+    let cid = c.id;
+    c.wait_state(|u| u.iter().any(|x| x.id == cid && x.channel_id == Some(2)));
+
+    let key = [3u8; 32];
+    let ct = file::encrypt_chunk(&key, 77, 0, b"png bytes");
+    a.send_raw_frame(KIND_FILE, &file::client_chunk(77, 0, 1, &ct));
+    let got = b.wait_frame(KIND_FILE, 3000).expect("bob gets the chunk");
+    let (from, id, seq, total, cipher) = file::read_server_chunk(&got).unwrap();
+    assert_eq!((from, id, seq, total), (a.id, 77, 0, 1));
+    assert_eq!(file::decrypt_chunk(&key, id, seq, cipher).unwrap(), b"png bytes");
+    assert!(c.wait_frame(KIND_FILE, 800).is_none(), "other channel must not get it");
+    assert!(a.wait_frame(KIND_FILE, 300).is_none(), "sender does not get its own chunk back");
+
+    // 同时最多 2 张：第 3 张未完成的图被丢弃
+    for id in [100u64, 101, 102] {
+        a.send_raw_frame(KIND_FILE, &file::client_chunk(id, 0, 2, &ct));
+    }
+    let mut ids = Vec::new();
+    while let Some(f) = b.wait_frame(KIND_FILE, 800) {
+        ids.push(file::read_server_chunk(&f).unwrap().1);
+    }
+    assert_eq!(ids, vec![100, 101]);
+    // 格式不对的块被丢弃（块数超上限）
+    a.send_raw_frame(KIND_FILE, &file::client_chunk(200, 0, file::MAX_CHUNKS + 1, &ct));
+    assert!(b.wait_frame(KIND_FILE, 500).is_none());
 }

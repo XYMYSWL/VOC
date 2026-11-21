@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub mod auth;
 pub mod crypto;
 pub mod e2e;
+pub mod file;
 pub mod p2p;
 pub mod udp;
 

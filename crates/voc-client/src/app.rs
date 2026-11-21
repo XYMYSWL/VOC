@@ -111,6 +111,62 @@ impl Default for Persisted {
 enum ChatLine {
     User { from: String, text: String, ts: u64, mine: bool },
     System(String),
+    Image(Box<ImageLine>),
+}
+
+/// 聊天里的一张图片（只在内存里）
+struct ImageLine {
+    from: String,
+    ts: u64,
+    mine: bool,
+    /// (发送者, 图片 id)
+    key: (u32, u64),
+    tex: Option<egui::TextureHandle>,
+    /// 发送进度：已发块数（后台线程更新）/ 总块数
+    sending: Option<(Arc<std::sync::atomic::AtomicU32>, u32)>,
+    /// 接收进度：已收块数 / 总块数
+    receiving: Option<(u32, u32)>,
+    error: Option<String>,
+}
+
+/// 在后台准备一张图片（压缩到 20 MB 以内），准备好后由 logic() 自动发送
+pub(crate) fn queue_image(
+    tx: &mpsc::Sender<Result<crate::images::Prepared, String>>,
+    ctx: &egui::Context,
+    job: impl FnOnce() -> Result<crate::images::Prepared, String> + Send + 'static,
+) {
+    let (tx, ctx) = (tx.clone(), ctx.clone());
+    let _ = std::thread::Builder::new().name("image-prepare".into()).spawn(move || {
+        let _ = tx.send(job());
+        ctx.request_repaint();
+    });
+}
+
+/// 把图片接收进度 / 结果写到对应的聊天行上
+fn apply_image_events(chat: &mut [ChatLine], events: Vec<crate::images::ImageEvent>, ctx: &egui::Context) {
+    use crate::images::ImageEvent as E;
+    for ev in events {
+        let key = match &ev {
+            E::Progress { key, .. } | E::Ready { key, .. } | E::Failed { key, .. } => *key,
+        };
+        let Some(line) = chat.iter_mut().rev().find_map(|l| match l {
+            ChatLine::Image(i) if i.key == key => Some(i),
+            _ => None,
+        }) else {
+            continue;
+        };
+        match ev {
+            E::Progress { got, total, .. } => line.receiving = Some((got, total)),
+            E::Ready { image, .. } => {
+                line.tex = Some(ctx.load_texture(format!("img-{}-{}", key.0, key.1), image, Default::default()));
+                line.receiving = None;
+            }
+            E::Failed { reason, .. } => {
+                line.error = Some(reason);
+                line.receiving = None;
+            }
+        }
+    }
 }
 
 struct Session {
@@ -232,6 +288,10 @@ fn wipe_chat(lines: &mut Vec<ChatLine>) {
                 wipe(text);
             }
             ChatLine::System(t) => wipe(t),
+            ChatLine::Image(i) => {
+                wipe(&mut i.from);
+                i.tex = None; // 释放贴图
+            }
         }
     }
     lines.clear();
@@ -288,6 +348,14 @@ pub struct App {
     big_audio_buffer: bool,
     /// 正在等用户按下新的说话键
     ptt_capture: bool,
+    /// 正在接收的图片
+    images: crate::images::ImageStore,
+    /// 后台准备好的待发送图片（选图 / 粘贴 / 拖入）
+    image_jobs: (mpsc::Sender<Result<crate::images::Prepared, String>>, Receiver<Result<crate::images::Prepared, String>>),
+    /// 正在看大图
+    image_view: Option<egui::TextureHandle>,
+    /// 测试模式：VOC_TEST_SEND_IMAGE 的图片已经发过
+    test_image_sent: bool,
     last_xruns: u32,
     demo: Demo,
 }
@@ -370,6 +438,10 @@ impl App {
             last_device_check: std::time::Instant::now(),
             big_audio_buffer: false,
             ptt_capture: false,
+            images: crate::images::ImageStore::default(),
+            image_jobs: mpsc::channel(),
+            image_view: None,
+            test_image_sent: false,
             last_xruns: 0,
         };
         app.restart_audio();
@@ -602,6 +674,35 @@ impl App {
                 self.go_login(Some(d.reason));
             }
         }
+        // 测试模式：进频道 2 秒后自动发一张图（VOC_TEST_SEND_IMAGE=路径）
+        if self.test_mode && !self.test_image_sent {
+            if let (Ok(path), Screen::Main(s)) = (std::env::var("VOC_TEST_SEND_IMAGE"), &self.screen) {
+                let others = s.users.iter().filter(|u| u.id != s.user_id && u.channel_id.is_some() && u.channel_id == s.me().and_then(|m| m.channel_id)).count();
+                if others > 0 && self.last_device_check.elapsed() > Duration::from_millis(1500) {
+                    self.test_image_sent = true;
+                    let p = std::path::PathBuf::from(path);
+                    queue_image(&self.image_jobs.0, ctx, move || crate::images::prepare_file(&p));
+                }
+            }
+        }
+        // 图片：准备好的发出去；后台解码完的贴到聊天里
+        let jobs: Vec<_> = self.image_jobs.1.try_iter().collect();
+        for job in jobs {
+            match job {
+                Ok(p) => self.send_image(p, ctx),
+                Err(e) => {
+                    if let Screen::Main(s) = &mut self.screen {
+                        s.chat.push(ChatLine::System(format!("图片没有发出：{e}")));
+                    }
+                }
+            }
+        }
+        let ev = self.images.poll();
+        if !ev.is_empty() {
+            if let Screen::Main(s) = &mut self.screen {
+                apply_image_events(&mut s.chat, ev, ctx);
+            }
+        }
         // 托盘
         let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
         for a in actions {
@@ -694,6 +795,52 @@ impl App {
         }
     }
 
+
+    /// 端到端加密后发给同频道的人
+    fn send_image(&mut self, p: crate::images::Prepared, ctx: &egui::Context) {
+        let Screen::Main(s) = &mut self.screen else { return };
+        let (Some(conn), Some(e2e)) = (&s.conn, &s.e2e) else { return };
+        let Some(ch) = s.me().and_then(|u| u.channel_id) else {
+            s.chat.push(ChatLine::System("进入语音频道后才能发图片（图片只发给同频道的人）".into()));
+            return;
+        };
+        let to: Vec<u32> = s.users.iter().filter(|u| u.id != s.user_id && u.channel_id == Some(ch)).map(|u| u.id).collect();
+        let (id, key) = crate::images::new_id_and_key();
+        let total = voc_proto::file::chunk_count(p.bytes.len());
+        let meta = voc_proto::file::ImageMeta {
+            id,
+            key: voc_proto::e2e::b64(&key),
+            size: p.bytes.len() as u32,
+            chunks: total,
+            mime: p.mime.to_string(),
+            width: p.width,
+            height: p.height,
+        };
+        let missing = e2e.lock().unwrap().send_image_meta(&to, &meta);
+        let progress = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let sender = conn.sender();
+        let mut bytes = p.bytes;
+        if to.is_empty() {
+            crate::images::wipe(&mut bytes);
+        } else {
+            crate::images::spawn_upload(sender, id, key, bytes, progress.clone());
+        }
+        let me = s.me().map(|u| u.name.clone()).unwrap_or_default();
+        s.chat.push(ChatLine::Image(Box::new(ImageLine {
+            from: me,
+            ts: voc_proto::now_millis(),
+            mine: true,
+            key: (s.user_id, id),
+            tex: Some(ctx.load_texture(format!("img-mine-{id}"), p.preview, Default::default())),
+            sending: (!to.is_empty()).then(|| (progress, total)),
+            receiving: None,
+            error: to.is_empty().then(|| "频道里没有其他人".to_string()),
+        })));
+        if !missing.is_empty() {
+            s.chat.push(ChatLine::System(format!("以下成员收不到这张图（加密尚未建立或身份待核对）：{}", missing.join("、"))));
+        }
+    }
+
     fn go_login(&mut self, error: Option<String>) {
         self.leave_main();
         self.rejoin = None;
@@ -753,6 +900,10 @@ impl App {
         while let Ok(ev) = s.events.try_recv() {
             match ev {
                 NetEvent::Closed(reason) => return Some(Dropped { reason, retry: true }),
+                NetEvent::File(data) => {
+                    let ev = self.images.on_chunk(&data);
+                    apply_image_events(&mut s.chat, ev, &self.egui_ctx);
+                }
                 NetEvent::Msg(msg) => match msg {
                     ServerMsg::Welcome { user_id, udp_port, server_name } => {
                         s.user_id = user_id;
@@ -923,9 +1074,27 @@ impl App {
                     }
                     ServerMsg::E2eBlob { from, blob, ts } => {
                         let msg = s.e2e.as_ref().and_then(|e| e.lock().unwrap().on_blob(from, &blob));
-                        if let Some(c) = msg {
-                            let from = s.name_of(c.from);
-                            s.chat.push(ChatLine::User { from, text: c.text, ts, mine: false });
+                        match msg {
+                            Some(crate::e2e::BlobIn::Chat(c)) => {
+                                let from = s.name_of(c.from);
+                                s.chat.push(ChatLine::User { from, text: c.text, ts, mine: false });
+                            }
+                            Some(crate::e2e::BlobIn::Image { from, meta }) => {
+                                let total = meta.chunks;
+                                s.chat.push(ChatLine::Image(Box::new(ImageLine {
+                                    from: s.name_of(from),
+                                    ts,
+                                    mine: false,
+                                    key: (from, meta.id),
+                                    tex: None,
+                                    sending: None,
+                                    receiving: Some((0, total)),
+                                    error: None,
+                                })));
+                                let ev = self.images.on_meta(from, meta);
+                                apply_image_events(&mut s.chat, ev, &self.egui_ctx);
+                            }
+                            None => {}
                         }
                     }
                 },
@@ -1177,6 +1346,8 @@ impl Drop for App {
             wipe_chat(chat);
         }
         self.chat_store.clear();
+        self.images.wipe_all();
+        self.image_view = None;
     }
 }
 

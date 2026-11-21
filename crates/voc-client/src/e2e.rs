@@ -51,6 +51,13 @@ pub struct ChatIn {
     pub text: String,
 }
 
+/// 解开的端到端信封
+pub enum BlobIn {
+    Chat(ChatIn),
+    /// 别人发来的图片密钥和信息（图片本身随后分块到）
+    Image { from: u32, meta: voc_proto::file::ImageMeta },
+}
+
 impl E2e {
     pub fn new(my_id: u32, my_name: &str, identity: Identity, pins: HashMap<String, String>) -> Self {
         let mut s = Self {
@@ -217,7 +224,7 @@ impl E2e {
     }
 
     /// 收到加密信封。聊天消息返回给界面。
-    pub fn on_blob(&mut self, from: u32, blob: &str) -> Option<ChatIn> {
+    pub fn on_blob(&mut self, from: u32, blob: &str) -> Option<BlobIn> {
         let blob = unb64(blob)?;
         if !self.trusted(from) {
             return None;
@@ -228,7 +235,12 @@ impl E2e {
                 self.keyring.by_sender.entry(from).or_default().install(&data);
                 None
             }
-            e2e::BLOB_CHAT => Some(ChatIn { from, text: String::from_utf8_lossy(&data).into_owned() }),
+            e2e::BLOB_CHAT => Some(BlobIn::Chat(ChatIn { from, text: String::from_utf8_lossy(&data).into_owned() })),
+            e2e::BLOB_IMAGE => {
+                let meta: voc_proto::file::ImageMeta = serde_json::from_slice(&data).ok()?;
+                (meta.size as usize <= voc_proto::file::MAX_IMAGE_BYTES && meta.chunks <= voc_proto::file::MAX_CHUNKS)
+                    .then_some(BlobIn::Image { from, meta })
+            }
             _ => None,
         }
     }
@@ -249,6 +261,22 @@ impl E2e {
             }
         }
         (sent, missing)
+    }
+
+    /// 把图片密钥和信息发给指定的人（同频道成员）。返回收不到的人的名字。
+    pub fn send_image_meta(&mut self, to: &[u32], meta: &voc_proto::file::ImageMeta) -> Vec<String> {
+        let json = serde_json::to_vec(meta).expect("meta json");
+        let mut missing = Vec::new();
+        for &id in to {
+            match (self.trusted(id), self.pairs.get(&id)) {
+                (true, Some(k)) => {
+                    let blob = e2e::seal_blob(&k.blob, e2e::BLOB_IMAGE, &json);
+                    self.out.push(ClientMsg::E2eBlob { to: id, blob: b64(&blob) });
+                }
+                _ => missing.push(self.members.get(&id).map(|m| m.name.clone()).unwrap_or_else(|| format!("#{id}"))),
+            }
+        }
+        missing
     }
 
     /// 加密自己的一帧语音
@@ -300,7 +328,11 @@ pub mod tests {
                     to.on_entry(entry).unwrap();
                 }
                 ServerMsg::PeerKey { from, ct, sig } => to.on_peer_key(from, &ct, &sig),
-                ServerMsg::E2eBlob { from, blob, .. } => chats.extend(to.on_blob(from, &blob)),
+                ServerMsg::E2eBlob { from, blob, .. } => {
+                    if let Some(super::BlobIn::Chat(c)) = to.on_blob(from, &blob) {
+                        chats.push(c);
+                    }
+                }
                 _ => {}
             }
         }

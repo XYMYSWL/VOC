@@ -10,6 +10,8 @@ use voc_proto::{ClientMsg, ServerMsg, DEFAULT_PORT, PROTOCOL_VERSION};
 
 pub enum NetEvent {
     Msg(ServerMsg),
+    /// 图片分块（服务器转来的密文，file::read_server_chunk 格式）
+    File(Vec<u8>),
     Closed(String),
 }
 
@@ -19,6 +21,8 @@ pub enum Outgoing {
     Voice(Vec<u8>),
     /// UDP 不可用时的视频分片
     Video(Vec<u8>),
+    /// 图片分块（file::client_chunk 格式）
+    File(Vec<u8>),
 }
 
 pub struct Conn {
@@ -136,6 +140,7 @@ pub fn connect(
                     Outgoing::Msg(m) => sealer.seal(KIND_JSON, serde_json::to_string(&m).unwrap().as_bytes()),
                     Outgoing::Voice(v) => sealer.seal(KIND_VOICE, &v),
                     Outgoing::Video(v) => sealer.seal(KIND_VIDEO, &v),
+                    Outgoing::File(v) => sealer.seal(KIND_FILE, &v),
                 };
                 if w.write_all(&f).is_err() {
                     break;
@@ -152,6 +157,12 @@ pub fn connect(
             while let Some((kind, data)) = read_frame(&mut r, &mut opener) {
                 match kind {
                     KIND_VOICE | KIND_VIDEO => on_media(kind, &data),
+                    KIND_FILE => {
+                        if evt_tx.send(NetEvent::File(data)).is_err() {
+                            return;
+                        }
+                        notify();
+                    }
                     KIND_JSON => {
                         if let Ok(msg) = serde_json::from_slice::<ServerMsg>(&data) {
                             if evt_tx.send(NetEvent::Msg(msg)).is_err() {

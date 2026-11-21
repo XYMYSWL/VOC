@@ -212,6 +212,7 @@ impl App {
 
     fn ui_main(&mut self, ui: &mut egui::Ui) {
         let latency = self.latency_inputs();
+        let (jobs_tx, ectx) = (self.image_jobs.0.clone(), self.egui_ctx.clone());
         let Screen::Main(s) = &mut self.screen else { return };
         let me = s.me().cloned();
         let my_channel = me.as_ref().and_then(|u| u.channel_id);
@@ -611,6 +612,8 @@ impl App {
                 });
             });
 
+        let mut pick_image = false;
+        let mut open_image: Option<egui::TextureHandle> = None;
         // ---------------- 中间：文字聊天
         egui::CentralPanel::default().frame(egui::Frame::new().fill(th::BG_PANEL).inner_margin(Margin::symmetric(18, 12))).show(
             ui,
@@ -621,6 +624,14 @@ impl App {
                         .corner_radius(CornerRadius::same(12))
                         .inner_margin(Margin::symmetric(12, 6))
                         .show(ui, |ui| {
+                          ui.horizontal(|ui| {
+                            if ui
+                                .add(egui::Button::new(RichText::new("🖼").size(16.0)).frame(false))
+                                .on_hover_text("发送图片（只发给同频道的人，最大 20 MB，端到端加密）\n也可以 Ctrl+V 粘贴截图，或把图片拖进窗口")
+                                .clicked()
+                            {
+                                pick_image = true;
+                            }
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut s.chat_input)
                                     .hint_text("发送消息…（回车发送 · 端到端加密）")
@@ -646,6 +657,7 @@ impl App {
                                 }
                                 r.request_focus();
                             }
+                          });
                         });
                 });
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
@@ -685,6 +697,42 @@ impl App {
                                 }
                                 prev = Some((from.as_str(), *ts));
                             }
+                            ChatLine::Image(img) => {
+                                ui.add_space(8.0);
+                                ui.horizontal_top(|ui| {
+                                    th::avatar(ui, &img.from, 38.0, false);
+                                    ui.add_space(4.0);
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let c = if img.mine { th::ACCENT_HOVER } else { th::name_color(&img.from) };
+                                            ui.label(RichText::new(&img.from).strong().color(c));
+                                            ui.label(RichText::new(th::fmt_time(img.ts)).size(11.5).color(th::TEXT_FAINT));
+                                        });
+                                        if let Some(tex) = &img.tex {
+                                            let r = ui
+                                                .add(egui::Image::new(tex).max_size(Vec2::new(360.0, 260.0)).corner_radius(8).sense(Sense::click()))
+                                                .on_hover_text("点击查看大图");
+                                            if r.clicked() {
+                                                open_image = Some(tex.clone());
+                                            }
+                                        }
+                                        let status = if let Some(e) = &img.error {
+                                            Some((format!("⚠ {e}"), th::RED))
+                                        } else if let Some((got, total)) = img.receiving {
+                                            Some((format!("🖼 接收中 {}%", got * 100 / total.max(1)), th::TEXT_DIM))
+                                        } else if let Some((p, total)) = &img.sending {
+                                            let sent = p.load(Ordering::Relaxed);
+                                            (sent < *total).then(|| (format!("发送中 {}%", sent * 100 / (*total).max(1)), th::TEXT_DIM))
+                                        } else {
+                                            None
+                                        };
+                                        if let Some((t, c)) = status {
+                                            ui.label(RichText::new(t).size(12.0).color(c));
+                                        }
+                                    });
+                                });
+                                prev = None;
+                            }
                             ChatLine::System(t) => {
                                 ui.add_space(6.0);
                                 ui.vertical_centered(|ui| {
@@ -706,6 +754,36 @@ impl App {
         );
 
         // ---------------- 动作
+        if let Some(t) = open_image {
+            self.image_view = Some(t);
+        }
+        if pick_image {
+            crate::app::queue_image(&jobs_tx, &ectx, || {
+                let path = rfd::FileDialog::new()
+                    .set_title("选择要发送的图片")
+                    .add_filter("图片", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+                    .pick_file()
+                    .ok_or("没有选择图片")?;
+                crate::images::prepare_file(&path)
+            });
+        }
+        // Ctrl+V 粘贴截图、把图片拖进窗口
+        let (paste, dropped) = ui.input(|i| {
+            let paste = i.events.iter().any(|e| {
+                matches!(e, egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. } if modifiers.command)
+            });
+            let dropped: Vec<std::path::PathBuf> = i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect();
+            (paste, dropped)
+        });
+        if paste {
+            if let Ok(img) = arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
+                let (w, h, rgba) = (img.width as u32, img.height as u32, img.bytes.into_owned());
+                crate::app::queue_image(&jobs_tx, &ectx, move || crate::images::prepare_rgba(w, h, rgba));
+            }
+        }
+        for path in dropped {
+            crate::app::queue_image(&jobs_tx, &ectx, move || crate::images::prepare_file(&path));
+        }
         if let Some((id, on)) = watch_toggle {
             s.send(ClientMsg::Watch { target: id, on });
             if on {
@@ -1226,6 +1304,26 @@ impl App {
         }
     }
 
+    /// 大图窗口（不提供保存：关闭 VOC 后图片就没了）
+    fn ui_image_view(&mut self, ctx: &egui::Context) {
+        let Some(tex) = self.image_view.clone() else { return };
+        let mut open = true;
+        let [w, h] = tex.size();
+        egui::Window::new("图片")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size(Vec2::new((w as f32).min(1000.0), (h as f32).min(700.0) + 30.0))
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("{w} × {h} · 阅后即焚：关闭 VOC 后图片会被清除，无法保存")).size(11.5).color(th::TEXT_FAINT));
+                let avail = ui.available_size();
+                ui.add(egui::Image::new(&tex).max_size(avail).maintain_aspect_ratio(true));
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.image_view = None;
+        }
+    }
+
     fn ui_viewers(&mut self, ctx: &egui::Context) {
         let Screen::Main(s) = &mut self.screen else { return };
         let mut close = Vec::new();
@@ -1408,6 +1506,7 @@ impl eframe::App for App {
         self.ui_settings(&ctx);
         self.ui_share(&ctx);
         self.ui_viewers(&ctx);
+        self.ui_image_view(&ctx);
         self.demo_screenshot(&ctx);
     }
 

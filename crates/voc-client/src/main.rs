@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod autostart;
 mod denoise;
+mod images;
 mod e2e;
 mod mf;
 mod net;
