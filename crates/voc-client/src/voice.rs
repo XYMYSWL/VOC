@@ -60,6 +60,8 @@ const PACE_STALE: Duration = Duration::from_millis(250);
 const OPUS_BITRATE: i32 = 24_000;
 /// 低带宽模式的语音码率（Opus 在 12 kbps 下人声仍然清楚）
 const LOW_OPUS_BITRATE: i32 = 12_000;
+/// 麦克风连续这么多帧（20 ms 一帧，共 5 秒）全 0 就提示
+const MIC_SILENT_FRAMES: u32 = 250;
 /// 端口预测：对方公网端口上下各试几个
 const PORT_SPRAY: u16 = 8;
 /// 每路直连语音估算占用的上行（Opus 24 kbps + 各层包头 + 随机填充，按 60 kbps 算）
@@ -187,6 +189,28 @@ fn local_candidates(port: u16, dual: bool) -> Vec<String> {
 }
 
 // ------------------------------------------------------------ 直连质量
+
+/// 用户对某个队友手动选的线路
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RoutePref {
+    /// 自动：能直连就直连，不稳 / 绕远 / 超出上行预算时走服务器或队友中转
+    #[default]
+    Auto,
+    /// 强制 P2P 直连：打通了就一直直连（不因丢包、绕远、上行预算切走）；打不通时仍走服务器
+    Direct,
+    /// 走服务器：不和他打洞，也不经队友中转
+    Server,
+}
+
+impl RoutePref {
+    pub fn label(self) -> &'static str {
+        match self {
+            RoutePref::Auto => "自动",
+            RoutePref::Direct => "强制直连",
+            RoutePref::Server => "走服务器",
+        }
+    }
+}
 
 /// 直连保活 / 测量间隔
 const PEER_PING_INTERVAL: Duration = Duration::from_millis(500);
@@ -434,6 +458,10 @@ pub struct Link {
     sent_bytes: AtomicU64,
     /// 最近 30 秒每秒的上行码率（kbps）
     up_history: Mutex<std::collections::VecDeque<u32>>,
+    /// 用户手动选的线路（没有的按自动）
+    route_prefs: Mutex<HashMap<u32, RoutePref>>,
+    /// 服务器最近一次发来的直连候选（改了线路后重新套用）
+    last_peer_list: Mutex<Vec<PeerInfo>>,
 }
 
 impl Link {
@@ -483,8 +511,16 @@ impl Link {
             }
         }
         // 经成员中继能送到的人：中继是我直连发到的人
-        let relayed: Vec<u32> =
-            self.relays.lock().unwrap().iter().filter(|r| r.from == self.my_id && sent.contains(&r.via)).map(|r| r.to).collect();
+        // （手动选了走服务器的人不算：服务器可能还没收到新选择，照样发一份给服务器）
+        let prefs = self.route_prefs.lock().unwrap().clone();
+        let relayed: Vec<u32> = self
+            .relays
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.from == self.my_id && sent.contains(&r.via) && prefs.get(&r.to) != Some(&RoutePref::Server))
+            .map(|r| r.to)
+            .collect();
         if others.iter().all(|o| sent.contains(o) || relayed.contains(o)) {
             return; // 频道里只有自己，或全部直连 / 经成员中继：服务器不经手
         }
@@ -782,10 +818,32 @@ impl Link {
     }
 
     /// 服务器推送的同频道 P2P 成员地址（密钥来自端到端加密层的成对密钥）
+    /// 设置手动线路（id → 选择；不在表里的按自动）
+    pub fn set_route_prefs(&self, prefs: HashMap<u32, RoutePref>) {
+        {
+            let mut cur = self.route_prefs.lock().unwrap();
+            if *cur == prefs {
+                return;
+            }
+            *cur = prefs;
+        }
+        // 「走服务器」的人从直连候选里去掉，改回来的重新打洞
+        let list = self.last_peer_list.lock().unwrap().clone();
+        self.on_peers(list);
+    }
+
+    pub fn route_pref(&self, id: u32) -> RoutePref {
+        self.route_prefs.lock().unwrap().get(&id).copied().unwrap_or_default()
+    }
+
     pub fn on_peers(&self, list: Vec<PeerInfo>) {
+        *self.last_peer_list.lock().unwrap() = list.clone();
         if !self.p2p_enabled.load(Ordering::Relaxed) {
             return;
         }
+        // 手动选了走服务器的人不打洞
+        let prefs = self.route_prefs.lock().unwrap().clone();
+        let list: Vec<PeerInfo> = list.into_iter().filter(|p| prefs.get(&p.id) != Some(&RoutePref::Server)).collect();
         let mut peers = self.peers.lock().unwrap();
         peers.map.retain(|id, _| list.iter().any(|p| p.id == *id));
         for info in list {
@@ -879,7 +937,14 @@ impl Link {
                 p.update_quality(now);
             }
         }
-        // 按上行预算分配：已打通的候选按延迟从低到高
+        // 手动「强制直连」的人：打通了就直连，不看稳定性、绕远和预算
+        let prefs = self.route_prefs.lock().unwrap().clone();
+        let forced: Vec<u32> = others
+            .iter()
+            .copied()
+            .filter(|id| prefs.get(id) == Some(&RoutePref::Direct) && peers.map.get(id).is_some_and(|p| p.confirmed && p.alive(now)))
+            .collect();
+        // 其余的人按上行预算分配：已打通的候选按延迟从低到高
         let srv = self.server_rtt.load(Ordering::Relaxed);
         let by_rtt = |ids: &[u32]| {
             let mut v: Vec<(u32, u32)> = ids
@@ -898,15 +963,20 @@ impl Link {
             v.into_iter().map(|(_, id)| id).collect::<Vec<u32>>()
         };
         let watchers: Vec<u32> = self.watchers.lock().unwrap().iter().copied().filter(|w| others.contains(w)).collect();
+        let auto_others: Vec<u32> = others.iter().copied().filter(|i| !forced.contains(i)).collect();
+        let auto_watchers: Vec<u32> = watchers.iter().copied().filter(|i| !forced.contains(i)).collect();
         let (mut voice, mut video) = if active {
-            allocate_direct(
+            let (mut v, mut d) = allocate_direct(
                 self.budget_bps.load(Ordering::Relaxed),
-                &by_rtt(&others),
-                others.len(),
+                &by_rtt(&auto_others),
+                auto_others.len(),
                 self.video_bps.load(Ordering::Relaxed),
-                &by_rtt(&watchers),
-                watchers.len(),
-            )
+                &by_rtt(&auto_watchers),
+                auto_watchers.len(),
+            );
+            v.extend(forced.iter().copied());
+            d.extend(forced.iter().copied().filter(|i| watchers.contains(i)));
+            (v, d)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -935,7 +1005,9 @@ impl Link {
             } else {
                 0
             };
-            self.tcp_send(Outgoing::Msg(ClientMsg::LinkStats { server_rtt: udp_rtt, peers: stats, relay_slots: slots }));
+            let mut via_server: Vec<u32> = prefs.iter().filter(|(_, r)| **r == RoutePref::Server).map(|(id, _)| *id).collect();
+            via_server.sort();
+            self.tcp_send(Outgoing::Msg(ClientMsg::LinkStats { server_rtt: udp_rtt, peers: stats, relay_slots: slots, via_server }));
         }
         voice.sort();
         video.sort();
@@ -1021,6 +1093,11 @@ pub struct VoiceState {
 }
 
 impl VoiceState {
+    /// 最近这段时间里收到过他的语音
+    pub fn heard_within(&self, user: u32, d: Duration) -> bool {
+        self.last_heard.lock().unwrap().get(&user).is_some_and(|t| t.elapsed() < d)
+    }
+
     pub fn is_speaking(&self, user: u32) -> bool {
         self.last_heard.lock().unwrap().get(&user).is_some_and(|t| t.elapsed() < Duration::from_millis(250))
     }
@@ -1208,6 +1285,8 @@ pub fn connect(
         srv_pings: Mutex::new(std::collections::VecDeque::new()),
         sent_bytes: AtomicU64::new(0),
         up_history: Mutex::new(std::collections::VecDeque::new()),
+        route_prefs: Mutex::new(HashMap::new()),
+        last_peer_list: Mutex::new(Vec::new()),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1519,6 +1598,8 @@ struct Transmitter {
     loop_seq: u16,
     /// 编码器当前是否按低带宽码率
     low: bool,
+    /// 连续多少帧完全没有声音（全 0）
+    zero_frames: u32,
 }
 
 impl Transmitter {
@@ -1536,6 +1617,7 @@ impl Transmitter {
             hang: 0,
             loop_seq: 0,
             low: false,
+            zero_frames: 0,
         }
     }
 
@@ -1549,6 +1631,9 @@ impl Transmitter {
         let rms = (energy / FRAME_SAMPLES as f32).sqrt();
         let db = 20.0 * (rms + 1e-9).log10();
         s.input_level_db.set(db);
+        // 麦克风连续 5 秒给的全是 0：多半是 Windows 隐私设置不让 VOC 用麦克风，或设备坏了（真实环境总有底噪）
+        self.zero_frames = if energy < 1e-12 { self.zero_frames.saturating_add(1) } else { 0 };
+        s.mic_silent.store(self.zero_frames >= MIC_SILENT_FRAMES, Ordering::Relaxed);
 
         let ptt = s.ptt_vk.load(Ordering::Relaxed);
         let speaking = if ptt != 0 { key_down(ptt) } else { db >= s.vad_threshold_db.get() };
@@ -2020,6 +2105,32 @@ mod tests {
 
     fn music_buffered(mb: &Mutex<Mixer>, from: u32) -> bool {
         mb.lock().unwrap().buffer_ms(crate::audio::stream_mixer_id(udp::MUSIC, from)).is_some()
+    }
+
+    /// 手动线路：走服务器 → 不再直连、不打洞；改回自动重新打通；强制直连时不稳也照样直连
+    #[test]
+    fn manual_route_prefs() {
+        let wait = |what: &str, f: &dyn Fn() -> bool| {
+            let t = Instant::now();
+            while !f() {
+                assert!(t.elapsed() < Duration::from_secs(5), "{what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let (la, sa, _lb, sb, _mb, _ea) = music_pair();
+        la.set_route_prefs(HashMap::from([(7, RoutePref::Server)]));
+        wait("server route drops direct", &|| !la.allocation().0.contains(&7));
+        assert!(!la.punch_states().contains_key(&7), "no punching with a server-only peer");
+        assert_eq!(la.route_pref(7), RoutePref::Server);
+        la.set_route_prefs(HashMap::new());
+        wait("auto punches again", &|| la.allocation().0.contains(&7));
+        // 直连被判为不稳：自动时改走服务器，强制直连时照样直连
+        la.peers.lock().unwrap().map.get_mut(&7).unwrap().unstable_until = Some(Instant::now() + Duration::from_secs(600));
+        wait("unstable falls back", &|| !la.allocation().0.contains(&7));
+        la.set_route_prefs(HashMap::from([(7, RoutePref::Direct)]));
+        wait("forced direct ignores instability", &|| la.allocation().0.contains(&7));
+        sa.disconnect();
+        sb.disconnect();
     }
 
     #[test]

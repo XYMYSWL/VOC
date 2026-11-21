@@ -54,6 +54,8 @@ struct Persisted {
     ptt_vk: u32,
     /// 低带宽模式（手机热点、流量少的网络）
     low_bandwidth: bool,
+    /// 手动选的线路：服务器地址 → 昵称 → 选择（没有的按自动）
+    routes: HashMap<String, HashMap<String, voice::RoutePref>>,
     /// 上次所在的语音频道（按服务器），开机自启自动登录后回到这里
     last_channel: HashMap<String, u32>,
     /// 观看屏幕共享时用显卡硬解
@@ -103,6 +105,7 @@ impl Default for Persisted {
             share_audio: true,
             ptt_vk: 0,
             low_bandwidth: false,
+            routes: HashMap::new(),
             last_channel: HashMap::new(),
             hw_decode: false,
             auto_update: true,
@@ -710,6 +713,23 @@ impl App {
         }
     }
 
+    /// 把手动线路（按昵称记）换成当前的 id 交给链路
+    fn sync_routes(&self) {
+        let Screen::Main(s) = &self.screen else { return };
+        let Some(l) = self.voice.current_link() else { return };
+        let map: HashMap<u32, voice::RoutePref> = match self.cfg.routes.get(&s.server_key) {
+            Some(m) => s
+                .users
+                .iter()
+                .filter(|u| u.id != s.user_id)
+                .filter_map(|u| m.get(&u.name).map(|r| (u.id, *r)))
+                .filter(|(_, r)| *r != voice::RoutePref::Auto)
+                .collect(),
+            None => HashMap::new(),
+        };
+        l.set_route_prefs(map);
+    }
+
     /// 诊断信息（给别人排查问题用）：版本、系统、网络、声卡、编解码器。
     /// 不含聊天、密钥、授权码、服务器地址和任何人的 IP。
     fn diagnostics(&self) -> String {
@@ -721,7 +741,7 @@ impl App {
         let _ = writeln!(d, "安装方式：{}", if crate::update::is_packaged() { "安装版（MSIX）" } else { "绿色版" });
         let _ = writeln!(d, "\n[网络]");
         match (&self.screen, self.voice.current_link()) {
-            (Screen::Main(_), Some(l)) => {
+            (Screen::Main(s), Some(l)) => {
                 let tr = match self.voice.transport_udp() {
                     Some(true) => "UDP",
                     Some(false) => "TCP 隧道（UDP 不通）",
@@ -779,6 +799,60 @@ impl App {
                 }
                 let _ = writeln!(d, "伴奏：{}", if self.music.is_some() { "正在放" } else { "没放" });
                 let _ = writeln!(d, "在看别人的共享：{} 路", self.views.len());
+                // 同频道每个人：加密、线路、有没有收到他的声音（排查「我能听到他、他听不到我」）
+                let yn = |b: bool| if b { "是" } else { "否" };
+                let my_ch = s.me().and_then(|u| u.channel_id);
+                if let (Some(ch), Some(e2e)) = (my_ch, &s.e2e) {
+                    let _ = writeln!(d, "\n[同频道成员]");
+                    let e = e2e.lock().unwrap();
+                    let punch = l.punch_states();
+                    let (alloc, _) = l.allocation();
+                    let routes = l.relays();
+                    for u in s.users.iter().filter(|u| u.id != s.user_id && u.channel_id == Some(ch)) {
+                        let enc = match e.member_status(u.id) {
+                            None => "还没收到他的加密身份".to_string(),
+                            Some((t, pair, theirs, mine)) => format!(
+                                "加密 {} · 成对密钥 {} · 收到他的语音密钥 {} · 我的语音密钥已发给他 {}",
+                                match t {
+                                    Trust::New | Trust::Known => "正常",
+                                    Trust::Changed => "身份已变化（暂停）",
+                                },
+                                yn(pair),
+                                yn(theirs),
+                                yn(mine)
+                            ),
+                        };
+                        let me = s.user_id;
+                        let out = if alloc.contains(&u.id) {
+                            "直连".to_string()
+                        } else if let Some(r) = routes.iter().find(|r| r.from == me && r.to == u.id) {
+                            format!("经 {} 中转", s.name_of(r.via))
+                        } else {
+                            "服务器".to_string()
+                        };
+                        let inbound = routes.iter().find(|r| r.from == u.id && r.to == me).map(|r| format!(" · 他的声音经 {} 中转过来", s.name_of(r.via)));
+                        let ps = match punch.get(&u.id) {
+                            Some(voice::PunchState::Connected(q)) => format!("已打通 {} ms", q.rtt_ms),
+                            Some(voice::PunchState::Punching(t)) => format!("打洞中 {t}s"),
+                            Some(voice::PunchState::Failed(_)) => "打不通".into(),
+                            Some(voice::PunchState::WaitingKeys) => "等待密钥".into(),
+                            None => "没有打洞".into(),
+                        };
+                        let _ = writeln!(
+                            d,
+                            "{}：{} · 我的声音发给他走 {}{} · 打洞 {} · 手动线路 {} · 最近 3 秒收到他的声音 {}{}{}",
+                            u.name,
+                            enc,
+                            out,
+                            inbound.unwrap_or_default(),
+                            ps,
+                            l.route_pref(u.id).label(),
+                            yn(self.voice.heard_within(u.id, Duration::from_secs(3))),
+                            if u.muted { " · 他闭麦了" } else { "" },
+                            if u.deafened { " · 他开了静音" } else { "" },
+                        );
+                    }
+                }
                 let me = l.my_id();
                 let routes = l.relays();
                 let _ = writeln!(
@@ -796,6 +870,26 @@ impl App {
         let _ = writeln!(d, "麦克风：{}", self.cfg.input_device.as_deref().unwrap_or("系统默认"));
         let _ = writeln!(d, "扬声器：{}", self.cfg.output_device.as_deref().unwrap_or("系统默认"));
         let _ = writeln!(d, "降噪：{:?} · 语音激活阈值 {} dB", self.cfg.denoise, self.cfg.vad_threshold_db);
+        {
+            let st = &self.settings;
+            let ptt = st.ptt_vk.load(Ordering::Relaxed);
+            let _ = writeln!(
+                d,
+                "麦克风状态：{} · 说话方式 {} · 当前电平 {:.0} dB · 正在发送 {} · 回声消除 {} · 麦克风完全没声音 {}",
+                if st.deafened.load(Ordering::Relaxed) {
+                    "静音中"
+                } else if st.muted.load(Ordering::Relaxed) {
+                    "闭麦中"
+                } else {
+                    "开"
+                },
+                if ptt == 0 { "语音激活".to_string() } else { format!("按键说话（{}）", vk_name(ptt)) },
+                st.input_level_db.get(),
+                if st.transmitting.load(Ordering::Relaxed) { "是" } else { "否" },
+                if st.aec.load(Ordering::Relaxed) { "开" } else { "关" },
+                if st.mic_silent.load(Ordering::Relaxed) { "是（检查 Windows 麦克风隐私设置）" } else { "否" },
+            );
+        }
         let _ = writeln!(d, "\n[视频]");
         let enc: Vec<String> = video::hw_encoders().iter().map(|e| format!("{} ({})", e.name, e.gpu)).collect();
         let _ = writeln!(d, "硬件编码器：{}", if enc.is_empty() { "无".into() } else { enc.join("、") });
@@ -817,6 +911,7 @@ impl App {
                 self.go_login(Some(d.reason));
             }
         }
+        self.sync_routes();
         // 测试模式：进频道 2 秒后自动发一张图（VOC_TEST_SEND_IMAGE=路径）
         if self.test_mode && !self.test_image_sent {
             if let (Ok(path), Screen::Main(s)) = (std::env::var("VOC_TEST_SEND_IMAGE"), &self.screen) {

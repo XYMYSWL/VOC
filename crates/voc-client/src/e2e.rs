@@ -179,6 +179,17 @@ impl E2e {
         }
     }
 
+    /// 诊断用：(信任状态, 成对密钥已建立, 收到了他的语音密钥, 我当前的语音密钥已发给他)
+    pub fn member_status(&self, id: u32) -> Option<(Trust, bool, bool, bool)> {
+        let m = self.members.get(&id)?;
+        Some((
+            m.trust,
+            self.pairs.contains_key(&id),
+            self.keyring.by_sender.get(&id).is_some_and(|k| k.has_any()),
+            self.sent_epoch.get(&id) == Some(&self.sender.epoch),
+        ))
+    }
+
     /// 用户核对安全码后，接受某人的新身份
     pub fn trust(&mut self, id: u32) {
         let Some(m) = self.members.get_mut(&id) else { return };

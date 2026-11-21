@@ -41,6 +41,8 @@ pub struct Member {
     pub links: HashMap<u32, (u32, u8, u32)>,
     /// 还能中转几路
     pub slots: u16,
+    /// 他手动选了「走服务器」的人：两人之间不安排成员中继
+    pub server_only: HashSet<u32>,
 }
 
 impl Member {
@@ -69,6 +71,9 @@ pub fn plan(members: &[Member], current: &HashMap<(u32, u32), u32>) -> Vec<Relay
         for b in members {
             if b.id == a.id || b.deafened || a.direct.contains(&b.id) {
                 continue;
+            }
+            if a.server_only.contains(&b.id) || b.server_only.contains(&a.id) {
+                continue; // 有一方手动选了走服务器
             }
             let (Some(sa), Some(sb)) = (a.server_rtt, b.server_rtt) else { continue };
             let server_ms = sa + sb;
@@ -124,6 +129,20 @@ mod tests {
             slots,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn manual_server_route_blocks_relay() {
+        // A(1)、B(2) 打不通，R(3) 和两人都直连良好：本来会安排 A→B 经 R
+        let ms = |srv_only: &[u32]| {
+            let mut a = m(1, 150, &[3], &[], 0);
+            a.server_only = srv_only.iter().copied().collect();
+            vec![a, m(2, 150, &[3], &[], 0), m(3, 150, &[1, 2], &[(1, 20, 0, 1), (2, 20, 0, 1)], 4)]
+        };
+        assert!(plan(&ms(&[]), &HashMap::new()).iter().any(|r| r.from == 1 && r.to == 2));
+        // A 手动选了和 B 走服务器：两个方向都不安排
+        let routes = plan(&ms(&[2]), &HashMap::new());
+        assert!(!routes.iter().any(|r| (r.from, r.to) == (1, 2) || (r.from, r.to) == (2, 1)), "{routes:?}");
     }
 
     #[test]

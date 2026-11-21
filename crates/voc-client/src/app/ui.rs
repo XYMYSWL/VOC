@@ -224,6 +224,10 @@ impl App {
         let mut open_dm: Option<String> = None;
         let mut close_dm: Option<String> = None;
         let mut switch_tab: Option<Option<String>> = None;
+        // 手动线路（按昵称）和这次在右键菜单里改的
+        let routes_by_name: HashMap<String, voice::RoutePref> = self.cfg.routes.get(&s.server_key).cloned().unwrap_or_default();
+        let mut route_change: Option<(String, voice::RoutePref)> = None;
+        let mic_silent = self.settings.mic_silent.load(Ordering::Relaxed) && my_channel.is_some();
         // 正在看的私聊：清未读；对话已不存在就回到频道聊天
         if let Some(p) = s.chat_tab.clone() {
             match s.dms.iter_mut().find(|t| t.peer == p) {
@@ -503,16 +507,26 @@ impl App {
                                     ui.add_space(48.0);
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     let voice_direct = alloc_voice.contains(&u.id);
-                                    match (via, q) {
-                                        (Some(r), q) if !q.is_some_and(|q| voice_direct && !q.unstable) => {
-                                            th::relay_chip(ui, &name_of(r.via), r.ms, r.server_ms, q);
-                                        }
-                                        (_, Some(q)) => th::quality_chip(ui, q, voice_direct, alloc_video.contains(&u.id)),
-                                        _ => {
-                                            if let Some(st) = link_state {
-                                                th::link_state_chip(ui, st);
+                                    let pref = if is_me { voice::RoutePref::Auto } else { routes_by_name.get(&u.name).copied().unwrap_or_default() };
+                                    if pref == voice::RoutePref::Server {
+                                        th::pill(ui, "⇄ 走服务器（手动）", th::TEXT_DIM, th::BG_ELEVATED)
+                                            .on_hover_text("你选了和他之间走服务器；右键他的名字可以改回自动");
+                                    } else {
+                                        match (via, q) {
+                                            (Some(r), q) if !q.is_some_and(|q| voice_direct && !q.unstable) => {
+                                                th::relay_chip(ui, &name_of(r.via), r.ms, r.server_ms, q);
+                                            }
+                                            (_, Some(q)) => th::quality_chip(ui, q, voice_direct, alloc_video.contains(&u.id)),
+                                            _ => {
+                                                if let Some(st) = link_state {
+                                                    th::link_state_chip(ui, st);
+                                                }
                                             }
                                         }
+                                    }
+                                    if pref == voice::RoutePref::Direct {
+                                        th::pill(ui, "手动直连", th::ACCENT_HOVER, th::ACCENT_SOFT)
+                                            .on_hover_text("你选了强制 P2P 直连：打通了就一直直连；打不通时仍走服务器。右键可以改回自动");
                                     }
                                     if relaying > 0 {
                                         let me = me_id.unwrap_or_default();
@@ -580,6 +594,23 @@ impl App {
                                     if ui.button("💬 私聊").on_hover_text("只有你们两个看得到，端到端加密，关闭标签或关掉 VOC 后清除").clicked() {
                                         open_dm = Some(u.name.clone());
                                         ui.close();
+                                    }
+                                    {
+                                        use voice::RoutePref as R;
+                                        let cur = routes_by_name.get(&u.name).copied().unwrap_or_default();
+                                        let mut r = cur;
+                                        ui.separator();
+                                        ui.label(RichText::new("和他之间的线路").size(12.0).color(th::TEXT_DIM));
+                                        ui.radio_value(&mut r, R::Auto, "自动（推荐）")
+                                            .on_hover_text("能直连就直连；不稳、绕远或超出上行预算时自动走服务器或队友中转");
+                                        ui.radio_value(&mut r, R::Direct, "强制 P2P 直连")
+                                            .on_hover_text("打通了就一直直连，不因丢包、绕远或上行预算切走；打不通时仍走服务器，保证听得到");
+                                        ui.radio_value(&mut r, R::Server, "走服务器")
+                                            .on_hover_text("不和他直连，也不经队友中转，两边的声音都经服务器。\n「我能听到他、他听不到我」时可以先试这个");
+                                        if r != cur {
+                                            route_change = Some((u.name.clone(), r));
+                                        }
+                                        ui.separator();
                                     }
                                     {
                                         let mut m = self.mixer.lock().unwrap();
@@ -684,6 +715,14 @@ impl App {
                     });
                 }
                 egui::Panel::bottom("chat_input").frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 8))).show(ui, |ui| {
+                    if mic_silent {
+                        ui.label(
+                            RichText::new("⚠ 你的麦克风一直完全没有声音，别人听不到你。请检查 Windows 设置 → 隐私和安全性 → 麦克风（「允许桌面应用访问麦克风」要打开），或在 设置 → 音频 换一个麦克风。")
+                                .size(12.0)
+                                .color(th::YELLOW),
+                        );
+                        ui.add_space(4.0);
+                    }
                     egui::Frame::new()
                         .fill(th::BG_ELEVATED)
                         .corner_radius(CornerRadius::same(12))
@@ -858,6 +897,14 @@ impl App {
         }
         if let Some(tab) = switch_tab {
             s.chat_tab = tab;
+        }
+        if let Some((name, r)) = route_change {
+            let m = self.cfg.routes.entry(s.server_key.clone()).or_default();
+            if r == voice::RoutePref::Auto {
+                m.remove(&name);
+            } else {
+                m.insert(name, r);
+            }
         }
         if let Some(p) = open_dm {
             s.dm(&p);

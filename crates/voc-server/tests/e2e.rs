@@ -793,10 +793,10 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
     b.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
     r.send(ClientMsg::DirectPeers { ids: vec![ia, ib], video: vec![] });
-    a.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0 });
-    b.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0 });
+    a.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![] });
+    b.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![] });
     // carol 顺带报了一个不在频道里的 id，服务器应忽略
-    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib), stat(999)], relay_slots: 4 });
+    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib), stat(999)], relay_slots: 4, via_server: vec![] });
 
     // 经 carol：20 + 20 + 4 = 44 ms；经服务器：150 + 150 = 300 ms
     let want = vec![
@@ -815,7 +815,7 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     assert!(r.udp_recv().is_none());
 
     // carol 关掉中继（名额 0）→ 路线撤销，服务器恢复转发给 bob
-    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib)], relay_slots: 0 });
+    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib)], relay_slots: 0, via_server: vec![] });
     for x in [&mut a, &mut b, &mut r] {
         x.wait_for(|m| matches!(m, ServerMsg::Relays { routes } if routes.is_empty()));
     }

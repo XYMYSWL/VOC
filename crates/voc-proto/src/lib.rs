@@ -117,6 +117,9 @@ pub enum ClientMsg {
         server_rtt: u32,
         peers: Vec<PeerStat>,
         relay_slots: u16,
+        /// 用户手动选了「走服务器」的人：我和他之间的语音不要安排成员中继
+        #[serde(default)]
+        via_server: Vec<u32>,
     },
 }
 

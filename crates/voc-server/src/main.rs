@@ -90,6 +90,8 @@ struct LinkReport {
     server_rtt: u32,
     peers: Vec<PeerStat>,
     slots: u16,
+    /// 手动选了走服务器的人
+    via_server: HashSet<u32>,
 }
 
 /// 链路上报超过这么久没更新就不再采信
@@ -316,6 +318,7 @@ impl State {
                 m.server_rtt = Some(r.server_rtt.max(1));
                 m.links = r.peers.iter().map(|p| (p.id, (p.rtt, p.loss, p.jitter))).collect();
                 m.slots = r.slots;
+                m.server_only = r.via_server.clone();
             }
             by_channel.entry(ch).or_default().push(m);
         }
@@ -1084,11 +1087,12 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::LinkStats { server_rtt, peers, relay_slots } => {
+        ClientMsg::LinkStats { server_rtt, peers, relay_slots, via_server } => {
             let Some(u) = st.users.get_mut(&uid) else { return };
             let allowed: HashSet<u32> = u.last_peers.iter().map(|p| p.id).collect();
             let peers: Vec<PeerStat> = peers.into_iter().filter(|p| allowed.contains(&p.id)).take(32).collect();
-            u.stats = Some(LinkReport { at: Instant::now(), server_rtt: server_rtt.min(10_000), peers, slots: relay_slots.min(16) });
+            let via_server: HashSet<u32> = via_server.into_iter().take(32).collect();
+            u.stats = Some(LinkReport { at: Instant::now(), server_rtt: server_rtt.min(10_000), peers, slots: relay_slots.min(16), via_server });
         }
         ClientMsg::DirectPeers { ids, video } => {
             let Some(u) = st.users.get(&uid) else { return };

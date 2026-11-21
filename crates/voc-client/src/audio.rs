@@ -107,6 +107,8 @@ pub struct Settings {
     pub aec: AtomicBool,
     /// 按键说话的按键（Windows 虚拟键码）；0 = 语音激活
     pub ptt_vk: AtomicU32,
+    /// 麦克风连续几秒完全没有声音（Windows 隐私设置关了麦克风等）
+    pub mic_silent: AtomicBool,
 }
 
 impl Default for Settings {
@@ -122,6 +124,7 @@ impl Default for Settings {
             transmitting: AtomicBool::new(false),
             aec: AtomicBool::new(true),
             ptt_vk: AtomicU32::new(0),
+            mic_silent: AtomicBool::new(false),
         }
     }
 }
