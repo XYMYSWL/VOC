@@ -14,7 +14,25 @@ permissions:
   contents: write
 
 jobs:
+  # 已经手动发布过这个版本（例如本机用 gh release create 发的）就不再打包
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.r.outputs.exists }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "Release 已存在，跳过"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
   release:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
