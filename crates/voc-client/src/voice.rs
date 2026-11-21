@@ -430,11 +430,17 @@ pub struct Link {
     public_addr: Mutex<Option<SocketAddr>>,
     /// 最近 30 次服务器 PING：(发送时间, 收到回复)，算丢包率
     srv_pings: Mutex<std::collections::VecDeque<(u64, bool)>>,
+    /// 发出的字节数（UDP 含 IP/UDP 头，TCP 隧道只算语音和画面），诊断「上行是不是被占满」用
+    sent_bytes: AtomicU64,
+    /// 最近 30 秒每秒的上行码率（kbps）
+    up_history: Mutex<std::collections::VecDeque<u32>>,
 }
 
 impl Link {
     fn send_raw(&self, buf: &[u8], to: SocketAddr) {
-        let _ = self.sock.send_to(buf, wire(to, self.dual));
+        if self.sock.send_to(buf, wire(to, self.dual)).is_ok() {
+            self.sent_bytes.fetch_add(buf.len() as u64 + 28, Ordering::Relaxed);
+        }
     }
 
     fn send_server(&self, kind: u8, data: &[u8], buf: &mut Vec<u8>) {
@@ -443,7 +449,18 @@ impl Link {
     }
 
     fn tcp_send(&self, o: Outgoing) {
+        if let Outgoing::Voice(v) | Outgoing::Video(v) = &o {
+            self.sent_bytes.fetch_add(v.len() as u64 + 60, Ordering::Relaxed);
+        }
         let _ = self.tcp.lock().unwrap().send(o);
+    }
+
+    /// 上行码率（kbps）：(最近 1 秒, 最近 30 秒平均, 最近 30 秒峰值)
+    pub fn upload_kbps(&self) -> (u32, u32, u32) {
+        let h = self.up_history.lock().unwrap();
+        let now = h.back().copied().unwrap_or(0);
+        let avg = if h.is_empty() { 0 } else { (h.iter().map(|&x| x as u64).sum::<u64>() / h.len() as u64) as u32 };
+        (now, avg, h.iter().copied().max().unwrap_or(0))
     }
 
     fn send_voice(&self, frame: &[u8], buf: &mut Vec<u8>) {
@@ -1189,6 +1206,8 @@ pub fn connect(
         created: Instant::now(),
         public_addr: Mutex::new(None),
         srv_pings: Mutex::new(std::collections::VecDeque::new()),
+        sent_bytes: AtomicU64::new(0),
+        up_history: Mutex::new(std::collections::VecDeque::new()),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1203,8 +1222,19 @@ pub fn connect(
     std::thread::Builder::new().name("udp-tick".into()).spawn(move || {
         let mut buf = Vec::new();
         let mut n = 0u32;
+        let mut last_sent = 0u64;
         while !l.closed.load(Ordering::Relaxed) {
             if n % 10 == 0 {
+                // 每秒记一次上行码率
+                let sent = l.sent_bytes.load(Ordering::Relaxed);
+                if n > 0 {
+                    let mut h = l.up_history.lock().unwrap();
+                    h.push_back((sent.saturating_sub(last_sent) * 8 / 1000) as u32);
+                    while h.len() > 30 {
+                        h.pop_front();
+                    }
+                }
+                last_sent = sent;
                 let ts = now_millis();
                 l.send_server(udp::PING, &udp::ping_payload(ts), &mut buf);
                 {

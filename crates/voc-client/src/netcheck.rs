@@ -48,6 +48,19 @@ pub struct Report {
     pub advice: Vec<String>,
 }
 
+/// 诊断信息里的「端口映射」一项：同样的结论，但不带任何 IP 地址
+pub fn portmap_text_without_ip(status: &PortMapStatus, item: &Item) -> String {
+    match status {
+        PortMapStatus::Trying => "正在问路由器".into(),
+        // 多层 NAT 的提示本来就不含 IP
+        PortMapStatus::Mapped { .. } if item.level == Level::Warn => item.value.clone(),
+        PortMapStatus::Mapped { method, .. } => format!("{method} 已映射"),
+        PortMapStatus::CarrierNat { method, .. } => format!("没用：路由器的外网地址不是公网地址（运营商级 NAT，{method} 查到的）"),
+        PortMapStatus::Unavailable if item.level == Level::Info => "不需要（本机直接有公网地址）".into(),
+        PortMapStatus::Unavailable => "路由器不支持或没开 UPnP / NAT-PMP / PCP".into(),
+    }
+}
+
 /// 连上这么多秒后还没结果才下结论
 const SETTLE_SECS: u64 = 6;
 
@@ -266,6 +279,25 @@ mod tests {
         assert_eq!(level(&r, "NAT"), Level::Warn);
         assert!(r.advice.iter().any(|a| a.contains("UPnP")));
         assert!(r.advice.iter().any(|a| a.contains("1 人打不通")));
+    }
+
+    #[test]
+    fn diagnostics_portmap_text_has_no_ip() {
+        let mut s = base();
+        let r = analyze(&s);
+        let it = r.items.iter().find(|i| i.label == "端口映射").unwrap();
+        assert!(it.value.contains("1.2.3.4"), "self-check shows the address to the user");
+        assert_eq!(portmap_text_without_ip(&s.portmap, it), "UPnP 已映射");
+        s.portmap = PortMapStatus::CarrierNat { method: "PCP", router_external: "100.70.1.2".parse().unwrap() };
+        let r = analyze(&s);
+        let it = r.items.iter().find(|i| i.label == "端口映射").unwrap();
+        let t = portmap_text_without_ip(&s.portmap, it);
+        assert!(!t.contains("100.70") && t.contains("运营商级 NAT"), "{t}");
+        s.portmap = PortMapStatus::Unavailable;
+        s.public = Some("1.2.3.4:61000".parse().unwrap());
+        let r = analyze(&s);
+        let it = r.items.iter().find(|i| i.label == "端口映射").unwrap();
+        assert_eq!(portmap_text_without_ip(&s.portmap, it), "路由器不支持或没开 UPnP / NAT-PMP / PCP");
     }
 
     #[test]

@@ -743,18 +743,42 @@ impl App {
                 for q in l.direct_peers().values() {
                     let _ = writeln!(d, "  链路：{} ms · 丢包 {}% · 抖动 {} ms{}", q.rtt_ms, q.loss_pct, q.jitter_ms, if q.unstable { " · 不稳" } else { "" });
                 }
-                // 自检结论（去掉含 IP 的两项）
+                // 自检结论（去掉含 IP 的内容）
                 let rep = crate::netcheck::analyze(&l.netcheck_snapshot());
                 for it in rep.items.iter().filter(|i| i.label != "本机地址" && i.label != "公网地址") {
-                    let v = if it.label == "端口映射" { format!("{:?}", it.level) } else { it.value.clone() };
+                    let v = if it.label == "端口映射" {
+                        crate::netcheck::portmap_text_without_ip(&l.portmap_status(), it)
+                    } else {
+                        it.value.clone()
+                    };
                     let _ = writeln!(d, "{}：{}", it.label, v);
                 }
-                let _ = writeln!(d, "端口映射方式：{}", match l.portmap_status() {
-                    crate::portmap::PortMapStatus::Trying => "尝试中",
-                    crate::portmap::PortMapStatus::Mapped { method, .. } => method,
-                    crate::portmap::PortMapStatus::CarrierNat { .. } => "运营商级 NAT",
-                    crate::portmap::PortMapStatus::Unavailable => "不支持",
-                });
+                let (now, avg, peak) = l.upload_kbps();
+                let _ = writeln!(d, "上行：当前 {now} kbps · 最近 30 秒平均 {avg} · 峰值 {peak}");
+                match &self.sharer {
+                    Some(sh) => {
+                        let st = &sh.stats;
+                        let _ = writeln!(
+                            d,
+                            "屏幕共享：{} · 观看 {} 人（其中流畅 {} 人）· 实际 {}×{} {} fps {} kbps · 码率 {}% · {} · {}",
+                            sh.cfg.desc(),
+                            l.watcher_count(),
+                            st.low_watchers.load(Ordering::Relaxed),
+                            st.width.load(Ordering::Relaxed),
+                            st.height.load(Ordering::Relaxed),
+                            st.fps.load(Ordering::Relaxed),
+                            st.kbps.load(Ordering::Relaxed),
+                            st.rate_pct.load(Ordering::Relaxed),
+                            st.encoder.lock().unwrap(),
+                            st.pipeline.lock().unwrap(),
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(d, "屏幕共享：没在共享");
+                    }
+                }
+                let _ = writeln!(d, "伴奏：{}", if self.music.is_some() { "正在放" } else { "没放" });
+                let _ = writeln!(d, "在看别人的共享：{} 路", self.views.len());
                 let me = l.my_id();
                 let routes = l.relays();
                 let _ = writeln!(
@@ -1534,16 +1558,55 @@ fn save_png(path: &str, img: &egui::ColorImage) -> Result<(), String> {
 }
 
 /// Windows 版本（例如 "Microsoft Windows [版本 10.0.26200.xxxx]"）
+/// 系统版本，例如「Windows 11 Pro 24H2（内部版本 26100.1234）」。
+/// 读注册表（以前用 `cmd /c ver`，中文系统输出 GBK，解出来是乱码）
 fn os_version() -> String {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        if let Ok(o) = std::process::Command::new("cmd").args(["/c", "ver"]).creation_flags(CREATE_NO_WINDOW).output() {
-            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !t.is_empty() {
-                return t;
+        use windows::core::HSTRING;
+        use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+        const KEY: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+        let sz = |name: &str| -> Option<String> {
+            let mut buf = [0u16; 128];
+            let mut len = (buf.len() * 2) as u32;
+            let ok = unsafe {
+                RegGetValueW(
+                    HKEY_LOCAL_MACHINE,
+                    &HSTRING::from(KEY),
+                    &HSTRING::from(name),
+                    RRF_RT_REG_SZ,
+                    None,
+                    Some(buf.as_mut_ptr() as *mut _),
+                    Some(&mut len),
+                )
             }
+            .is_ok();
+            let n = (len as usize / 2).saturating_sub(1);
+            ok.then(|| String::from_utf16_lossy(&buf[..n]).trim().to_string()).filter(|s| !s.is_empty())
+        };
+        let ubr = {
+            let mut v = 0u32;
+            let mut len = 4u32;
+            let ok = unsafe {
+                RegGetValueW(
+                    HKEY_LOCAL_MACHINE,
+                    &HSTRING::from(KEY),
+                    &HSTRING::from("UBR"),
+                    RRF_RT_REG_DWORD,
+                    None,
+                    Some(&mut v as *mut u32 as *mut _),
+                    Some(&mut len),
+                )
+            }
+            .is_ok();
+            ok.then_some(v)
+        };
+        if let (Some(product), Some(build)) = (sz("ProductName"), sz("CurrentBuildNumber")) {
+            // Windows 11 的注册表里产品名仍写着 Windows 10
+            let product = if build.parse::<u32>().unwrap_or(0) >= 22000 { product.replace("Windows 10", "Windows 11") } else { product };
+            let display = sz("DisplayVersion").map(|d| format!(" {d}")).unwrap_or_default();
+            let ubr = ubr.map(|u| format!(".{u}")).unwrap_or_default();
+            return format!("{product}{display}（内部版本 {build}{ubr}）");
         }
     }
     std::env::consts::OS.to_string()
@@ -1631,5 +1694,14 @@ mod tests {
         ];
         wipe_chat(&mut chat);
         assert!(chat.is_empty());
+    }
+}
+#[cfg(test)]
+mod os_version_probe {
+    #[test]
+    fn os_version_is_readable() {
+        let v = super::os_version();
+        println!("os_version = {v}");
+        assert!(v.starts_with("Windows") && v.contains("内部版本") && !v.contains('\u{FFFD}'), "{v}");
     }
 }

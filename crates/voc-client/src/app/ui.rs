@@ -1184,6 +1184,12 @@ impl App {
                                     ui.end_row();
                                 }
                             });
+                            let (now, avg, peak) = l.upload_kbps();
+                            ui.label(
+                                RichText::new(format!("VOC 上行：当前 {now} kbps · 30 秒平均 {avg} · 峰值 {peak}（丢包多时先看是不是共享屏幕或别的程序占满了上传）"))
+                                    .size(12.0)
+                                    .color(th::TEXT_DIM),
+                            );
                             ui.add_space(4.0);
                             for a in &rep.advice {
                                 ui.label(RichText::new(format!("👉 {a}")).size(12.0).color(th::TEXT_DIM));
