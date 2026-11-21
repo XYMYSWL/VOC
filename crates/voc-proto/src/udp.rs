@@ -1,7 +1,8 @@
 //! 语音包内容（加密前的明文；外层封装见 [`crate::crypto::DatagramSealer`]）。语音帧是 Opus 数据。
 //! 同样的内容在 UDP 不可用时放进 TCP 帧（kind = `crypto::KIND_VOICE`）传输。
 //!
-//! - PING（客户端→服务器）/ PONG（服务器→客户端）：`ts_ms u64`
+//! - PING（客户端→服务器）/ PONG（服务器→客户端）：`ts_ms u64`；PING 末尾多一个字节 1 时，
+//!   新版服务器在 PONG 里接着附上它看到的客户端公网地址：`ts_ms u64 | 1 | ip(4 或 16 字节) | port u16`
 //! - VOICE 客户端→服务器：`seq u16 | 语音帧`
 //! - VOICE 服务器→客户端：`from_id u32 | seq u16 | 语音帧`
 //! - VIDEO 客户端→服务器：`frame u32 | idx u16 | count u16 | flags u8 | 分片数据`（一帧加密后的视频切成多片）
@@ -23,6 +24,44 @@ pub const VIDEO_KEY: u8 = 1;
 pub const CODEC_H264: u8 = 0;
 pub const CODEC_HEVC: u8 = 1;
 pub const CODEC_AV1: u8 = 2;
+
+/// 客户端发的 PING：时间戳 + 「请附上我的公网地址」标记（旧服务器原样回显，不受影响）
+pub fn ping_payload(ts_ms: u64) -> [u8; 9] {
+    let mut p = [1u8; 9];
+    p[..8].copy_from_slice(&ts_ms.to_le_bytes());
+    p
+}
+
+/// 服务器回的 PONG：客户端要了就附上观察到的地址，否则原样回显
+pub fn pong_payload(ping: &[u8], observed: std::net::SocketAddr) -> Vec<u8> {
+    if ping.len() != 9 || ping[8] != 1 {
+        return ping.to_vec();
+    }
+    let mut v = ping.to_vec();
+    match observed.ip().to_canonical() {
+        std::net::IpAddr::V4(ip) => v.extend_from_slice(&ip.octets()),
+        std::net::IpAddr::V6(ip) => v.extend_from_slice(&ip.octets()),
+    }
+    v.extend_from_slice(&observed.port().to_le_bytes());
+    v
+}
+
+/// 解析 PONG：(时间戳, 服务器看到的我的公网地址)
+pub fn read_pong(data: &[u8]) -> Option<(u64, Option<std::net::SocketAddr>)> {
+    let ts = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
+    let addr = match data.len() {
+        15 => {
+            let ip: [u8; 4] = data[9..13].try_into().ok()?;
+            Some(std::net::SocketAddr::from((ip, u16::from_le_bytes([data[13], data[14]]))))
+        }
+        27 => {
+            let ip: [u8; 16] = data[9..25].try_into().ok()?;
+            Some(std::net::SocketAddr::from((ip, u16::from_le_bytes([data[25], data[26]]))))
+        }
+        _ => None,
+    };
+    Some((ts, addr))
+}
 
 pub fn video_flags(key: bool, codec: u8) -> u8 {
     (key as u8) | ((codec & 3) << 1)
@@ -146,6 +185,19 @@ mod tests {
         }
         assert_eq!(back, data);
         assert!(read_video_frag(&[0; 4]).is_none());
+    }
+
+    #[test]
+    fn pong_with_address() {
+        let ping = ping_payload(123);
+        let v4: std::net::SocketAddr = "[::ffff:1.2.3.4]:5000".parse().unwrap();
+        assert_eq!(read_pong(&pong_payload(&ping, v4)), Some((123, Some("1.2.3.4:5000".parse().unwrap()))));
+        let v6: std::net::SocketAddr = "[2001:db8::1]:7".parse().unwrap();
+        assert_eq!(read_pong(&pong_payload(&ping, v6)), Some((123, Some(v6))));
+        // 旧客户端（8 字节）：原样回显；旧服务器回显 9 字节：没有地址
+        assert_eq!(pong_payload(&123u64.to_le_bytes(), v4), 123u64.to_le_bytes().to_vec());
+        assert_eq!(read_pong(&ping), Some((123, None)));
+        assert_eq!(read_pong(&[1, 2]), None);
     }
 
     #[test]

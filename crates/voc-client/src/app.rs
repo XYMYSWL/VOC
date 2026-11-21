@@ -676,6 +676,18 @@ impl App {
                 for q in l.direct_peers().values() {
                     let _ = writeln!(d, "  链路：{} ms · 丢包 {}% · 抖动 {} ms{}", q.rtt_ms, q.loss_pct, q.jitter_ms, if q.unstable { " · 不稳" } else { "" });
                 }
+                // 自检结论（去掉含 IP 的两项）
+                let rep = crate::netcheck::analyze(&l.netcheck_snapshot());
+                for it in rep.items.iter().filter(|i| i.label != "本机地址" && i.label != "公网地址") {
+                    let v = if it.label == "端口映射" { format!("{:?}", it.level) } else { it.value.clone() };
+                    let _ = writeln!(d, "{}：{}", it.label, v);
+                }
+                let _ = writeln!(d, "端口映射方式：{}", match l.portmap_status() {
+                    crate::portmap::PortMapStatus::Trying => "尝试中",
+                    crate::portmap::PortMapStatus::Mapped { method, .. } => method,
+                    crate::portmap::PortMapStatus::CarrierNat { .. } => "运营商级 NAT",
+                    crate::portmap::PortMapStatus::Unavailable => "不支持",
+                });
                 let me = l.my_id();
                 let routes = l.relays();
                 let _ = writeln!(

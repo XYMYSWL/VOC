@@ -1135,7 +1135,7 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
                 udp::PING => {
                     let u = st.users.get_mut(&uid).unwrap();
                     let mut p = Vec::new();
-                    u.udp_seal.seal(udp::PONG, &data, &mut p);
+                    u.udp_seal.seal(udp::PONG, &udp::pong_payload(&data, addr), &mut p);
                     out.push((addr, p));
                 }
                 udp::VOICE => {

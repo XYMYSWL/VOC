@@ -418,6 +418,14 @@ pub struct Link {
     pace_dropped: AtomicU32,
     /// 路由器端口映射的结果（网络自检显示）
     portmap: Mutex<crate::portmap::PortMapStatus>,
+    /// 本机局域网地址（不含端口映射得到的公网地址）、本地端口、建立时间（网络自检用）
+    lan_addrs: Vec<SocketAddr>,
+    local_port: u16,
+    created: Instant,
+    /// 服务器看到的我的公网地址（新版服务器在 PONG 里告诉我）
+    public_addr: Mutex<Option<SocketAddr>>,
+    /// 最近 30 次服务器 PING：(发送时间, 收到回复)，算丢包率
+    srv_pings: Mutex<std::collections::VecDeque<(u64, bool)>>,
 }
 
 impl Link {
@@ -645,6 +653,35 @@ impl Link {
     /// 路由器端口映射的结果
     pub fn portmap_status(&self) -> crate::portmap::PortMapStatus {
         self.portmap.lock().unwrap().clone()
+    }
+
+    /// 网络自检要用的链路快照
+    pub fn netcheck_snapshot(&self) -> crate::netcheck::Snapshot {
+        let now = now_millis();
+        let loss = {
+            let p = self.srv_pings.lock().unwrap();
+            // 发出 1.5 秒还没回的才算丢
+            let done: Vec<bool> = p.iter().filter(|(t, _)| now.saturating_sub(*t) > 1500).map(|(_, g)| *g).collect();
+            (done.len() >= 5).then(|| (done.iter().filter(|g| !**g).count() * 100 / done.len()) as u8)
+        };
+        let rtt = self.server_rtt.load(Ordering::Relaxed);
+        let states = self.punch_states();
+        let count = |f: &dyn Fn(&PunchState) -> bool| states.values().filter(|s| f(s)).count();
+        crate::netcheck::Snapshot {
+            age_secs: self.created.elapsed().as_secs(),
+            udp_ok: self.udp_ok.load(Ordering::Relaxed),
+            ever_pong: self.last_pong_ms.load(Ordering::Relaxed) != 0,
+            server_rtt: (rtt > 0).then_some(rtt),
+            server_loss: loss,
+            public: *self.public_addr.lock().unwrap(),
+            lan: self.lan_addrs.clone(),
+            local_port: self.local_port,
+            portmap: self.portmap_status(),
+            p2p: self.p2p_on(),
+            punched: count(&|s| matches!(s, PunchState::Connected(_))),
+            punching: count(&|s| matches!(s, PunchState::Punching(_))),
+            failed: count(&|s| matches!(s, PunchState::Failed(_))),
+        }
     }
 
     /// 取走匀速队列的丢包计数
@@ -1136,6 +1173,11 @@ pub fn connect(
         share_seq: AtomicU16::new(0),
         pace_dropped: AtomicU32::new(0),
         portmap: Mutex::new(crate::portmap::PortMapStatus::Trying),
+        lan_addrs: local_candidates(port, dual).iter().filter_map(|a| a.parse().ok()).collect(),
+        local_port: port,
+        created: Instant::now(),
+        public_addr: Mutex::new(None),
+        srv_pings: Mutex::new(std::collections::VecDeque::new()),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1152,7 +1194,15 @@ pub fn connect(
         let mut n = 0u32;
         while !l.closed.load(Ordering::Relaxed) {
             if n % 10 == 0 {
-                l.send_server(udp::PING, &now_millis().to_le_bytes(), &mut buf);
+                let ts = now_millis();
+                l.send_server(udp::PING, &udp::ping_payload(ts), &mut buf);
+                {
+                    let mut p = l.srv_pings.lock().unwrap();
+                    p.push_back((ts, false));
+                    while p.len() > 30 {
+                        p.pop_front();
+                    }
+                }
                 let last = l.last_pong_ms.load(Ordering::Relaxed);
                 let ok = last != 0 && now_millis().saturating_sub(last) < UDP_DEAD_MS;
                 if ok != l.udp_ok.swap(ok, Ordering::Relaxed) {
@@ -1184,9 +1234,15 @@ pub fn connect(
             if from == l.server {
                 let Some((kind, data)) = opener.open(pkt) else { continue };
                 match kind {
-                    udp::PONG if data.len() == 8 => {
-                        let sent = u64::from_le_bytes(data[..8].try_into().unwrap());
+                    udp::PONG => {
+                        let Some((sent, public)) = udp::read_pong(&data) else { continue };
                         let now = now_millis();
+                        if let Some(p) = l.srv_pings.lock().unwrap().iter_mut().find(|p| p.0 == sent) {
+                            p.1 = true;
+                        }
+                        if public.is_some() {
+                            *l.public_addr.lock().unwrap() = public;
+                        }
                         l.last_pong_ms.store(now, Ordering::Relaxed);
                         let rtt = (now.saturating_sub(sent) as u32).max(1);
                         state.ping_ms.store(rtt, Ordering::Relaxed);

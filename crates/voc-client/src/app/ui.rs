@@ -1059,6 +1059,41 @@ impl App {
                         );
                     }
 
+                    ui.add_space(8.0);
+                    th::section(ui, "网络自检");
+                    match self.voice.current_link() {
+                        Some(l) => {
+                            let rep = crate::netcheck::analyze(&l.netcheck_snapshot());
+                            egui::Grid::new("netcheck").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                                for it in &rep.items {
+                                    use crate::netcheck::Level;
+                                    let (icon, color) = match it.level {
+                                        Level::Good => ("✔", th::GREEN),
+                                        Level::Warn => ("⚠", th::YELLOW),
+                                        Level::Bad => ("✖", th::RED),
+                                        Level::Pending => ("…", th::TEXT_FAINT),
+                                        Level::Info => ("•", th::TEXT_DIM),
+                                    };
+                                    ui.label(RichText::new(format!("{icon} {}", it.label)).color(color));
+                                    ui.label(RichText::new(&it.value).size(12.5));
+                                    ui.end_row();
+                                }
+                            });
+                            ui.add_space(4.0);
+                            for a in &rep.advice {
+                                ui.label(RichText::new(format!("👉 {a}")).size(12.0).color(th::TEXT_DIM));
+                            }
+                            ui.label(
+                                RichText::new("只用连接时已有的测量，不额外发包；这里显示的 IP 只有你自己看得到。")
+                                    .size(11.5)
+                                    .color(th::TEXT_FAINT),
+                            );
+                            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                        }
+                        None => {
+                            ui.label(RichText::new("登录服务器后显示").size(12.0).color(th::TEXT_DIM));
+                        }
+                    }
                     }
                     if self.settings_tab == 5 {
                     th::section(ui, "VOC");

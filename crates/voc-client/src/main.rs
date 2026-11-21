@@ -11,6 +11,7 @@ mod streams;
 mod e2e;
 mod mf;
 mod net;
+mod netcheck;
 mod portmap;
 mod theme;
 mod tray;
