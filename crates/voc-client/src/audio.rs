@@ -87,6 +87,10 @@ pub struct Settings {
     pub input_level_db: AtomicF32,
     /// 当前是否正在发送语音
     pub transmitting: AtomicBool,
+    /// 回声消除
+    pub aec: AtomicBool,
+    /// 按键说话的按键（Windows 虚拟键码）；0 = 语音激活
+    pub ptt_vk: AtomicU32,
 }
 
 impl Default for Settings {
@@ -100,6 +104,8 @@ impl Default for Settings {
             output_volume: AtomicF32::new(1.0),
             input_level_db: AtomicF32::new(-100.0),
             transmitting: AtomicBool::new(false),
+            aec: AtomicBool::new(true),
+            ptt_vk: AtomicU32::new(0),
         }
     }
 }
@@ -679,6 +685,7 @@ where
 {
     let ch = cfg.channels.max(1) as usize;
     let mut rs = PullResampler::new(SAMPLE_RATE, cfg.sample_rate);
+    let mut tap: Vec<f32> = Vec::with_capacity(crate::aec::AEC_FRAME);
     dev.build_output_stream::<T, _, _>(
         cfg,
         move |data: &mut [T], _| {
@@ -693,7 +700,17 @@ where
                 return;
             }
             for frame in data.chunks_mut(ch) {
-                let v = soft_clip(rs.next(|| m.next_sample()) * vol);
+                let v = soft_clip(
+                    rs.next(|| {
+                        let x = m.next_sample();
+                        // 回声消除的远端参考：按播放音量，10 ms 一帧
+                        tap.push(x * vol);
+                        if tap.len() == crate::aec::AEC_FRAME {
+                            crate::aec::push_render(std::mem::replace(&mut tap, Vec::with_capacity(crate::aec::AEC_FRAME)));
+                        }
+                        x
+                    }) * vol,
+                );
                 let s = T::from_sample(v);
                 for x in frame.iter_mut() {
                     *x = s;

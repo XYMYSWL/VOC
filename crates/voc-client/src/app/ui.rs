@@ -782,16 +782,56 @@ impl App {
                     }
 
                     ui.add_space(8.0);
-                    th::section(ui, "语音激活");
+                    th::section(ui, "说话方式");
+                    let mut ptt = self.cfg.ptt_vk != 0;
+                    if th::segmented(ui, &mut ptt, &[(false, "语音激活"), (true, "按键说话")]) {
+                        if ptt {
+                            self.ptt_capture = true;
+                        } else {
+                            self.cfg.ptt_vk = 0;
+                            self.ptt_capture = false;
+                            self.settings.ptt_vk.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    if self.ptt_capture {
+                        ui.label(RichText::new("请按下要用来说话的键（键盘键、鼠标中键或侧键），Esc 取消").color(th::YELLOW));
+                        ctx.request_repaint();
+                        match crate::app::capture_ptt_key() {
+                            Some(Some(vk)) => {
+                                self.cfg.ptt_vk = vk;
+                                self.settings.ptt_vk.store(vk, Ordering::Relaxed);
+                                self.ptt_capture = false;
+                            }
+                            Some(None) => self.ptt_capture = false,
+                            None => {}
+                        }
+                    } else if self.cfg.ptt_vk != 0 {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("按住「{}」说话", crate::app::vk_name(self.cfg.ptt_vk)));
+                            if ui.button("更改按键").clicked() {
+                                self.ptt_capture = true;
+                            }
+                        });
+                        ui.label(RichText::new("在游戏里也有效。松开后多发 0.2 秒，句尾不会被截断。").size(11.5).color(th::TEXT_FAINT));
+                    }
                     let level = self.settings.input_level_db.get();
                     level_meter(ui, level, self.cfg.vad_threshold_db, self.settings.transmitting.load(Ordering::Relaxed));
+                    if self.cfg.ptt_vk == 0 {
+                        if ui
+                            .add(egui::Slider::new(&mut self.cfg.vad_threshold_db, -80.0..=-10.0).suffix(" dB").text("灵敏度阈值"))
+                            .changed()
+                        {
+                            self.settings.vad_threshold_db.set(self.cfg.vad_threshold_db);
+                        }
+                        ui.label(RichText::new("说话时电平条要超过白线、不说话时低于白线；背景噪音大就把阈值调高。").size(11.5).color(th::TEXT_FAINT));
+                    }
                     if ui
-                        .add(egui::Slider::new(&mut self.cfg.vad_threshold_db, -80.0..=-10.0).suffix(" dB").text("灵敏度阈值"))
+                        .checkbox(&mut self.cfg.aec, "回声消除（不戴耳机、用扬声器外放时开）")
+                        .on_hover_text("外放时，扬声器里队友的声音会被麦克风收进去，队友会听到自己的回声。开着它可以消掉。戴耳机时开着也没关系。")
                         .changed()
                     {
-                        self.settings.vad_threshold_db.set(self.cfg.vad_threshold_db);
+                        self.settings.aec.store(self.cfg.aec, Ordering::Relaxed);
                     }
-                    ui.label(RichText::new("说话时电平条要超过白线、不说话时低于白线；背景噪音大就把阈值调高。").size(11.5).color(th::TEXT_FAINT));
                     let mut gain = self.cfg.input_gain * 100.0;
                     if ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%").text("麦克风增益")).changed() {
                         self.cfg.input_gain = gain / 100.0;

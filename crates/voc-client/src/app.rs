@@ -46,6 +46,10 @@ struct Persisted {
     relay: bool,
     /// 关闭窗口时缩到托盘（语音不断）
     close_to_tray: bool,
+    /// 回声消除（外放时用）
+    aec: bool,
+    /// 按键说话：虚拟键码，0 = 语音激活
+    ptt_vk: u32,
     /// 上次所在的语音频道（按服务器），开机自启自动登录后回到这里
     last_channel: HashMap<String, u32>,
     /// 观看屏幕共享时用显卡硬解
@@ -91,6 +95,8 @@ impl Default for Persisted {
             p2p_budget_mbps: 15,
             relay: true,
             close_to_tray: true,
+            aec: true,
+            ptt_vk: 0,
             last_channel: HashMap::new(),
             hw_decode: false,
             auto_update: true,
@@ -280,6 +286,8 @@ pub struct App {
     last_device_check: std::time::Instant,
     /// 10 ms 小缓冲老是欠载：这次运行期间改用默认缓冲
     big_audio_buffer: bool,
+    /// 正在等用户按下新的说话键
+    ptt_capture: bool,
     last_xruns: u32,
     demo: Demo,
 }
@@ -308,6 +316,8 @@ impl App {
 
         let settings = Arc::new(Settings::default());
         settings.vad_threshold_db.set(cfg.vad_threshold_db);
+        settings.aec.store(cfg.aec, Ordering::Relaxed);
+        settings.ptt_vk.store(cfg.ptt_vk, Ordering::Relaxed);
         settings.input_gain.set(cfg.input_gain);
         settings.output_volume.set(cfg.output_volume);
         let mixer = Arc::new(Mutex::new(Mixer::default()));
@@ -359,6 +369,7 @@ impl App {
             devices: audio::watch_devices(cc.egui_ctx.clone()),
             last_device_check: std::time::Instant::now(),
             big_audio_buffer: false,
+            ptt_capture: false,
             last_xruns: 0,
         };
         app.restart_audio();
@@ -1126,6 +1137,36 @@ fn os_version() -> String {
     std::env::consts::OS.to_string()
 }
 
+/// 按键说话键的显示名
+pub fn vk_name(vk: u32) -> String {
+    match vk {
+        0x04 => return "鼠标中键".into(),
+        0x05 => return "鼠标侧键 1".into(),
+        0x06 => return "鼠标侧键 2".into(),
+        _ => {}
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyNameTextW, MapVirtualKeyW, MAPVK_VK_TO_VSC};
+        let sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        let mut buf = [0u16; 64];
+        let n = GetKeyNameTextW((sc << 16) as i32, &mut buf);
+        if n > 0 {
+            return String::from_utf16_lossy(&buf[..n as usize]);
+        }
+    }
+    format!("按键 {vk:#04x}")
+}
+
+/// 等待用户按下一个键（键盘或鼠标中键 / 侧键）当作说话键。Esc 取消。左右键不算。
+pub fn capture_ptt_key() -> Option<Option<u32>> {
+    const VK_ESCAPE: u32 = 0x1B;
+    if voice::key_down(VK_ESCAPE) {
+        return Some(None);
+    }
+    (0x04u32..=0xFE).filter(|&vk| vk != VK_ESCAPE && !(0x10..=0x12).contains(&vk)).find(|&vk| voice::key_down(vk)).map(Some)
+}
+
 impl Drop for App {
     /// 关闭 VOC：聊天记录覆盖清零后释放，不留在内存里
     fn drop(&mut self) {
@@ -1142,6 +1183,14 @@ impl Drop for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ptt_key_names() {
+        assert_eq!(vk_name(0x05), "鼠标侧键 1");
+        assert_eq!(vk_name(0x06), "鼠标侧键 2");
+        assert!(!vk_name(0x41).is_empty()); // A
+        assert!(!vk_name(0x14).is_empty()); // CapsLock
+    }
 
     #[test]
     fn reconnect_backoff() {

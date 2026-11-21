@@ -26,6 +26,20 @@ use voc_proto::{now_millis, udp, ClientMsg, PeerInfo, PeerStat, RelayRoute, FRAM
 
 /// VAD 关闭前的保持帧数（20 ms × 15 = 300 ms），避免句尾被截断
 const VAD_HANGOVER: u32 = 15;
+/// 松开说话键后再多发这么多帧（20 ms × 10 = 200 ms），避免句尾被截断
+const PTT_HANGOVER: u32 = 10;
+
+/// 某个键（或鼠标键）现在是否按着。用全局按键状态查询，游戏在前台时也有效，不装键盘钩子。
+pub fn key_down(vk: u32) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        return (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0;
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 /// 超过这么久没有服务器 UDP pong 就切到 TCP
 const UDP_DEAD_MS: u64 = 4000;
 /// 直连对端多久没消息算断开
@@ -1108,6 +1122,7 @@ pub fn spawn_encoder(
             let mut down = (CAPTURE_RATE != SAMPLE_RATE).then(|| PushResampler::new(CAPTURE_RATE, SAMPLE_RATE));
             let mut acc: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES * 2);
             let mut tx = Transmitter::new(settings.clone(), state, mixer);
+            let mut ec = crate::aec::EchoCanceller::new();
             loop {
                 let mut frame = match frames.recv_timeout(Duration::from_millis(200)) {
                     Ok(f) => f,
@@ -1121,6 +1136,12 @@ pub fn spawn_encoder(
                 let gain = settings.input_gain.get();
                 for x in frame.iter_mut() {
                     *x = (*x * gain).clamp(-1.0, 1.0);
+                }
+                // 先消回声（要用原始麦克风信号），再降噪
+                if settings.aec.load(Ordering::Relaxed) {
+                    ec.process(&mut frame);
+                } else {
+                    ec.discard_render();
                 }
                 if let Some(d) = denoise.lock().unwrap().as_mut() {
                     d.process(&mut frame);
@@ -1193,8 +1214,10 @@ impl Transmitter {
         let db = 20.0 * (rms + 1e-9).log10();
         s.input_level_db.set(db);
 
-        if db >= s.vad_threshold_db.get() {
-            self.hang = VAD_HANGOVER;
+        let ptt = s.ptt_vk.load(Ordering::Relaxed);
+        let speaking = if ptt != 0 { key_down(ptt) } else { db >= s.vad_threshold_db.get() };
+        if speaking {
+            self.hang = if ptt != 0 { PTT_HANGOVER } else { VAD_HANGOVER };
         } else {
             self.hang = self.hang.saturating_sub(1);
         }
