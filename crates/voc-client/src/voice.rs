@@ -44,6 +44,18 @@ pub fn key_down(vk: u32) -> bool {
 const UDP_DEAD_MS: u64 = 4000;
 /// 直连对端多久没消息算断开
 const PEER_DEAD: Duration = Duration::from_secs(4);
+/// 直连对端这么久没消息（连丢两个 ping）就先改走服务器 / 中继，不等到判定断开
+const PEER_SUSPECT: Duration = Duration::from_millis(1200);
+/// 服务器 UDP 这么久没回 pong：语音同时也走 TCP 发一份，确认之前不断音
+const UDP_SUSPECT_MS: u64 = 1500;
+/// 直连比经服务器明显绕远时不用直连：直连往返 > 2 × 到服务器往返 + 30 ms
+const DIRECT_DETOUR_MS: u32 = 30;
+/// 屏幕画面匀速发送：按画面码率的 3 倍（至少 4 Mbps）发，最多连发 4 个包
+const PACE_FACTOR: u64 = 3;
+const PACE_MIN_BPS: u64 = 4_000_000;
+const PACE_BURST: usize = 4 * 1200;
+/// 画面包在发送队列里超过这么久就丢掉（宁可丢一帧请求关键帧，也不让延迟越积越多）
+const PACE_STALE: Duration = Duration::from_millis(250);
 /// Opus 码率
 const OPUS_BITRATE: i32 = 24_000;
 /// 端口预测：对方公网端口上下各试几个
@@ -345,6 +357,11 @@ impl Peer {
     fn usable(&self) -> bool {
         self.confirmed && self.unstable_until.is_none()
     }
+
+    /// 最近还收得到对方的包（1.2 秒内）
+    fn alive(&self, now: Instant) -> bool {
+        now.duration_since(self.last_rx) < PEER_SUSPECT
+    }
 }
 
 #[derive(Default)]
@@ -392,6 +409,8 @@ pub struct Link {
     relays: Mutex<Vec<RelayRoute>>,
     /// 上次上报链路质量的时间
     last_stats: Mutex<Instant>,
+    /// 屏幕画面的匀速发送队列（语音不走这里，直接发）
+    pace_tx: Mutex<Option<Sender<(Instant, SocketAddr, Vec<u8>)>>>,
 }
 
 impl Link {
@@ -436,6 +455,11 @@ impl Link {
         let payload = udp::client_voice(seq, frame);
         if self.udp_ok.load(Ordering::Relaxed) {
             self.send_server(udp::VOICE, &payload, buf);
+            // UDP 好像断了但还没确认：TCP 同时发一份（对方按序号去重），切换期间不断音
+            let last = self.last_pong_ms.load(Ordering::Relaxed);
+            if now_millis().saturating_sub(last) > UDP_SUSPECT_MS {
+                self.tcp_send(Outgoing::Voice(payload));
+            }
         } else {
             self.tcp_send(Outgoing::Voice(payload));
         }
@@ -559,7 +583,7 @@ impl Link {
                 if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
                     for f in frags {
                         s.seal(udp::VIDEO, &udp::server_video(self.my_id, f), buf);
-                        self.send_raw(buf, path);
+                        self.send_paced(path, buf);
                     }
                     direct += 1;
                 }
@@ -571,10 +595,22 @@ impl Link {
         let udp_ok = self.udp_ok.load(Ordering::Relaxed);
         for f in frags {
             if udp_ok {
-                self.send_server(udp::VIDEO, f, buf);
+                self.sealer.lock().unwrap().seal(udp::VIDEO, f, buf);
+                self.send_paced(self.server, buf);
             } else {
                 self.tcp_send(Outgoing::Video(f.clone()));
             }
+        }
+    }
+
+    /// 画面包交给匀速发送线程（队列没起来时直接发）
+    fn send_paced(&self, to: SocketAddr, pkt: &[u8]) {
+        let tx = self.pace_tx.lock().unwrap().clone();
+        match tx {
+            Some(tx) => {
+                let _ = tx.send((Instant::now(), to, pkt.to_vec()));
+            }
+            None => self.send_raw(pkt, to),
         }
     }
 
@@ -731,10 +767,19 @@ impl Link {
             }
         }
         // 按上行预算分配：已打通的候选按延迟从低到高
+        let srv = self.server_rtt.load(Ordering::Relaxed);
         let by_rtt = |ids: &[u32]| {
             let mut v: Vec<(u32, u32)> = ids
                 .iter()
-                .filter_map(|id| peers.map.get(id).filter(|p| p.usable()).map(|p| (p.rtt_ms, *id)))
+                .filter_map(|id| {
+                    peers
+                        .map
+                        .get(id)
+                        .filter(|p| p.usable() && p.alive(now))
+                        // 直连明显比经服务器绕远：不用（对方到服务器的延迟按和我差不多估）
+                        .filter(|p| srv == 0 || p.rtt_ms <= 2 * srv + DIRECT_DETOUR_MS)
+                        .map(|p| (p.rtt_ms, *id))
+                })
                 .collect();
             v.sort();
             v.into_iter().map(|(_, id)| id).collect::<Vec<u32>>()
@@ -761,7 +806,7 @@ impl Link {
             let mut stats: Vec<PeerStat> = peers
                 .map
                 .iter()
-                .filter(|(id, p)| others.contains(id) && p.usable() && evaluate_pings(&p.pings, now).is_some())
+                .filter(|(id, p)| others.contains(id) && p.usable() && p.alive(now) && evaluate_pings(&p.pings, now).is_some())
                 .map(|(id, p)| PeerStat { id: *id, rtt: p.quality.rtt_ms.max(1), loss: p.quality.loss_pct, jitter: p.quality.jitter_ms })
                 .collect();
             stats.sort_by_key(|p| p.id);
@@ -987,7 +1032,9 @@ pub fn connect(
         relay_enabled: AtomicBool::new(true),
         relays: Mutex::new(Vec::new()),
         last_stats: Mutex::new(Instant::now()),
+        pace_tx: Mutex::new(None),
     });
+    spawn_pacer(link.clone());
     state.disconnect();
     *state.link.lock().unwrap() = Some(link.clone());
     *state.e2e.lock().unwrap() = Some(e2e);
@@ -1058,6 +1105,35 @@ pub fn connect(
         }
     })?;
     Ok(())
+}
+
+/// 屏幕画面匀速发送：令牌桶限速，过期的包丢掉。语音不经过这里，永远先发。
+fn spawn_pacer(link: Arc<Link>) {
+    let (tx, rx) = std::sync::mpsc::channel::<(Instant, SocketAddr, Vec<u8>)>();
+    *link.pace_tx.lock().unwrap() = Some(tx);
+    let _ = std::thread::Builder::new().name("video-pacer".into()).spawn(move || {
+        let mut tokens = PACE_BURST as f64;
+        let mut last = Instant::now();
+        while !link.closed.load(Ordering::Relaxed) {
+            let Ok((queued, to, pkt)) = rx.recv_timeout(Duration::from_millis(200)) else { continue };
+            if queued.elapsed() > PACE_STALE {
+                continue;
+            }
+            let rate = (link.video_bps.load(Ordering::Relaxed) as u64 * PACE_FACTOR).max(PACE_MIN_BPS) as f64 / 8.0;
+            let now = Instant::now();
+            tokens = (tokens + now.duration_since(last).as_secs_f64() * rate).min(PACE_BURST as f64);
+            last = now;
+            if tokens < pkt.len() as f64 {
+                let wait = (pkt.len() as f64 - tokens) / rate;
+                std::thread::sleep(Duration::from_secs_f64(wait));
+                let now = Instant::now();
+                tokens += now.duration_since(last).as_secs_f64() * rate;
+                last = now;
+            }
+            tokens -= pkt.len() as f64;
+            link.send_raw(&pkt, to);
+        }
+    });
 }
 
 /// 请求家用路由器做 UDP 端口映射（UPnP IGD），成功后把映射出的公网地址加入 P2P 候选。
@@ -1572,6 +1648,81 @@ mod tests {
         sa.disconnect();
         sr.disconnect();
         sb.disconnect();
+    }
+
+    fn test_keys() -> SessionKeys {
+        SessionKeys { tcp_c2s: [1; 32], tcp_s2c: [2; 32], udp_c2s: [3; 32], udp_s2c: [4; 32], udp_c2s_hp: [5; 32], udp_s2c_hp: [6; 32] }
+    }
+
+    /// 直连对端突然没响应：1.2 秒左右就不再直连发给他（改走服务器），不等 4 秒判定断开
+    #[test]
+    fn silent_peer_fails_over_quickly() {
+        use std::sync::mpsc;
+        let keys = test_keys();
+        let (ea, eb) = e2e_pair(3, 7);
+        let dummy_server: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mk = |id: u32, e2e: Arc<Mutex<E2e>>| {
+            let (tx, rx) = mpsc::channel::<Outgoing>();
+            let st = Arc::new(VoiceState::default());
+            let mx = Arc::new(Mutex::new(Mixer::default()));
+            connect(dummy_server, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            (st.current_link().unwrap(), st, rx)
+        };
+        let (la, sa, _rxa) = mk(3, ea);
+        let (lb, sb, _rxb) = mk(7, eb);
+        let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
+        la.set_others(vec![7]);
+        lb.set_others(vec![3]);
+        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
+        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }]);
+        let t = Instant::now();
+        while !la.allocation().0.contains(&7) {
+            assert!(t.elapsed() < Duration::from_secs(5), "never went direct");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // B 掉线（不再回 ping）
+        sb.disconnect();
+        let t = Instant::now();
+        while la.allocation().0.contains(&7) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let took = t.elapsed();
+        println!("{took:?} 后不再直连");
+        assert!(took < Duration::from_millis(1800), "failover took {took:?}");
+        sa.disconnect();
+    }
+
+    /// 屏幕画面匀速发出：一个大关键帧（100 个包）不会一下子全涌出去
+    #[test]
+    fn video_is_paced() {
+        use std::sync::mpsc;
+        let keys = test_keys();
+        let (ea, _) = e2e_pair(3, 7);
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (tx, _rx) = mpsc::channel::<Outgoing>();
+        let st = Arc::new(VoiceState::default());
+        connect(sink.local_addr().unwrap(), &keys, 3, false, ea, tx, st.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
+        let l = st.current_link().unwrap();
+        l.udp_ok.store(true, Ordering::Relaxed);
+        l.set_watchers(vec![7]);
+        let frags: Vec<Vec<u8>> = (0..100).map(|_| vec![0u8; 1150]).collect();
+        let mut buf = Vec::new();
+        let t = Instant::now();
+        l.send_video(&frags, &mut buf);
+        let mut got = 0;
+        let mut b = [0u8; 2048];
+        while got < 100 {
+            let (n, _) = sink.recv_from(&mut b).expect("video packet");
+            if n > 1000 {
+                got += 1;
+            }
+        }
+        let took = t.elapsed();
+        println!("100 个画面包用了 {took:?}");
+        // 4 Mbps 下约 120 KB 要 ~230 ms；至少要明显摊开
+        assert!(took > Duration::from_millis(150), "not paced: {took:?}");
+        st.disconnect();
     }
 
     /// 真实屏幕采集 → 720p H.264 → 端到端加密 → 两个真实 Link P2P 直连 → 解码。
