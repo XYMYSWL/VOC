@@ -97,6 +97,9 @@ pub enum ClientMsg {
         on: bool,
         #[serde(default)]
         low: bool,
+        /// 观看者选的画面线路：0 自动，1 P2P 直连（打得通就直连，不看上行预算），2 走服务器
+        #[serde(default)]
+        route: u8,
     },
     /// 观看者丢包后请求共享者发关键帧
     KeyframeRequest {
@@ -196,6 +199,12 @@ pub enum ServerMsg {
         ids: Vec<u32>,
         #[serde(default)]
         low: Vec<u32>,
+        /// 其中选了 P2P 直连的人
+        #[serde(default)]
+        direct: Vec<u32>,
+        /// 其中选了走服务器的人
+        #[serde(default)]
+        server: Vec<u32>,
     },
     /// 发给共享者：某观看者请求关键帧
     KeyframeRequest {

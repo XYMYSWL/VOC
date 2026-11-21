@@ -433,6 +433,9 @@ pub struct App {
     image_view: Option<egui::TextureHandle>,
     /// 测试模式：VOC_TEST_SEND_IMAGE 的图片已经发过
     test_image_sent: bool,
+    /// 测试模式：VOC_TEST_SHARE 已经开始过共享；VOC_TEST_LOG 上次写日志的时间
+    test_share_started: bool,
+    test_log_at: std::time::Instant,
     /// 正在放的伴奏
     music: Option<MusicPlaying>,
     /// 伴奏窗口
@@ -457,6 +460,8 @@ struct Viewer {
     size: (usize, usize),
     /// 看低画质层（流畅 360P）
     low: bool,
+    /// 画面线路：0 自动，1 P2P 直连，2 走服务器
+    route: u8,
 }
 
 impl App {
@@ -535,6 +540,8 @@ impl App {
             image_jobs: mpsc::channel(),
             image_view: None,
             test_image_sent: false,
+            test_share_started: false,
+            test_log_at: std::time::Instant::now(),
             music: None,
             music_window: false,
             music_apps: Vec::new(),
@@ -573,6 +580,10 @@ impl App {
             app.cfg.name = parts.get(1).unwrap_or(&"tester").to_string();
             app.code_input = parts.get(2).unwrap_or(&"").to_string();
             app.cfg.pins.clear();
+            // VOC_TEST_NO_P2P：关掉 P2P，测经服务器中转
+            if std::env::var_os("VOC_TEST_NO_P2P").is_some() {
+                app.cfg.p2p = false;
+            }
             app.start_connect(&cc.egui_ctx);
             app.rejoin = parts.get(3).and_then(|c| c.parse().ok());
         } else if app.cfg.auto_update {
@@ -639,7 +650,7 @@ impl App {
                 &code,
                 move || notify_ctx.request_repaint(),
                 move |kind, payload| match kind {
-                    voc_proto::crypto::KIND_VIDEO => voice::on_server_video(payload, &voice),
+                    voc_proto::crypto::KIND_VIDEO => voice::on_server_video(payload, &voice, false),
                     _ => voice::on_server_voice(payload, &voice, &mixer, &mut pcm),
                 },
             );
@@ -710,6 +721,80 @@ impl App {
                 muted: self.settings.muted.load(Ordering::Relaxed),
                 deafened: self.settings.deafened.load(Ordering::Relaxed),
             });
+        }
+    }
+
+    /// 测试模式（配合 VOC_AUTOLOGIN）：
+    /// VOC_TEST_SHARE=720 / 1080 进频道后自动共享屏幕；VOC_TEST_WATCH=main / low 自动看第一个在共享的人；
+    /// VOC_TEST_LOG=文件 每秒追加一行共享 / 观看状态
+    fn test_share_and_watch(&mut self) {
+        let Screen::Main(s) = &mut self.screen else { return };
+        if s.me().and_then(|u| u.channel_id).is_none() {
+            return;
+        }
+        if let (Ok(h), false) = (std::env::var("VOC_TEST_SHARE"), self.test_share_started) {
+            self.test_share_started = true;
+            let mut cfg = self.cfg.share.clone();
+            cfg.height = h.parse().unwrap_or(720);
+            match Sharer::start(cfg.clone(), self.voice.clone()) {
+                Ok(sh) => {
+                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true });
+                    self.sharer = Some(sh);
+                }
+                Err(e) => eprintln!("VOC_TEST_SHARE 失败：{e}"),
+            }
+        }
+        if let (Ok(mode), true) = (std::env::var("VOC_TEST_WATCH"), self.views.is_empty()) {
+            if let Some(id) = s.users.iter().find(|u| u.id != s.user_id && u.sharing.is_some()).map(|u| u.id) {
+                let low = mode == "low";
+                let route = match std::env::var("VOC_TEST_VIDEO_ROUTE").as_deref() {
+                    Ok("p2p") => 1,
+                    Ok("server") => 2,
+                    _ => 0,
+                };
+                s.send(ClientMsg::Watch { target: id, on: true, low, route });
+                if let Some(view) = self.voice.video.watch(id, true) {
+                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route });
+                }
+            }
+        }
+        let Ok(path) = std::env::var("VOC_TEST_LOG") else { return };
+        if self.test_log_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.test_log_at = std::time::Instant::now();
+        let mut line = format!("{} ", voc_proto::now_millis());
+        if let Some(l) = self.voice.current_link() {
+            let (v, d) = l.allocation();
+            line += &format!("udp {:?} 语音直连 {v:?} 画面直连 {d:?} 观看者 {} ", self.voice.transport_udp(), l.watcher_count());
+        }
+        if let Some(sh) = &self.sharer {
+            let st = &sh.stats;
+            line += &format!(
+                "| 共享 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
+                st.capture_fps.load(Ordering::Relaxed),
+                st.fps.load(Ordering::Relaxed),
+                st.kbps.load(Ordering::Relaxed),
+                st.width.load(Ordering::Relaxed),
+                st.height.load(Ordering::Relaxed),
+                st.encoder.lock().unwrap(),
+                st.pipeline.lock().unwrap(),
+                st.error.lock().unwrap()
+            );
+        }
+        for (id, v) in &self.views {
+            let f = v.view.frame.lock().unwrap();
+            let (w, h, seq) = f.as_ref().map(|f| (f.width, f.height, f.seq)).unwrap_or((0, 0, 0));
+            line += &format!(
+                "| 看 #{id} {w}x{h} 已解 {seq} 帧 {} fps 解码器 {:?} 线路 {:?} ",
+                v.view.fps.load(Ordering::Relaxed),
+                v.view.decoder.lock().unwrap(),
+                self.voice.video_direct(*id).map(|d| if d { "直连" } else { "服务器" })
+            );
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
         }
     }
 
@@ -922,6 +1007,9 @@ impl App {
                     queue_image(&self.image_jobs.0, ctx, move || crate::images::prepare_file(&p));
                 }
             }
+        }
+        if self.test_mode {
+            self.test_share_and_watch();
         }
         // 屏幕共享的声音：共享时开，停了就关（录除了 VOC 自己以外的全部声音）
         let want_share_audio = self.sharer.is_some() && self.cfg.share_audio && crate::loopback::supported();
@@ -1379,9 +1467,10 @@ impl App {
                     }
                     ServerMsg::System { text } => s.chat.push(ChatLine::System(text)),
                     ServerMsg::Pong => {}
-                    ServerMsg::Watchers { ids, low } => {
+                    ServerMsg::Watchers { ids, low, direct, server } => {
                         if let Some(l) = self.voice.current_link() {
                             l.set_watchers(ids, low);
+                            l.set_watcher_routes(direct, server);
                         }
                     }
                     ServerMsg::KeyframeRequest { .. } => {
@@ -1612,7 +1701,7 @@ impl App {
                 }
             }
             *view.frame.lock().unwrap() = Some(video::DecodedFrame { width: w, height: h, rgba, seq: 1 });
-            self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0), low: false });
+            self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0), low: false, route: 0 });
             if kind == "fullscreen" {
                 self.fullscreen = Some(2); // 演示只画全屏界面，不真的切换窗口全屏
             }

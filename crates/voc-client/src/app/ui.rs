@@ -619,6 +619,18 @@ impl App {
                                             m.set_volume(u.id, v / 100.0);
                                         }
                                     }
+                                    if u.sharing.is_some() && u.share_audio {
+                                        let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, u.id);
+                                        let mut m = self.mixer.lock().unwrap();
+                                        let mut v = m.volume(sid) * 100.0;
+                                        if ui
+                                            .add(egui::Slider::new(&mut v, 0.0..=200.0).suffix("%").fixed_decimals(0).text("共享声音音量"))
+                                            .on_hover_text("看他的屏幕共享时听到的游戏、视频声音，和他说话的音量分开调")
+                                            .changed()
+                                        {
+                                            m.set_volume(sid, v / 100.0);
+                                        }
+                                    }
                                     if u.music.is_some() {
                                         let mid = crate::audio::stream_mixer_id(voc_proto::udp::MUSIC, u.id);
                                         let mut m = self.mixer.lock().unwrap();
@@ -949,10 +961,10 @@ impl App {
         if let Some((id, on)) = watch_toggle {
             // 低带宽模式下默认看低画质层
             let low = on && self.cfg.low_bandwidth;
-            s.send(ClientMsg::Watch { target: id, on, low });
+            s.send(ClientMsg::Watch { target: id, on, low, route: 0 });
             if on {
                 if let Some(view) = self.voice.video.watch(id, true) {
-                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low });
+                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route: 0 });
                 }
             } else {
                 self.views.remove(&id);
@@ -1571,7 +1583,9 @@ impl App {
     fn ui_viewers(&mut self, ctx: &egui::Context) {
         let Screen::Main(s) = &mut self.screen else { return };
         let mut close = Vec::new();
-        let mut relayer: Vec<(u32, bool)> = Vec::new();
+        // 观看中改了画质或线路：重新告诉服务器
+        let mut relayer: Vec<(u32, bool, u8)> = Vec::new();
+        let voice = self.voice.clone();
         let mut go_full: Option<u32> = None;
         let mut exit_full = false;
         let mixer = self.mixer.clone();
@@ -1658,16 +1672,56 @@ impl App {
                             ui.selectable_value(&mut v.low, false, "原画").on_hover_text(format!("按共享者设置的 {desc} 观看"));
                             ui.selectable_value(&mut v.low, true, "流畅").on_hover_text("360P 低画质，省流量、网络差时更不容易卡");
                             if v.low != before {
-                                relayer.push((*id, v.low));
+                                relayer.push((*id, v.low, v.route));
                             }
                         }
-                        if user.is_some_and(|u| u.share_audio) {
+                        {
+                            let before = v.route;
+                            ui.separator();
+                            ui.selectable_value(&mut v.route, 0, "自动").on_hover_text("能直连就直连，否则经服务器（推荐）");
+                            ui.selectable_value(&mut v.route, 1, "P2P").on_hover_text(
+                                "画面直接从共享者发给你，不受对方上行预算限制；和对方打不通时仍经服务器。\n双方都要 0.4.2 以上，服务器也要升级",
+                            );
+                            ui.selectable_value(&mut v.route, 2, "服务器")
+                                .on_hover_text("画面经服务器转给你。直连卡顿、花屏或一直等待画面时试试\n双方都要 0.4.2 以上，服务器也要升级");
+                            if v.route != before {
+                                relayer.push((*id, v.low, v.route));
+                            }
+                            match voice.video_direct(*id) {
+                                Some(true) => th::pill(ui, "⇄ 直连中", th::GREEN, th::GREEN_SOFT),
+                                Some(false) => th::pill(ui, "经服务器", th::TEXT_DIM, th::BG_ELEVATED),
+                                None => th::pill(ui, "没收到画面", th::YELLOW, th::BG_ELEVATED),
+                            }
+                            .on_hover_text("现在画面实际走的线路（最近 2 秒）");
+                        }
+                        // 共享声音的音量：只影响你自己听到的大小，和他说话的音量分开调
+                        {
+                            ui.separator();
+                            let has_audio = user.is_some_and(|u| u.share_audio);
                             let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
                             let mut m = mixer.lock().unwrap();
                             let mut vol = m.volume(sid) * 100.0;
-                            if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").text("🔊")).on_hover_text("共享的声音音量").changed() {
-                                m.set_volume(sid, vol / 100.0);
-                            }
+                            ui.add_enabled_ui(has_audio, |ui| {
+                                let icon = if vol < 0.5 { "🔇" } else { "🔊" };
+                                if ui
+                                    .button(icon)
+                                    .on_hover_text("静音 / 恢复共享声音")
+                                    .on_disabled_hover_text("对方没有勾选「同时共享电脑声音」")
+                                    .clicked()
+                                {
+                                    vol = if vol < 0.5 { 100.0 } else { 0.0 };
+                                    m.set_volume(sid, vol / 100.0);
+                                }
+                                ui.label(RichText::new("共享声音").size(12.0).color(th::TEXT_DIM));
+                                if ui
+                                    .add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").fixed_decimals(0))
+                                    .on_hover_text("只调你听到的共享声音大小（游戏、视频的声音），不影响他说话的音量；右键他的名字也能调")
+                                    .on_disabled_hover_text("对方没有勾选「同时共享电脑声音」")
+                                    .changed()
+                                {
+                                    m.set_volume(sid, vol / 100.0);
+                                }
+                            });
                         }
                         if ui.button("全屏").on_hover_text("全屏观看（双击画面也可以；Esc 退出）").clicked() {
                             go_full = Some(*id);
@@ -1696,13 +1750,13 @@ impl App {
                 close.push(*id);
             }
         }
-        for (id, low) in relayer {
-            s.send(ClientMsg::Watch { target: id, on: true, low });
+        for (id, low, route) in relayer {
+            s.send(ClientMsg::Watch { target: id, on: true, low, route });
         }
         for id in close {
             self.views.remove(&id);
             self.voice.video.watch(id, false);
-            s.send(ClientMsg::Watch { target: id, on: false, low: false });
+            s.send(ClientMsg::Watch { target: id, on: false, low: false, route: 0 });
         }
         if let Some(id) = go_full {
             self.fullscreen = Some(id);

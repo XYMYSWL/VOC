@@ -62,10 +62,12 @@ struct User {
     watching: HashSet<u32>,
     /// 其中要低画质层的
     watch_low: HashSet<u32>,
+    /// 观看时选的画面线路：共享者 → 1 P2P / 2 服务器（自动的不记）
+    watch_route: HashMap<u32, u8>,
     /// 我的屏幕共享有低画质层
     simulcast: bool,
-    /// 上次发给我的观看者名单（我是共享者时）：全部、要低画质的
-    last_watchers: (Vec<u32>, Vec<u32>),
+    /// 上次发给我的观看者名单（我是共享者时）：全部、要低画质的、选了 P2P 的、选了走服务器的
+    last_watchers: (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>),
     /// 能解码的视频格式
     decoders: Vec<String>,
     /// 正在放伴奏的程序名
@@ -206,23 +208,32 @@ impl State {
 
     /// 告诉每个共享者现在有谁在看（有变化才发）
     fn push_watchers(&mut self) {
-        let pairs: Vec<(u32, Option<u32>, HashSet<u32>, HashSet<u32>)> =
-            self.users.iter().map(|(id, u)| (*id, u.channel, u.watching.clone(), u.watch_low.clone())).collect();
+        type Pair = (u32, Option<u32>, HashSet<u32>, HashSet<u32>, HashMap<u32, u8>);
+        let pairs: Vec<Pair> = self
+            .users
+            .iter()
+            .map(|(id, u)| (*id, u.channel, u.watching.clone(), u.watch_low.clone(), u.watch_route.clone()))
+            .collect();
         for (id, u) in self.users.iter_mut() {
-            let mut w: Vec<(u32, bool)> = match (&u.sharing, u.channel) {
+            // (观看者, 要低画质, 线路)
+            let mut w: Vec<(u32, bool, u8)> = match (&u.sharing, u.channel) {
                 (Some(_), Some(ch)) => pairs
                     .iter()
-                    .filter(|(wid, wch, set, _)| wid != id && *wch == Some(ch) && set.contains(id))
-                    .map(|(wid, _, _, low)| (*wid, u.simulcast && low.contains(id)))
+                    .filter(|(wid, wch, set, _, _)| wid != id && *wch == Some(ch) && set.contains(id))
+                    .map(|(wid, _, _, low, route)| (*wid, u.simulcast && low.contains(id), route.get(id).copied().unwrap_or(0)))
                     .collect(),
                 _ => Vec::new(),
             };
             w.sort();
             let ids: Vec<u32> = w.iter().map(|x| x.0).collect();
             let low: Vec<u32> = w.iter().filter(|x| x.1).map(|x| x.0).collect();
-            if (&ids, &low) != (&u.last_watchers.0, &u.last_watchers.1) {
-                u.last_watchers = (ids.clone(), low.clone());
-                u.send(ServerMsg::Watchers { ids, low });
+            let direct: Vec<u32> = w.iter().filter(|x| x.2 == 1).map(|x| x.0).collect();
+            let server: Vec<u32> = w.iter().filter(|x| x.2 == 2).map(|x| x.0).collect();
+            let now = (ids, low, direct, server);
+            if now != u.last_watchers {
+                u.last_watchers = now.clone();
+                let (ids, low, direct, server) = now;
+                u.send(ServerMsg::Watchers { ids, low, direct, server });
             }
         }
     }
@@ -771,8 +782,9 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 sharing: None,
                 watching: HashSet::new(),
                 watch_low: HashSet::new(),
+                watch_route: HashMap::new(),
                 simulcast: false,
-                last_watchers: (Vec::new(), Vec::new()),
+                last_watchers: Default::default(),
                 decoders: Vec::new(),
                 music: None,
                 share_audio: false,
@@ -1053,7 +1065,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::Watch { target, on, low } => {
+        ClientMsg::Watch { target, on, low, route } => {
             let ok = match (st.users.get(&uid), st.users.get(&target)) {
                 (Some(me), Some(t)) => t.sharing.is_some() && me.channel.is_some() && me.channel == t.channel,
                 _ => false,
@@ -1066,9 +1078,15 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                     } else {
                         u.watch_low.remove(&target);
                     }
+                    if matches!(route, 1 | 2) {
+                        u.watch_route.insert(target, route);
+                    } else {
+                        u.watch_route.remove(&target);
+                    }
                 } else {
                     u.watching.remove(&target);
                     u.watch_low.remove(&target);
+                    u.watch_route.remove(&target);
                 }
             }
         }

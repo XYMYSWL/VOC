@@ -423,6 +423,8 @@ pub struct Link {
     watchers_ver: AtomicU32,
     /// 其中要低画质层的人
     watchers_low: Mutex<Vec<u32>>,
+    /// 观看者自己选的画面线路：(选了 P2P 直连的, 选了走服务器的)
+    watcher_routes: Mutex<(Vec<u32>, Vec<u32>)>,
     /// P2P 上行带宽预算（bps）
     budget_bps: AtomicU32,
     /// 正在共享的屏幕码率（bps），没在共享为 0
@@ -628,10 +630,17 @@ impl Link {
         *wl = low;
     }
 
+    /// 服务器转告：观看者自己选的画面线路
+    pub fn set_watcher_routes(&self, direct: Vec<u32>, server: Vec<u32>) {
+        *self.watcher_routes.lock().unwrap() = (direct, server);
+    }
+
     /// 某一层的观看者：low = 低画质层，否则原画
     pub fn layer_watchers(&self, low: bool) -> Vec<u32> {
+        // 和 set_watchers 同样的加锁顺序（先 watchers 后 watchers_low），避免互相等死
+        let w = self.watchers.lock().unwrap();
         let wl = self.watchers_low.lock().unwrap();
-        self.watchers.lock().unwrap().iter().copied().filter(|i| wl.contains(i) == low).collect()
+        w.iter().copied().filter(|i| wl.contains(i) == low).collect()
     }
 
     pub fn watchers_version(&self) -> u32 {
@@ -964,7 +973,15 @@ impl Link {
         };
         let watchers: Vec<u32> = self.watchers.lock().unwrap().iter().copied().filter(|w| others.contains(w)).collect();
         let auto_others: Vec<u32> = others.iter().copied().filter(|i| !forced.contains(i)).collect();
-        let auto_watchers: Vec<u32> = watchers.iter().copied().filter(|i| !forced.contains(i)).collect();
+        // 画面：观看者自己选的线路优先，其次是我对这个人手动选的线路
+        let (vd, vs) = self.watcher_routes.lock().unwrap().clone();
+        let forced_video: Vec<u32> = watchers
+            .iter()
+            .copied()
+            .filter(|i| !vs.contains(i))
+            .filter(|i| forced.contains(i) || (vd.contains(i) && peers.map.get(i).is_some_and(|p| p.confirmed && p.alive(now))))
+            .collect();
+        let auto_watchers: Vec<u32> = watchers.iter().copied().filter(|i| !forced_video.contains(i) && !vs.contains(i)).collect();
         let (mut voice, mut video) = if active {
             let (mut v, mut d) = allocate_direct(
                 self.budget_bps.load(Ordering::Relaxed),
@@ -975,7 +992,7 @@ impl Link {
                 auto_watchers.len(),
             );
             v.extend(forced.iter().copied());
-            d.extend(forced.iter().copied().filter(|i| watchers.contains(i)));
+            d.extend(forced_video.iter().copied());
             (v, d)
         } else {
             (Vec::new(), Vec::new())
@@ -1090,12 +1107,19 @@ pub struct VoiceState {
     pub caps: Mutex<HashMap<u32, Vec<String>>>,
     /// 伴奏 / 屏幕共享声音的解码器：(发送者, 流)
     stream_decoders: Mutex<HashMap<(u32, u8), UserDecoder>>,
+    /// 最近收到某人画面的线路：(是不是 P2P 直连, 时间)
+    video_path: Mutex<HashMap<u32, (bool, Instant)>>,
 }
 
 impl VoiceState {
     /// 最近这段时间里收到过他的语音
     pub fn heard_within(&self, user: u32, d: Duration) -> bool {
         self.last_heard.lock().unwrap().get(&user).is_some_and(|t| t.elapsed() < d)
+    }
+
+    /// 最近 2 秒收到他的画面走的线路：Some(true) 直连，Some(false) 经服务器
+    pub fn video_direct(&self, from: u32) -> Option<bool> {
+        self.video_path.lock().unwrap().get(&from).filter(|(_, t)| t.elapsed() < Duration::from_secs(2)).map(|(d, _)| *d)
     }
 
     pub fn is_speaking(&self, user: u32) -> bool {
@@ -1171,7 +1195,11 @@ pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mut
 }
 
 /// 处理一个视频分片（服务器中转 / P2P 直连 / TCP 隧道共用）；需要时向共享者请求关键帧
-pub fn on_server_video(payload: &[u8], state: &VoiceState) {
+/// direct = 这个包是 P2P 直连收到的（否则经服务器 UDP / TCP 隧道）
+pub fn on_server_video(payload: &[u8], state: &VoiceState, direct: bool) {
+    if let Some((from, _, _)) = udp::read_server_video(payload) {
+        state.video_path.lock().unwrap().insert(from, (direct, Instant::now()));
+    }
     let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
     let req = state.video.on_packet(payload, |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
     if let (Some(from), Some(l)) = (req, state.current_link()) {
@@ -1266,6 +1294,7 @@ pub fn connect(
         watchers: Mutex::new(Vec::new()),
         watchers_ver: AtomicU32::new(0),
         watchers_low: Mutex::new(Vec::new()),
+        watcher_routes: Mutex::new((Vec::new(), Vec::new())),
         budget_bps: AtomicU32::new(DEFAULT_BUDGET_BPS),
         video_bps: AtomicU32::new(0),
         alloc: Mutex::new((Vec::new(), Vec::new())),
@@ -1369,13 +1398,13 @@ pub fn connect(
                         l.server_rtt.store(rtt, Ordering::Relaxed);
                     }
                     udp::VOICE => on_server_voice(&data, &state, &mixer, &mut pcm),
-                    udp::VIDEO => on_server_video(&data, &state),
+                    udp::VIDEO => on_server_video(&data, &state, false),
                     udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &data, &state, &mixer, &mut pcm),
                     _ => {}
                 }
             } else if let Some((peer, kind, v)) = l.on_peer_packet(from, pkt, &mut out) {
                 match kind {
-                    udp::VIDEO => on_server_video(&v, &state),
+                    udp::VIDEO => on_server_video(&v, &state, true),
                     udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &v, &state, &mixer, &mut pcm),
                     _ => {
                         l.relay_forward(peer, &v, &mut out);

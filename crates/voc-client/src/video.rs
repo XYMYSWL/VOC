@@ -672,10 +672,21 @@ fn encode_loop(
     let mut last_watchers = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let Ok(frame) = rx.recv_timeout(Duration::from_millis(300)) else { continue };
-        let Some(link) = state.current_link() else { continue };
+        // 不处理的显卡画面一定要把共享纹理还给采集端，否则采集端再也拿不到它，之后的画面全被丢掉
+        //（以前「先开共享、过一会儿才有人看」时画面永远是「正在等待画面」就是这个原因）
+        let skip = |enc: &mut VideoEncoder, frame: &CapFrame| {
+            if let CapFrame::Gpu(g) = frame {
+                enc.give_back(g);
+            }
+        };
+        let Some(link) = state.current_link() else {
+            skip(&mut enc, &frame);
+            continue;
+        };
         let ver = link.watchers_version();
         if !link.has_watchers() {
             last_watchers = ver;
+            skip(&mut enc, &frame);
             continue; // 没人看就不编码，省 CPU 和流量
         }
         if ver != last_watchers {
