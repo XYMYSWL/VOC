@@ -120,6 +120,14 @@ enum ChatLine {
     Image(Box<ImageLine>),
 }
 
+/// 和某个人的私聊（只在内存里；关闭标签或关掉 VOC 时清除）
+struct DmThread {
+    /// 对方昵称（重连后 id 会变，按昵称找人）
+    peer: String,
+    lines: Vec<ChatLine>,
+    unread: u32,
+}
+
 /// 聊天里的一张图片（只在内存里）
 struct ImageLine {
     from: String,
@@ -149,13 +157,14 @@ pub(crate) fn queue_image(
 }
 
 /// 把图片接收进度 / 结果写到对应的聊天行上
-fn apply_image_events(chat: &mut [ChatLine], events: Vec<crate::images::ImageEvent>, ctx: &egui::Context) {
+fn apply_image_events(s: &mut Session, events: Vec<crate::images::ImageEvent>, ctx: &egui::Context) {
     use crate::images::ImageEvent as E;
     for ev in events {
         let key = match &ev {
             E::Progress { key, .. } | E::Ready { key, .. } | E::Failed { key, .. } => *key,
         };
-        let Some(line) = chat.iter_mut().rev().find_map(|l| match l {
+        let mut lines = s.chat.iter_mut().rev().chain(s.dms.iter_mut().flat_map(|t| t.lines.iter_mut().rev()));
+        let Some(line) = lines.find_map(|l| match l {
             ChatLine::Image(i) if i.key == key => Some(i),
             _ => None,
         }) else {
@@ -186,11 +195,17 @@ struct Session {
     channels: Vec<ChannelInfo>,
     users: Vec<UserInfo>,
     chat: Vec<ChatLine>,
+    /// 私聊（按对方昵称）
+    dms: Vec<DmThread>,
+    /// 正在看的私聊；None = 频道聊天
+    chat_tab: Option<String>,
     chat_input: String,
     new_channel: String,
     /// 用于记住身份的服务器标识（登录时填的地址）
     server_key: String,
     e2e: Option<Arc<Mutex<E2e>>>,
+    /// 服务器支持的新功能（Welcome 里带来）
+    features: Vec<String>,
 }
 
 impl Session {
@@ -202,6 +217,40 @@ impl Session {
 
     fn me(&self) -> Option<&UserInfo> {
         self.users.iter().find(|u| u.id == self.user_id)
+    }
+
+    fn id_by_name(&self, name: &str) -> Option<u32> {
+        self.users.iter().find(|u| u.name == name && u.id != self.user_id).map(|u| u.id)
+    }
+
+    /// 和某人的私聊（没有就新建）
+    fn dm(&mut self, peer: &str) -> &mut DmThread {
+        let i = match self.dms.iter().position(|t| t.peer == peer) {
+            Some(i) => i,
+            None => {
+                self.dms.push(DmThread { peer: peer.to_string(), lines: Vec::new(), unread: 0 });
+                self.dms.len() - 1
+            }
+        };
+        &mut self.dms[i]
+    }
+
+    /// 收到私聊：没在看这段对话就记一条未读
+    fn push_dm(&mut self, peer: &str, line: ChatLine) {
+        let viewing = self.chat_tab.as_deref() == Some(peer);
+        let t = self.dm(peer);
+        t.lines.push(line);
+        if !viewing {
+            t.unread += 1;
+        }
+    }
+
+    /// 频道聊天（None）或某段私聊的消息列表
+    fn lines_for(&mut self, peer: Option<&str>) -> &mut Vec<ChatLine> {
+        match peer {
+            Some(p) => &mut self.dm(p).lines,
+            None => &mut self.chat,
+        }
     }
 
     fn name_of(&self, id: u32) -> String {
@@ -298,6 +347,12 @@ fn wipe_string(s: &mut String) {
     s.clear();
 }
 
+/// 清除私聊（关闭私聊标签、关掉 VOC 时）
+fn wipe_dm(t: &mut DmThread) {
+    wipe_string(&mut t.peer);
+    wipe_chat(&mut t.lines);
+}
+
 fn wipe_chat(lines: &mut Vec<ChatLine>) {
     let wipe = wipe_string;
     for l in lines.iter_mut() {
@@ -349,7 +404,7 @@ pub struct App {
     /// 上次点「复制诊断信息」的时间（显示「已复制」）
     diag_copied: Option<std::time::Instant>,
     /// 断开后保留的聊天（按服务器），只在内存里，关闭 VOC 时清空
-    chat_store: HashMap<String, Vec<ChatLine>>,
+    chat_store: HashMap<String, (Vec<ChatLine>, Vec<DmThread>)>,
     /// 重连成功后要回到的语音频道
     rejoin: Option<u32>,
     egui_ctx: egui::Context,
@@ -602,7 +657,8 @@ impl App {
         if let Screen::Main(s) = &mut self.screen {
             if s.conn.is_some() {
                 let chat = std::mem::take(&mut s.chat);
-                self.chat_store.insert(s.server_key.clone(), chat);
+                let dms = std::mem::take(&mut s.dms);
+                self.chat_store.insert(s.server_key.clone(), (chat, dms));
             }
         }
     }
@@ -623,6 +679,7 @@ impl App {
 
     fn new_session(&mut self, conn: Conn, events: Receiver<NetEvent>) -> Session {
         let server_key = self.cfg.server.trim().to_string();
+        let (chat, dms) = self.chat_store.remove(&server_key).unwrap_or_default();
         Session {
             conn: Some(conn),
             last_members: None,
@@ -631,11 +688,14 @@ impl App {
             server_name: String::new(),
             channels: Vec::new(),
             users: Vec::new(),
-            chat: self.chat_store.remove(&server_key).unwrap_or_default(),
+            chat,
+            dms,
+            chat_tab: None,
             chat_input: String::new(),
             new_channel: String::new(),
             server_key,
             e2e: None,
+            features: Vec::new(),
         }
     }
 
@@ -776,7 +836,8 @@ impl App {
                 Ok(p) => self.send_image(p, ctx),
                 Err(e) => {
                     if let Screen::Main(s) = &mut self.screen {
-                        s.chat.push(ChatLine::System(format!("图片没有发出：{e}")));
+                        let tab = s.chat_tab.clone();
+                        s.lines_for(tab.as_deref()).push(ChatLine::System(format!("图片没有发出：{e}")));
                     }
                 }
             }
@@ -784,7 +845,7 @@ impl App {
         let ev = self.images.poll();
         if !ev.is_empty() {
             if let Screen::Main(s) = &mut self.screen {
-                apply_image_events(&mut s.chat, ev, ctx);
+                apply_image_events(s, ev, ctx);
             }
         }
         // 托盘
@@ -916,15 +977,38 @@ impl App {
         }
     }
 
-    /// 端到端加密后发给同频道的人
+    /// 端到端加密后发给同频道的人；在私聊标签里只发给对方
     fn send_image(&mut self, p: crate::images::Prepared, ctx: &egui::Context) {
         let Screen::Main(s) = &mut self.screen else { return };
-        let (Some(conn), Some(e2e)) = (&s.conn, &s.e2e) else { return };
-        let Some(ch) = s.me().and_then(|u| u.channel_id) else {
-            s.chat.push(ChatLine::System("进入语音频道后才能发图片（图片只发给同频道的人）".into()));
+        if s.conn.is_none() || s.e2e.is_none() {
             return;
+        }
+        let dm = s.chat_tab.clone();
+        let to: Vec<u32> = match &dm {
+            Some(peer) => {
+                let id = s.id_by_name(peer);
+                let why = if !s.features.iter().any(|f| f == voc_proto::FEATURE_DM_FILE) {
+                    Some("服务器版本较旧，私聊发图需要先升级服务器（发文字不受影响）")
+                } else if id.is_none() {
+                    Some("对方不在线，图片没有发出")
+                } else {
+                    None
+                };
+                if let Some(w) = why {
+                    s.dm(peer).lines.push(ChatLine::System(w.into()));
+                    return;
+                }
+                vec![id.unwrap()]
+            }
+            None => {
+                let Some(ch) = s.me().and_then(|u| u.channel_id) else {
+                    s.chat.push(ChatLine::System("进入语音频道后才能发图片（图片只发给同频道的人；私聊可以右键对方名字）".into()));
+                    return;
+                };
+                s.users.iter().filter(|u| u.id != s.user_id && u.channel_id == Some(ch)).map(|u| u.id).collect()
+            }
         };
-        let to: Vec<u32> = s.users.iter().filter(|u| u.id != s.user_id && u.channel_id == Some(ch)).map(|u| u.id).collect();
+        let (Some(conn), Some(e2e)) = (&s.conn, &s.e2e) else { return };
         let (id, key) = crate::images::new_id_and_key();
         let total = voc_proto::file::chunk_count(p.bytes.len());
         let meta = voc_proto::file::ImageMeta {
@@ -936,27 +1020,39 @@ impl App {
             width: p.width,
             height: p.height,
         };
-        let missing = e2e.lock().unwrap().send_image_meta(&to, &meta);
+        if dm.is_some() {
+            conn.send(ClientMsg::FileTarget { id, to: to[0] });
+        }
+        let missing = e2e.lock().unwrap().send_image_meta(&to, &meta, dm.is_some());
         let progress = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let sender = conn.sender();
         let mut bytes = p.bytes;
-        if to.is_empty() {
+        // 一个能收的人都没有就不上传
+        let nobody = to.len() == missing.len();
+        if nobody {
             crate::images::wipe(&mut bytes);
         } else {
             crate::images::spawn_upload(sender, id, key, bytes, progress.clone());
         }
         let me = s.me().map(|u| u.name.clone()).unwrap_or_default();
-        s.chat.push(ChatLine::Image(Box::new(ImageLine {
+        let error = match (to.is_empty(), nobody, dm.is_some()) {
+            (true, _, _) => Some("频道里没有其他人".to_string()),
+            (_, true, true) => Some("和对方的加密尚未建立（或身份待核对），没有发出".to_string()),
+            (_, true, false) => Some("同频道的人都还没建立加密，没有发出".to_string()),
+            _ => None,
+        };
+        let user_id = s.user_id;
+        s.lines_for(dm.as_deref()).push(ChatLine::Image(Box::new(ImageLine {
             from: me,
             ts: voc_proto::now_millis(),
             mine: true,
-            key: (s.user_id, id),
+            key: (user_id, id),
             tex: Some(ctx.load_texture(format!("img-mine-{id}"), p.preview, Default::default())),
-            sending: (!to.is_empty()).then(|| (progress, total)),
+            sending: (!nobody).then(|| (progress, total)),
             receiving: None,
-            error: to.is_empty().then(|| "频道里没有其他人".to_string()),
+            error,
         })));
-        if !missing.is_empty() {
+        if !missing.is_empty() && !nobody {
             s.chat.push(ChatLine::System(format!("以下成员收不到这张图（加密尚未建立或身份待核对）：{}", missing.join("、"))));
         }
     }
@@ -1022,11 +1118,12 @@ impl App {
                 NetEvent::Closed(reason) => return Some(Dropped { reason, retry: true }),
                 NetEvent::File(data) => {
                     let ev = self.images.on_chunk(&data);
-                    apply_image_events(&mut s.chat, ev, &self.egui_ctx);
+                    apply_image_events(s, ev, &self.egui_ctx);
                 }
                 NetEvent::Msg(msg) => match msg {
-                    ServerMsg::Welcome { user_id, udp_port, server_name } => {
+                    ServerMsg::Welcome { user_id, udp_port, server_name, features } => {
                         s.user_id = user_id;
+                        s.features = features;
                         s.server_name = server_name;
                         let Some(conn) = &s.conn else { continue };
                         let mut udp_addr = conn.server_addr;
@@ -1197,12 +1294,18 @@ impl App {
                         match msg {
                             Some(crate::e2e::BlobIn::Chat(c)) => {
                                 let from = s.name_of(c.from);
-                                s.chat.push(ChatLine::User { from, text: c.text, ts, mine: false });
+                                let line = ChatLine::User { from: from.clone(), text: c.text, ts, mine: false };
+                                if c.dm {
+                                    s.push_dm(&from, line);
+                                } else {
+                                    s.chat.push(line);
+                                }
                             }
-                            Some(crate::e2e::BlobIn::Image { from, meta }) => {
+                            Some(crate::e2e::BlobIn::Image { from, meta, dm }) => {
                                 let total = meta.chunks;
-                                s.chat.push(ChatLine::Image(Box::new(ImageLine {
-                                    from: s.name_of(from),
+                                let name = s.name_of(from);
+                                let line = ChatLine::Image(Box::new(ImageLine {
+                                    from: name.clone(),
                                     ts,
                                     mine: false,
                                     key: (from, meta.id),
@@ -1210,9 +1313,14 @@ impl App {
                                     sending: None,
                                     receiving: Some((0, total)),
                                     error: None,
-                                })));
+                                }));
+                                if dm {
+                                    s.push_dm(&name, line);
+                                } else {
+                                    s.chat.push(line);
+                                }
                                 let ev = self.images.on_meta(from, meta);
-                                apply_image_events(&mut s.chat, ev, &self.egui_ctx);
+                                apply_image_events(s, ev, &self.egui_ctx);
                             }
                             None => {}
                         }
@@ -1326,6 +1434,13 @@ impl App {
             new_channel: String::new(),
             server_key: "voc.example.com".into(),
             e2e: None,
+            dms: vec![DmThread {
+                peer: "阿豪".into(),
+                lines: vec![ChatLine::User { from: "阿豪".into(), text: "等下帮我看看配装，别在频道里说".into(), ts: now - 60_000, mine: false }],
+                unread: 1,
+            }],
+            chat_tab: None,
+            features: Vec::new(),
         };
         let q = |rtt, loss, jitter, unstable| PeerQuality { rtt_ms: rtt, loss_pct: loss, jitter_ms: jitter, unstable };
         self.demo.quality = [
@@ -1466,9 +1581,13 @@ impl Drop for App {
     fn drop(&mut self) {
         if let Screen::Main(s) = &mut self.screen {
             wipe_chat(&mut s.chat);
+            s.dms.iter_mut().for_each(wipe_dm);
+            s.dms.clear();
         }
-        for chat in self.chat_store.values_mut() {
+        for (chat, dms) in self.chat_store.values_mut() {
             wipe_chat(chat);
+            dms.iter_mut().for_each(wipe_dm);
+            dms.clear();
         }
         self.chat_store.clear();
         self.images.wipe_all();

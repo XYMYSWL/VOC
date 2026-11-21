@@ -816,6 +816,34 @@ fn image_chunks_go_to_same_channel_only() {
     assert!(b.wait_frame(KIND_FILE, 500).is_none());
 }
 
+/// 私聊发图：FileTarget 之后的那张图只转给对方，不管在不在同一频道
+#[test]
+fn dm_image_goes_to_target_only() {
+    use voc_proto::crypto::KIND_FILE;
+    use voc_proto::file;
+    let srv = Server::start(12);
+    let codes = srv.gen_codes(3);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
+    let mut c = Client::connect(srv.port, &codes[2], "carol").unwrap();
+    // alice 和 bob 同频道，carol 在大厅外
+    both_in(&mut a, &mut b, 1);
+    let ct = file::encrypt_chunk(&[5u8; 32], 9, 0, b"secret png");
+    a.send(ClientMsg::FileTarget { id: 9, to: c.id });
+    a.send_raw_frame(KIND_FILE, &file::client_chunk(9, 0, 2, &ct));
+    a.send_raw_frame(KIND_FILE, &file::client_chunk(9, 1, 2, &ct));
+    for seq in 0..2 {
+        let got = c.wait_frame(KIND_FILE, 3000).expect("carol gets the dm chunk");
+        let (from, id, s, total, _) = file::read_server_chunk(&got).unwrap();
+        assert_eq!((from, id, s, total), (a.id, 9, seq, 2));
+    }
+    assert!(b.wait_frame(KIND_FILE, 800).is_none(), "same-channel member must not get a dm image");
+    // 不是私聊的图照旧发给同频道
+    a.send_raw_frame(KIND_FILE, &file::client_chunk(10, 0, 1, &ct));
+    assert!(b.wait_frame(KIND_FILE, 3000).is_some());
+    assert!(c.wait_frame(KIND_FILE, 800).is_none());
+}
+
 /// 伴奏：发给同频道所有没静音的人（发送者闭麦也照转）；屏幕共享声音只发给观看者
 #[test]
 fn music_and_share_audio_forwarding() {

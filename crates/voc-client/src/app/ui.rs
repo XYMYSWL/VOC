@@ -220,6 +220,17 @@ impl App {
         let mut toggled_state = false;
         let mut trust_id: Option<u32> = None;
         let mut watch_toggle: Option<(u32, bool)> = None;
+        // 右键「私聊」打开的对话、点 ✕ 关闭的对话、切换到的标签（Some(None) = 频道聊天）
+        let mut open_dm: Option<String> = None;
+        let mut close_dm: Option<String> = None;
+        let mut switch_tab: Option<Option<String>> = None;
+        // 正在看的私聊：清未读；对话已不存在就回到频道聊天
+        if let Some(p) = s.chat_tab.clone() {
+            match s.dms.iter_mut().find(|t| t.peer == p) {
+                Some(t) => t.unread = 0,
+                None => s.chat_tab = None,
+            }
+        }
 
         // 直连质量 / 分配 / 加密状态（演示模式用假数据）
         let (direct, alloc_voice, alloc_video) = match self.voice.current_link() {
@@ -566,6 +577,10 @@ impl App {
                                 resp.context_menu(|ui| {
                                     ui.set_min_width(240.0);
                                     ui.label(RichText::new(&u.name).strong());
+                                    if ui.button("💬 私聊").on_hover_text("只有你们两个看得到，端到端加密，关闭标签或关掉 VOC 后清除").clicked() {
+                                        open_dm = Some(u.name.clone());
+                                        ui.close();
+                                    }
                                     {
                                         let mut m = self.mixer.lock().unwrap();
                                         let mut v = m.volume(u.id) * 100.0;
@@ -625,7 +640,15 @@ impl App {
                         ui.add_space(12.0);
                         th::section(ui, &format!("在线 — {}", idle.len()));
                         for u in idle {
-                            member_row(ui, u, false, |_| {});
+                            let resp = member_row(ui, u, false, |_| {});
+                            if u.id != s.user_id {
+                                resp.context_menu(|ui| {
+                                    if ui.button("💬 私聊").clicked() {
+                                        open_dm = Some(u.name.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
                         }
                     }
                 });
@@ -637,6 +660,29 @@ impl App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(th::BG_PANEL).inner_margin(Margin::symmetric(18, 12))).show(
             ui,
             |ui| {
+                if !s.dms.is_empty() {
+                    egui::Panel::top("chat_tabs").frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 4))).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.selectable_label(s.chat_tab.is_none(), "# 频道聊天").clicked() {
+                                switch_tab = Some(None);
+                            }
+                            for t in &s.dms {
+                                let sel = s.chat_tab.as_deref() == Some(t.peer.as_str());
+                                let label = if t.unread > 0 { format!("💬 {} ({})", t.peer, t.unread) } else { format!("💬 {}", t.peer) };
+                                let mut text = RichText::new(label);
+                                if t.unread > 0 {
+                                    text = text.color(th::ACCENT_HOVER).strong();
+                                }
+                                if ui.selectable_label(sel, text).clicked() {
+                                    switch_tab = Some(Some(t.peer.clone()));
+                                }
+                                if sel && ui.small_button("✕").on_hover_text("关闭并清除这段私聊（阅后即焚）").clicked() {
+                                    close_dm = Some(t.peer.clone());
+                                }
+                            }
+                        });
+                    });
+                }
                 egui::Panel::bottom("chat_input").frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 8))).show(ui, |ui| {
                     egui::Frame::new()
                         .fill(th::BG_ELEVATED)
@@ -651,9 +697,13 @@ impl App {
                             {
                                 pick_image = true;
                             }
+                            let hint = match &s.chat_tab {
+                                Some(p) => format!("私聊 {p}…（只有对方看得到 · 端到端加密）"),
+                                None => "发送消息…（回车发送 · 端到端加密）".to_string(),
+                            };
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut s.chat_input)
-                                    .hint_text("发送消息…（回车发送 · 端到端加密）")
+                                    .hint_text(hint)
                                     .frame(egui::Frame::NONE)
                                     .desired_width(f32::INFINITY)
                                     .margin(Margin::symmetric(0, 6)),
@@ -661,7 +711,23 @@ impl App {
                             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                 let text = std::mem::take(&mut s.chat_input);
                                 let text = text.trim().chars().take(voc_proto::MAX_CHAT_LEN).collect::<String>();
-                                if !text.is_empty() {
+                                if let (false, Some(peer)) = (text.is_empty(), s.chat_tab.clone()) {
+                                    let id = s.id_by_name(&peer);
+                                    let ok = match (id, &s.e2e) {
+                                        (Some(id), Some(e2e)) => e2e.lock().unwrap().send_dm(id, &text),
+                                        _ => false,
+                                    };
+                                    let me = s.me().map(|u| u.name.clone()).unwrap_or_default();
+                                    let t = s.dm(&peer);
+                                    if ok {
+                                        t.lines.push(ChatLine::User { from: me, text, ts: voc_proto::now_millis(), mine: true });
+                                    } else {
+                                        t.lines.push(ChatLine::System(
+                                            if id.is_none() { "对方不在线，消息没有发出" } else { "和对方的加密尚未建立（或身份待核对），消息没有发出" }.into(),
+                                        ));
+                                        s.chat_input = text;
+                                    }
+                                } else if !text.is_empty() {
                                     if let Some(e2e) = &s.e2e {
                                         let (_, missing) = e2e.lock().unwrap().send_chat(&text);
                                         if !missing.is_empty() {
@@ -680,16 +746,30 @@ impl App {
                         });
                 });
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
-                    if s.chat.is_empty() {
+                    let lines = match &s.chat_tab {
+                        Some(p) => s.dms.iter().find(|t| &t.peer == p).map(|t| &t.lines).unwrap_or(&s.chat),
+                        None => &s.chat,
+                    };
+                    if lines.is_empty() {
                         ui.add_space(ui.available_height() * 0.35);
                         ui.vertical_centered(|ui| {
                             ui.label(RichText::new("💬").size(32.0));
-                            ui.label(RichText::new("还没有消息").color(th::TEXT_DIM));
-                            ui.label(RichText::new("聊天内容端到端加密，服务器看不到").size(12.0).color(th::TEXT_FAINT));
+                            match &s.chat_tab {
+                                Some(p) => {
+                                    ui.label(RichText::new(format!("和 {p} 的私聊")).color(th::TEXT_DIM));
+                                    ui.label(
+                                        RichText::new("只有你们两个看得到 · 端到端加密 · 关闭标签或关掉 VOC 后清除").size(12.0).color(th::TEXT_FAINT),
+                                    );
+                                }
+                                None => {
+                                    ui.label(RichText::new("还没有消息").color(th::TEXT_DIM));
+                                    ui.label(RichText::new("聊天内容端到端加密，服务器看不到").size(12.0).color(th::TEXT_FAINT));
+                                }
+                            }
                         });
                     }
                     let mut prev: Option<(&str, u64)> = None;
-                    for line in &s.chat {
+                    for line in lines {
                         match line {
                             ChatLine::User { from, text, ts, mine } => {
                                 // 同一人 5 分钟内的连续消息合并显示
@@ -775,6 +855,22 @@ impl App {
         // ---------------- 动作
         if let Some(t) = open_image {
             self.image_view = Some(t);
+        }
+        if let Some(tab) = switch_tab {
+            s.chat_tab = tab;
+        }
+        if let Some(p) = open_dm {
+            s.dm(&p);
+            s.chat_tab = Some(p);
+        }
+        if let Some(p) = close_dm {
+            if let Some(i) = s.dms.iter().position(|t| t.peer == p) {
+                let mut t = s.dms.remove(i);
+                crate::app::wipe_dm(&mut t);
+            }
+            if s.chat_tab.as_deref() == Some(p.as_str()) {
+                s.chat_tab = None;
+            }
         }
         if pick_image {
             crate::app::queue_image(&jobs_tx, &ectx, || {

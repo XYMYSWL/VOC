@@ -101,6 +101,11 @@ pub enum ClientMsg {
     Caps {
         decoders: Vec<String>,
     },
+    /// 接下来上传的这张图片（id）只转给 to 一个人（私聊发图）。需要服务器支持 FEATURE_DM_FILE
+    FileTarget {
+        id: u64,
+        to: u32,
+    },
     /// 每 2 秒上报一次链路质量，服务器据此安排成员互相中转语音（成员中继）。
     /// server_rtt：到服务器的往返延迟；peers：已打通且稳定的直连；relay_slots：还能帮别人中转几路语音（0 = 不当中继）
     LinkStats {
@@ -140,6 +145,9 @@ pub enum ServerMsg {
         user_id: u32,
         udp_port: u16,
         server_name: String,
+        /// 服务器支持的新功能（旧服务器为空），见 FEATURE_*
+        #[serde(default)]
+        features: Vec<String>,
     },
     Error {
         message: String,
@@ -241,6 +249,11 @@ pub struct UserInfo {
     #[serde(default)]
     pub share_audio: bool,
 }
+
+/// 服务器功能：私聊发图（FileTarget）
+pub const FEATURE_DM_FILE: &str = "dm_file";
+/// 服务器功能：PONG 里附上客户端公网地址
+pub const FEATURE_PONG_ADDR: &str = "pong_addr";
 
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
     let mut s = serde_json::to_string(msg).expect("serialize");

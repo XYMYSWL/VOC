@@ -49,13 +49,15 @@ pub struct E2e {
 pub struct ChatIn {
     pub from: u32,
     pub text: String,
+    /// 私聊
+    pub dm: bool,
 }
 
 /// 解开的端到端信封
 pub enum BlobIn {
     Chat(ChatIn),
     /// 别人发来的图片密钥和信息（图片本身随后分块到）
-    Image { from: u32, meta: voc_proto::file::ImageMeta },
+    Image { from: u32, meta: voc_proto::file::ImageMeta, dm: bool },
 }
 
 impl E2e {
@@ -235,11 +237,13 @@ impl E2e {
                 self.keyring.by_sender.entry(from).or_default().install(&data);
                 None
             }
-            e2e::BLOB_CHAT => Some(BlobIn::Chat(ChatIn { from, text: String::from_utf8_lossy(&data).into_owned() })),
-            e2e::BLOB_IMAGE => {
+            e2e::BLOB_CHAT | e2e::BLOB_DM => {
+                Some(BlobIn::Chat(ChatIn { from, text: String::from_utf8_lossy(&data).into_owned(), dm: kind == e2e::BLOB_DM }))
+            }
+            e2e::BLOB_IMAGE | e2e::BLOB_DM_IMAGE => {
                 let meta: voc_proto::file::ImageMeta = serde_json::from_slice(&data).ok()?;
                 (meta.size as usize <= voc_proto::file::MAX_IMAGE_BYTES && meta.chunks <= voc_proto::file::MAX_CHUNKS)
-                    .then_some(BlobIn::Image { from, meta })
+                    .then_some(BlobIn::Image { from, meta, dm: kind == e2e::BLOB_DM_IMAGE })
             }
             _ => None,
         }
@@ -263,14 +267,26 @@ impl E2e {
         (sent, missing)
     }
 
-    /// 把图片密钥和信息发给指定的人（同频道成员）。返回收不到的人的名字。
-    pub fn send_image_meta(&mut self, to: &[u32], meta: &voc_proto::file::ImageMeta) -> Vec<String> {
+    /// 私聊：只发给一个人。false = 和对方的加密还没建立（或身份待核对），没发出
+    pub fn send_dm(&mut self, to: u32, text: &str) -> bool {
+        match (self.trusted(to), self.pairs.get(&to)) {
+            (true, Some(k)) => {
+                let blob = e2e::seal_blob(&k.blob, e2e::BLOB_DM, text.as_bytes());
+                self.out.push(ClientMsg::E2eBlob { to, blob: b64(&blob) });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 把图片密钥和信息发给指定的人（同频道成员，或私聊对象 dm = true）。返回收不到的人的名字。
+    pub fn send_image_meta(&mut self, to: &[u32], meta: &voc_proto::file::ImageMeta, dm: bool) -> Vec<String> {
         let json = serde_json::to_vec(meta).expect("meta json");
         let mut missing = Vec::new();
         for &id in to {
             match (self.trusted(id), self.pairs.get(&id)) {
                 (true, Some(k)) => {
-                    let blob = e2e::seal_blob(&k.blob, e2e::BLOB_IMAGE, &json);
+                    let blob = e2e::seal_blob(&k.blob, if dm { e2e::BLOB_DM_IMAGE } else { e2e::BLOB_IMAGE }, &json);
                     self.out.push(ClientMsg::E2eBlob { to: id, blob: b64(&blob) });
                 }
                 _ => missing.push(self.members.get(&id).map(|m| m.name.clone()).unwrap_or_else(|| format!("#{id}"))),
@@ -402,6 +418,13 @@ pub mod tests {
         let chats = relay(&mut a, &mut b);
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].text, "你好");
+        assert!(!chats[0].dm);
+
+        // 私聊：只有对方收得到，并标成私聊
+        assert!(a.send_dm(2, "悄悄话"));
+        let dms = relay(&mut a, &mut b);
+        assert_eq!((dms.len(), dms[0].text.as_str(), dms[0].dm), (1, "悄悄话", true));
+        assert!(!a.send_dm(99, "没这个人"));
 
         // 有人离开频道：alice 换密钥，bob 的旧密钥解不开新语音
         a.set_channel_others(vec![]);

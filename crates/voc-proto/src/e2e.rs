@@ -37,6 +37,10 @@ pub const BLOB_SENDER_KEY: u8 = 1;
 pub const BLOB_CHAT: u8 = 2;
 /// 图片密钥和信息（file::ImageMeta 的 JSON）
 pub const BLOB_IMAGE: u8 = 3;
+/// 私聊文字（只发给一个人；旧版客户端不认识，直接忽略）
+pub const BLOB_DM: u8 = 4;
+/// 私聊图片的密钥和信息
+pub const BLOB_DM_IMAGE: u8 = 5;
 
 const CTX_EK: &[u8] = b"voc e2e ek v1";
 const CTX_PAIR: &[u8] = b"voc e2e pair v1";

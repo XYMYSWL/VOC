@@ -74,8 +74,10 @@ struct User {
     last_relays: Vec<RelayRoute>,
     /// 还在发送队列里的图片字节数
     pending_file: Arc<std::sync::atomic::AtomicUsize>,
-    /// 我正在上传的图片：id → (块数, 已收块数, 最后一次收到的时间)
-    uploads: HashMap<u64, (u32, u32, Instant)>,
+    /// 我正在上传的图片：id → (块数, 已收块数, 最后一次收到的时间, 私聊对象)
+    uploads: HashMap<u64, (u32, u32, Instant, Option<u32>)>,
+    /// 还没开始上传的私聊图片：id → 接收者
+    upload_to: HashMap<u64, u32>,
 }
 
 /// 客户端上报的链路质量
@@ -244,31 +246,41 @@ impl State {
         out
     }
 
-    /// 转发一块图片给同频道的其他人（只转发不保存）
+    /// 转发一块图片给同频道的其他人，私聊图片只转给对方（只转发不保存）
     fn forward_file(&mut self, from: u32, chunk: &[u8]) {
         let Some((id, _seq, total, _)) = voc_proto::file::read_client_chunk(chunk) else { return };
         let Some(u) = self.users.get_mut(&from) else { return };
-        let Some(ch) = u.channel else { return };
+        let channel = u.channel;
         let now = Instant::now();
-        u.uploads.retain(|_, (t, got, at)| *got < *t && now.duration_since(*at) < UPLOAD_TTL);
-        match u.uploads.get_mut(&id) {
-            Some((t, got, at)) => {
+        u.uploads.retain(|_, (t, got, at, _)| *got < *t && now.duration_since(*at) < UPLOAD_TTL);
+        let target = match u.uploads.get_mut(&id) {
+            Some((t, got, at, to)) => {
                 if *t != total {
                     return;
                 }
                 *got += 1;
                 *at = now;
+                *to
             }
             None => {
                 if u.uploads.len() >= MAX_UPLOADS {
                     return;
                 }
-                u.uploads.insert(id, (total, 1, now));
+                let to = u.upload_to.remove(&id);
+                u.uploads.insert(id, (total, 1, now, to));
+                to
             }
+        };
+        if target.is_none() && channel.is_none() {
+            return;
         }
         let payload = voc_proto::file::server_chunk(from, chunk);
         for (id, other) in self.users.iter() {
-            if *id == from || other.channel != Some(ch) {
+            let wanted = match target {
+                Some(t) => *id == t,
+                None => other.channel == channel,
+            };
+            if *id == from || !wanted {
                 continue;
             }
             let pending = other.pending_file.load(std::sync::atomic::Ordering::Relaxed);
@@ -717,7 +729,12 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         }
         let id = st.next_user;
         st.next_user += 1;
-        let _ = tx.send(Out::Json(ServerMsg::Welcome { user_id: id, udp_port: st.udp_port, server_name: st.server_name.clone() }));
+        let _ = tx.send(Out::Json(ServerMsg::Welcome {
+            user_id: id,
+            udp_port: st.udp_port,
+            server_name: st.server_name.clone(),
+            features: vec![voc_proto::FEATURE_DM_FILE.into(), voc_proto::FEATURE_PONG_ADDR.into()],
+        }));
         st.users.insert(
             id,
             User {
@@ -747,6 +764,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 last_relays: Vec::new(),
                 pending_file: pending_file.clone(),
                 uploads: HashMap::new(),
+                upload_to: HashMap::new(),
             },
         );
         st.broadcast_state();
@@ -967,6 +985,17 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             let (Some(me), Some(peer)) = (st.users.get(&uid), st.users.get(&to)) else { return };
             if me.e2e.is_some() && peer.e2e.is_some() {
                 peer.send(ServerMsg::PeerKey { from: uid, ct, sig });
+            }
+        }
+        ClientMsg::FileTarget { id, to } => {
+            if to == uid || !st.users.contains_key(&to) {
+                return;
+            }
+            if let Some(u) = st.users.get_mut(&uid) {
+                if u.upload_to.len() >= 8 {
+                    u.upload_to.clear();
+                }
+                u.upload_to.insert(id, to);
             }
         }
         ClientMsg::E2eBlob { to, blob } => {
