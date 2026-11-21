@@ -1246,10 +1246,28 @@ impl App {
                             ui.label(format!("{} fps（采集 {}）", st.fps.load(Ordering::Relaxed), st.capture_fps.load(Ordering::Relaxed)));
                             ui.end_row();
                             ui.label(RichText::new("码率").color(th::TEXT_DIM));
-                            ui.label(format!("{:.1} Mbps", st.kbps.load(Ordering::Relaxed) as f32 / 1000.0));
+                            let pct = st.rate_pct.load(Ordering::Relaxed);
+                            if pct < 100 {
+                                ui.label(RichText::new(format!(
+                                    "{:.1} Mbps（网络拥堵，已自动降到 {pct}%）",
+                                    st.kbps.load(Ordering::Relaxed) as f32 / 1000.0
+                                ))
+                                .color(th::YELLOW));
+                            } else {
+                                ui.label(format!("{:.1} Mbps", st.kbps.load(Ordering::Relaxed) as f32 / 1000.0));
+                            }
                             ui.end_row();
                             ui.label(RichText::new("编码").color(th::TEXT_DIM));
                             ui.label(format!("{} · {} ms/帧", st.encoder.lock().unwrap(), st.encode_ms.load(Ordering::Relaxed)));
+                            ui.end_row();
+                            ui.label(RichText::new("画面处理").color(th::TEXT_DIM));
+                            let pipe = st.pipeline.lock().unwrap().clone();
+                            let tip = if pipe == "显卡直通" {
+                                "画面全程在显卡上缩放、转换、编码，不拷回内存，打游戏时也不抢 CPU"
+                            } else {
+                                "画面拷回内存用 CPU 转换（编码器和显示器不在同一块显卡上、或用软件编码时）"
+                            };
+                            ui.label(pipe).on_hover_text(tip);
                             ui.end_row();
                         });
                     }

@@ -230,6 +230,12 @@ pub fn d3d_manager_any() -> Result<(IMFDXGIDeviceManager, ID3D11Device)> {
     }
 }
 
+/// 喂给编码器的一帧：内存里的 NV12，或显卡上的 NV12 纹理
+enum Input<'a> {
+    Mem(&'a [u8]),
+    Tex(&'a ID3D11Texture2D),
+}
+
 pub struct HwEncoder {
     mft: IMFTransform,
     events: IMFMediaEventGenerator,
@@ -253,17 +259,43 @@ fn set_u64(mt: &IMFMediaType, key: &GUID, hi: u32, lo: u32) -> Result<()> {
 impl HwEncoder {
     pub fn new(info: &HwEncoderInfo, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
         // 先不绑显卡直接试（NVIDIA 可以）；不行再绑定对应厂商的 D3D11 设备重试（AMD 需要）
-        match Self::open(info, width, height, fps, bitrate, false) {
+        match Self::open(info, width, height, fps, bitrate, None) {
             Ok(e) => Ok(e),
-            Err(_) => Self::open(info, width, height, fps, bitrate, true),
+            Err(_) => {
+                let list = enum_encoders(info.codec)?;
+                let a = list.into_iter().find(|a| friendly_name(a) == info.name).ok_or_else(|| Error::from(E_FAIL))?;
+                let d3d = d3d_manager(vendor_id(&a).ok_or_else(|| Error::from(E_FAIL))?)?;
+                Self::open(info, width, height, fps, bitrate, Some(d3d))
+            }
         }
     }
 
-    fn open(info: &HwEncoderInfo, width: u32, height: u32, fps: u32, bitrate: u32, with_d3d: bool) -> Result<Self> {
+    /// 绑定到指定的 D3D11 设备（显卡直通：输入直接是这个设备上的 NV12 纹理）
+    pub fn new_on_device(
+        info: &HwEncoderInfo,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        mgr: IMFDXGIDeviceManager,
+        dev: ID3D11Device,
+    ) -> Result<Self> {
+        Self::open(info, width, height, fps, bitrate, Some((mgr, dev)))
+    }
+
+    /// 运行中调整码率（网络拥堵时降低）
+    pub fn set_bitrate(&self, bitrate: u32) {
+        if let Some(api) = &self.codec_api {
+            unsafe {
+                let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate));
+            }
+        }
+    }
+
+    fn open(info: &HwEncoderInfo, width: u32, height: u32, fps: u32, bitrate: u32, d3d: Option<(IMFDXGIDeviceManager, ID3D11Device)>) -> Result<Self> {
         let list = enum_encoders(info.codec)?;
         let a = list.into_iter().find(|a| friendly_name(a) == info.name).ok_or_else(|| Error::from(E_FAIL))?;
         unsafe {
-            let d3d = if with_d3d { Some(d3d_manager(vendor_id(&a).ok_or_else(|| Error::from(E_FAIL))?)?) } else { None };
             let mft: IMFTransform = a.ActivateObject()?;
             let attrs = mft.GetAttributes()?;
             attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?; // 必须先解锁异步，才能发其它消息
@@ -322,12 +354,21 @@ impl HwEncoder {
 
     /// 编码一帧 NV12（w×h + w×h/2）。返回这次拿到的所有码流包 (数据, 是否关键帧)。
     pub fn encode(&mut self, nv12: &[u8]) -> Result<Vec<(Vec<u8>, bool)>> {
+        self.encode_input(Input::Mem(nv12))
+    }
+
+    /// 编码一张 NV12 纹理（显卡直通；纹理必须在 new_on_device 给的设备上）
+    pub fn encode_texture(&mut self, tex: &ID3D11Texture2D) -> Result<Vec<(Vec<u8>, bool)>> {
+        self.encode_input(Input::Tex(tex))
+    }
+
+    fn encode_input(&mut self, input: Input) -> Result<Vec<(Vec<u8>, bool)>> {
         let mut out = Vec::new();
         // 处理事件直到喂进这一帧；顺便把已有输出取走。最多等 ~500 ms 防止卡死。
         let start = std::time::Instant::now();
         loop {
             if self.need_input > 0 {
-                self.feed(nv12)?;
+                self.feed(&input)?;
                 self.need_input -= 1;
                 break;
             }
@@ -365,15 +406,21 @@ impl HwEncoder {
         Ok(())
     }
 
-    fn feed(&mut self, nv12: &[u8]) -> Result<()> {
+    fn feed(&mut self, input: &Input) -> Result<()> {
         unsafe {
-            let len = (self.width * self.height * 3 / 2) as usize;
-            let buf = MFCreateMemoryBuffer(len as u32)?;
-            let mut p: *mut u8 = std::ptr::null_mut();
-            buf.Lock(&mut p, None, None)?;
-            std::ptr::copy_nonoverlapping(nv12.as_ptr(), p, len.min(nv12.len()));
-            buf.Unlock()?;
-            buf.SetCurrentLength(len as u32)?;
+            let buf = match input {
+                Input::Mem(nv12) => {
+                    let len = (self.width * self.height * 3 / 2) as usize;
+                    let buf = MFCreateMemoryBuffer(len as u32)?;
+                    let mut p: *mut u8 = std::ptr::null_mut();
+                    buf.Lock(&mut p, None, None)?;
+                    std::ptr::copy_nonoverlapping(nv12.as_ptr(), p, len.min(nv12.len()));
+                    buf.Unlock()?;
+                    buf.SetCurrentLength(len as u32)?;
+                    buf
+                }
+                Input::Tex(t) => MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, *t, 0, false)?,
+            };
             let s = MFCreateSample()?;
             s.AddBuffer(&buf)?;
             let dur = 10_000_000i64 / self.fps as i64;

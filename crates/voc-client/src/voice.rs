@@ -414,6 +414,8 @@ pub struct Link {
     /// 伴奏 / 共享声音的外层序号（只给服务器去重用；端到端的计数器在密文里）
     music_seq: AtomicU16,
     share_seq: AtomicU16,
+    /// 画面包在匀速队列里过期被丢掉的次数（网络 / 上行太挤的信号，码率自适应用）
+    pace_dropped: AtomicU32,
 }
 
 impl Link {
@@ -636,6 +638,11 @@ impl Link {
         if sent < targets.len() && self.udp_ok.load(Ordering::Relaxed) {
             self.send_server(kind, &udp::client_voice(seq, blob), buf);
         }
+    }
+
+    /// 取走匀速队列的丢包计数
+    pub fn take_pace_drops(&self) -> u32 {
+        self.pace_dropped.swap(0, Ordering::Relaxed)
     }
 
     /// 画面包交给匀速发送线程（队列没起来时直接发）
@@ -1120,6 +1127,7 @@ pub fn connect(
         pace_tx: Mutex::new(None),
         music_seq: AtomicU16::new(0),
         share_seq: AtomicU16::new(0),
+        pace_dropped: AtomicU32::new(0),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1206,6 +1214,7 @@ fn spawn_pacer(link: Arc<Link>) {
         while !link.closed.load(Ordering::Relaxed) {
             let Ok((queued, to, pkt)) = rx.recv_timeout(Duration::from_millis(200)) else { continue };
             if queued.elapsed() > PACE_STALE {
+                link.pace_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let rate = (link.video_bps.load(Ordering::Relaxed) as u64 * PACE_FACTOR).max(PACE_MIN_BPS) as f64 / 8.0;
@@ -1943,8 +1952,9 @@ mod tests {
             if let Some(f) = view.frame.lock().unwrap().as_ref() {
                 if f.seq >= 30 && t.elapsed() >= Duration::from_secs(secs) {
                     println!(
-                        "[{}] -> [{}] decoded {}x{} frames: {}, viewer fps: {}, capture fps: {}, sender fps: {}, kbps: {}, encode_ms: {}, skipped/s: {}, elapsed {:?}",
+                        "[{} | {}] -> [{}] decoded {}x{} frames: {}, viewer fps: {}, capture fps: {}, sender fps: {}, kbps: {}, encode_ms: {}, skipped/s: {}, elapsed {:?}, err {:?}",
                         sharer.stats.encoder.lock().unwrap(),
+                        sharer.stats.pipeline.lock().unwrap(),
                         view.decoder.lock().unwrap(),
                         f.width,
                         f.height,
@@ -1955,8 +1965,12 @@ mod tests {
                         sharer.stats.kbps.load(Ordering::Relaxed),
                         sharer.stats.encode_ms.load(Ordering::Relaxed),
                         sharer.stats.skipped.load(Ordering::Relaxed),
-                        t.elapsed()
+                        t.elapsed(),
+                        sharer.stats.error.lock().unwrap()
                     );
+                    let n = (f.rgba.len() / 4).max(1);
+                    let avg = |c: usize| f.rgba.chunks(4).map(|p| p[c] as u64).sum::<u64>() / n as u64;
+                    println!("平均颜色 R {} G {} B {}", avg(0), avg(1), avg(2));
                     assert_eq!(f.height as u32, h);
                     break;
                 }

@@ -282,6 +282,10 @@ pub struct VideoEncoder {
     cur: Option<(usize, usize, Codec, String, Backend)>,
     yuv: Vec<u8>,
     nv12: Vec<u8>,
+    /// 显卡直通用的设备和视频处理器
+    gpu: Option<crate::mf::gpu::Converter>,
+    /// 码率比例（网络拥堵时降低，0.3–1.0）
+    rate_scale: f32,
 }
 
 pub struct EncodedFrame {
@@ -294,7 +298,48 @@ pub struct EncodedFrame {
 
 impl VideoEncoder {
     pub fn new(cfg: ShareConfig) -> Self {
-        Self { cfg, cur: None, yuv: Vec::new(), nv12: Vec::new() }
+        Self { cfg, cur: None, yuv: Vec::new(), nv12: Vec::new(), gpu: None, rate_scale: 1.0 }
+    }
+
+    /// 调整码率比例（硬件编码器即时生效；openh264 不支持中途改，保持原码率）
+    pub fn set_rate_scale(&mut self, scale: f32) {
+        self.rate_scale = scale;
+        if let Some((_, _, codec, _, Backend::Hw(enc))) = &self.cur {
+            enc.set_bitrate((self.cfg.bitrate_for(*codec) as f32 * scale) as u32);
+        }
+    }
+
+    /// 显卡直通：画面在显卡上缩放、转 NV12，直接交给硬件编码器（不经过内存）
+    pub fn encode_gpu(
+        &mut self,
+        f: &crate::mf::gpu::GpuFrame,
+        plan: &(Codec, Option<HwEncoderInfo>),
+        force_key: bool,
+    ) -> Result<Vec<EncodedFrame>, String> {
+        let (codec, Some(info)) = plan else { return Err("没有硬件编码器".into()) };
+        let (dw, dh) = self.cfg.target_size(f.width as usize, f.height as usize);
+        if !self.gpu.as_ref().is_some_and(|g| g.luid() == f.luid) {
+            self.gpu = Some(crate::mf::gpu::Converter::new(f.luid).map_err(|e| format!("显卡设备创建失败：{e}"))?);
+            self.cur = None;
+        }
+        let name = format!("{} · 显卡直通", info.name);
+        let fresh = !matches!(&self.cur, Some((w, h, c, n, _)) if *w == dw && *h == dh && c == codec && *n == name);
+        if fresh {
+            mfenc::mf_init().map_err(|e| e.to_string())?;
+            let g = self.gpu.as_ref().unwrap();
+            let bitrate = (self.cfg.bitrate_for(*codec) as f32 * self.rate_scale) as u32;
+            let enc = HwEncoder::new_on_device(info, dw as u32, dh as u32, self.cfg.fps, bitrate, g.mgr.clone(), g.dev.clone())
+                .map_err(|e| format!("{} 初始化失败：{e}", info.name))?;
+            self.cur = Some((dw, dh, *codec, name, Backend::Hw(enc)));
+        }
+        let tex = self.gpu.as_mut().unwrap().convert(f, dw as u32, dh as u32, self.cfg.fps).map_err(|e| format!("显卡缩放失败：{e}"))?;
+        let Some((_, _, codec, _, Backend::Hw(enc))) = self.cur.as_mut() else { return Err("编码器状态不对".into()) };
+        if force_key || fresh {
+            enc.force_keyframe();
+        }
+        let codec = *codec;
+        let pkts = enc.encode_texture(&tex).map_err(|e| format!("{} 编码失败：{e}", enc.name))?;
+        Ok(pkts.into_iter().map(|(data, key)| EncodedFrame { data, key, width: dw, height: dh, codec }).collect())
     }
 
     fn make_soft(cfg: &ShareConfig) -> Result<Encoder, String> {
@@ -334,7 +379,7 @@ impl VideoEncoder {
                 Some(info) => {
                     mfenc::mf_init().map_err(|e| e.to_string())?;
                     Backend::Hw(
-                        HwEncoder::new(info, dw as u32, dh as u32, self.cfg.fps, self.cfg.bitrate_for(*codec))
+                        HwEncoder::new(info, dw as u32, dh as u32, self.cfg.fps, (self.cfg.bitrate_for(*codec) as f32 * self.rate_scale) as u32)
                             .map_err(|e| format!("{} 初始化失败：{e}", info.name))?,
                     )
                 }
@@ -389,6 +434,10 @@ pub struct ShareStats {
     pub error: Mutex<Option<String>>,
     /// 正在用的格式和编码器
     pub encoder: Mutex<String>,
+    /// 画面处理方式：显卡直通 / CPU 转换
+    pub pipeline: Mutex<String>,
+    /// 当前码率占设定值的百分比（网络拥堵时自动降低）
+    pub rate_pct: AtomicU32,
 }
 
 struct RawFrame {
@@ -397,8 +446,16 @@ struct RawFrame {
     data: Vec<u8>,
 }
 
+/// 采集到的一帧：拷回内存的 BGRA，或留在显卡上的共享纹理
+enum CapFrame {
+    Cpu(RawFrame),
+    Gpu(crate::mf::gpu::GpuFrame),
+}
+
 struct CapFlags {
-    tx: SyncSender<RawFrame>,
+    tx: SyncSender<CapFrame>,
+    /// 走显卡直通（编码线程判断不能用时关掉，之后改拷回内存）
+    gpu: Arc<AtomicBool>,
     stats: Arc<ShareStats>,
     stop: Arc<AtomicBool>,
     interval: Duration,
@@ -409,6 +466,7 @@ struct CapHandler {
     last: Option<Instant>,
     sec: (Instant, u32),
     scratch: Vec<u8>,
+    side: crate::mf::gpu::CaptureSide,
 }
 
 impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
@@ -416,7 +474,7 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self { flags: ctx.flags, last: None, sec: (Instant::now(), 0), scratch: Vec::new() })
+        Ok(Self { flags: ctx.flags, last: None, sec: (Instant::now(), 0), scratch: Vec::new(), side: Default::default() })
     }
 
     fn on_frame_arrived(
@@ -439,11 +497,27 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
             self.flags.stats.capture_fps.store(fps, Ordering::Relaxed);
             self.sec = (Instant::now(), 0);
         }
+        // 显卡直通：只在显卡内部拷一份，画面不回内存
+        if self.flags.gpu.load(Ordering::Relaxed) {
+            match self.side.copy(frame.device(), frame.device_context(), frame.as_raw_texture()) {
+                Ok(Some(g)) => {
+                    return match self.flags.tx.try_send(CapFrame::Gpu(g)) {
+                        Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+                        Err(TrySendError::Disconnected(_)) => {
+                            control.stop();
+                            Ok(())
+                        }
+                    };
+                }
+                Ok(None) => return Ok(()), // 编码端还在处理上一帧：丢这一帧
+                Err(_) => self.flags.gpu.store(false, Ordering::Relaxed),
+            }
+        }
         let fb = frame.buffer()?;
         let (w, h) = (fb.width() as usize, fb.height() as usize);
         let data = fb.as_nopadding_buffer(&mut self.scratch).to_vec();
         // 编码跟不上就丢帧，只保留最新的（低延迟）
-        match self.flags.tx.try_send(RawFrame { w, h, data }) {
+        match self.flags.tx.try_send(CapFrame::Cpu(RawFrame { w, h, data })) {
             Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Disconnected(_)) => {
                 control.stop();
@@ -458,6 +532,8 @@ pub struct Sharer {
     state: Arc<VoiceState>,
     stop: Arc<AtomicBool>,
     force_key: Arc<AtomicBool>,
+    /// 观看者请求关键帧的次数（丢包的信号，码率自适应用）
+    key_requests: Arc<AtomicU32>,
     pub stats: Arc<ShareStats>,
 }
 
@@ -471,7 +547,9 @@ impl Sharer {
         let stop = Arc::new(AtomicBool::new(false));
         let force_key = Arc::new(AtomicBool::new(true));
         let stats = Arc::new(ShareStats::default());
-        let (tx, rx) = mpsc::sync_channel::<RawFrame>(1);
+        let (tx, rx) = mpsc::sync_channel::<CapFrame>(1);
+        let gpu = Arc::new(AtomicBool::new(std::env::var_os("VOC_NO_GPU_PIPE").is_none()));
+        let key_requests = Arc::new(AtomicU32::new(0));
         let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
         let settings = Settings::new(
             monitor,
@@ -481,7 +559,7 @@ impl Sharer {
             MinimumUpdateIntervalSettings::Custom(interval.mul_f32(0.9)),
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            CapFlags { tx, stats: stats.clone(), stop: stop.clone(), interval },
+            CapFlags { tx, gpu: gpu.clone(), stats: stats.clone(), stop: stop.clone(), interval },
         );
         CapHandler::start_free_threaded(settings).map_err(|e| format!("屏幕采集启动失败：{e}"))?;
 
@@ -489,16 +567,17 @@ impl Sharer {
         if let Some(l) = state.current_link() {
             l.set_video_bps(cfg.bitrate());
         }
-        let (st, fk, sp, stx, c2) = (state.clone(), force_key.clone(), stop.clone(), stats.clone(), cfg.clone());
+        let (st, fk, sp, stx, c2, kr) = (state.clone(), force_key.clone(), stop.clone(), stats.clone(), cfg.clone(), key_requests.clone());
         std::thread::Builder::new()
             .name("video-encode".into())
-            .spawn(move || encode_loop(c2, rx, st, fk, sp, stx))
+            .spawn(move || encode_loop(c2, rx, st, fk, sp, stx, gpu, kr))
             .map_err(|e| e.to_string())?;
-        Ok(Self { cfg, state, stop, force_key, stats })
+        Ok(Self { cfg, state, stop, force_key, key_requests, stats })
     }
 
     pub fn request_keyframe(&self) {
         self.force_key.store(true, Ordering::Relaxed);
+        self.key_requests.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -511,16 +590,40 @@ impl Drop for Sharer {
     }
 }
 
+/// 码率自适应：每秒看一次。观看者频繁要关键帧（≥2 次 / 秒）或匀速队列丢包 → 降到 70%（最低 30%）；
+/// 连续 4 秒正常 → 每秒回升 10%，直到设定值
+pub fn adapt_rate(scale: f32, calm_secs: &mut u32, key_requests: u32, pace_drops: u32) -> f32 {
+    if key_requests >= 2 || pace_drops > 0 {
+        *calm_secs = 0;
+        (scale * 0.7).max(0.3)
+    } else {
+        *calm_secs += 1;
+        if *calm_secs >= 4 {
+            (scale * 1.1).min(1.0)
+        } else {
+            scale
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     cfg: ShareConfig,
-    rx: Receiver<RawFrame>,
+    rx: Receiver<CapFrame>,
     state: Arc<VoiceState>,
     force_key: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     stats: Arc<ShareStats>,
+    gpu_flag: Arc<AtomicBool>,
+    key_requests: Arc<AtomicU32>,
 ) {
     let pref = cfg.encoder.clone();
+    let full_bps = cfg.bitrate();
     let mut enc = VideoEncoder::new(cfg);
+    let mut gpu_broken = std::env::var_os("VOC_NO_GPU_PIPE").is_some();
+    let mut cap_vendor: Option<u32> = None;
+    let (mut scale, mut calm) = (1.0f32, 0u32);
+    stats.rate_pct.store(100, Ordering::Relaxed);
     let mut hw_broken = false;
     let mut frame_no = 0u32;
     let mut buf = Vec::new();
@@ -529,7 +632,7 @@ fn encode_loop(
     let mut last_key = Instant::now();
     let mut last_watchers = 0u32;
     while !stop.load(Ordering::Relaxed) {
-        let Ok(raw) = rx.recv_timeout(Duration::from_millis(300)) else { continue };
+        let Ok(frame) = rx.recv_timeout(Duration::from_millis(300)) else { continue };
         let Some(link) = state.current_link() else { continue };
         let ver = link.watchers_version();
         if !link.has_watchers() {
@@ -548,8 +651,42 @@ fn encode_loop(
             link.watcher_ids().iter().map(|id| all.get(id).cloned().unwrap_or_default()).collect()
         };
         let plan = plan_encoder(if hw_broken { "software" } else { &pref }, &common_decoders(&caps), hw_encoders());
+        // 显卡直通的条件：用硬件编码器，且编码器和画面在同一块显卡上（笔记本核显出画面、独显编码时不行）
+        let gpu_ok = !gpu_broken && plan.1.as_ref().is_some_and(|i| cap_vendor.is_none_or(|v| v == i.vendor));
+        gpu_flag.store(gpu_ok, Ordering::Relaxed);
         let te = Instant::now();
-        let r = enc.encode(&raw.data, raw.w, raw.h, &plan, key);
+        let r = match frame {
+            CapFrame::Gpu(g) => {
+                if cap_vendor.is_none() {
+                    cap_vendor = crate::mf::gpu::vendor_of(g.luid);
+                    if !plan.1.as_ref().is_some_and(|i| Some(i.vendor) == cap_vendor) {
+                        gpu_flag.store(false, Ordering::Relaxed);
+                        continue; // 换成拷回内存，下一帧走 CPU 转换
+                    }
+                }
+                if !gpu_ok {
+                    continue;
+                }
+                match enc.encode_gpu(&g, &plan, key) {
+                    Ok(f) => {
+                        *stats.pipeline.lock().unwrap() = "显卡直通".into();
+                        Ok(f)
+                    }
+                    Err(e) => {
+                        // 显卡直通不行：这次共享改用 CPU 转换（硬件编码照用）
+                        *stats.error.lock().unwrap() = Some(format!("显卡直通不可用（{e}），已改用 CPU 转换"));
+                        gpu_broken = true;
+                        gpu_flag.store(false, Ordering::Relaxed);
+                        force_key.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            }
+            CapFrame::Cpu(raw) => {
+                *stats.pipeline.lock().unwrap() = "CPU 转换".into();
+                enc.encode(&raw.data, raw.w, raw.h, &plan, key)
+            }
+        };
         sec_enc += te.elapsed();
         sec_all += 1;
         let frames = match r {
@@ -582,6 +719,14 @@ fn encode_loop(
             stats.height.store(ef.height as u32, Ordering::Relaxed);
         }
         if sec_start.elapsed() >= Duration::from_secs(1) {
+            // 码率自适应
+            let new_scale = adapt_rate(scale, &mut calm, key_requests.swap(0, Ordering::Relaxed), link.take_pace_drops());
+            if (new_scale - scale).abs() > 0.01 {
+                scale = new_scale;
+                enc.set_rate_scale(scale);
+                link.set_video_bps((full_bps as f32 * scale) as u32);
+            }
+            stats.rate_pct.store((scale * 100.0).round() as u32, Ordering::Relaxed);
             let secs = sec_start.elapsed().as_secs_f64();
             stats.fps.store((sec_frames as f64 / secs).round() as u32, Ordering::Relaxed);
             stats.kbps.store((sec_bytes as f64 * 8.0 / 1000.0 / secs) as u32, Ordering::Relaxed);
@@ -933,6 +1078,37 @@ mod tests {
         let black = [0u8, 0, 0, 255].repeat(16);
         bgra_to_i420(&black, 4, 4, 2, 2, &mut out);
         assert!(out[..4].iter().all(|&y| y == 16));
+    }
+
+    #[test]
+    fn bitrate_adapts_to_congestion() {
+        let mut calm = 0;
+        let mut s = 1.0f32;
+        // 观看者一秒内要了 3 次关键帧：降到 70%
+        s = adapt_rate(s, &mut calm, 3, 0);
+        assert!((s - 0.7).abs() < 1e-4);
+        // 匀速队列丢包：再降
+        s = adapt_rate(s, &mut calm, 0, 2);
+        assert!((s - 0.49).abs() < 1e-4);
+        // 一直拥堵：最低 30%
+        for _ in 0..10 {
+            s = adapt_rate(s, &mut calm, 5, 0);
+        }
+        assert!((s - 0.3).abs() < 1e-4);
+        // 偶尔一次关键帧请求（新观看者）不算拥堵
+        let t = adapt_rate(s, &mut calm, 1, 0);
+        assert_eq!(t, s);
+        // 连续 4 秒正常后每秒回升 10%，最多到 100%
+        for _ in 0..3 {
+            s = adapt_rate(s, &mut calm, 0, 0);
+        }
+        let before = s;
+        s = adapt_rate(s, &mut calm, 0, 0);
+        assert!(s > before);
+        for _ in 0..30 {
+            s = adapt_rate(s, &mut calm, 0, 0);
+        }
+        assert_eq!(s, 1.0);
     }
 
     #[test]
