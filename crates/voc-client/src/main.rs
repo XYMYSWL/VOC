@@ -6,6 +6,8 @@ mod audio;
 mod autostart;
 mod denoise;
 mod images;
+mod loopback;
+mod streams;
 mod e2e;
 mod mf;
 mod net;

@@ -577,7 +577,7 @@ fn screen_share_watch_relay_and_keyframes() {
 
     // 不在共享时不能观看
     b.send(ClientMsg::Watch { target: aid, on: true });
-    a.send(ClientMsg::ShareStart { desc: "720p30".into() });
+    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.as_deref() == Some("720p30")));
     // 之前那次 Watch 无效，alice 此时没有观看者；现在正式观看
     b.send(ClientMsg::Watch { target: aid, on: true });
@@ -689,7 +689,7 @@ fn voice_and_video_direct_lists_are_independent() {
     }
     let (aid, bid) = (a.id, b.id);
     a.wait_for(|m| matches!(m, ServerMsg::Peers { peers } if peers.iter().any(|p| p.id == bid)));
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into() });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.is_some()));
     b.send(ClientMsg::Watch { target: aid, on: true });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids } if ids == &vec![bid]));
@@ -814,4 +814,60 @@ fn image_chunks_go_to_same_channel_only() {
     // 格式不对的块被丢弃（块数超上限）
     a.send_raw_frame(KIND_FILE, &file::client_chunk(200, 0, file::MAX_CHUNKS + 1, &ct));
     assert!(b.wait_frame(KIND_FILE, 500).is_none());
+}
+
+/// 伴奏：发给同频道所有没静音的人（发送者闭麦也照转）；屏幕共享声音只发给观看者
+#[test]
+fn music_and_share_audio_forwarding() {
+    let srv = Server::start(11);
+    let codes = srv.gen_codes(4);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
+    let mut c = Client::connect(srv.port, &codes[2], "carol").unwrap();
+    let mut d = Client::connect(srv.port, &codes[3], "dave").unwrap();
+    for x in [&mut a, &mut b, &mut c, &mut d] {
+        x.enable_udp();
+    }
+    for x in [&mut a, &mut b, &mut c] {
+        x.send(ClientMsg::JoinChannel { channel_id: 1 });
+    }
+    d.send(ClientMsg::JoinChannel { channel_id: 2 });
+    let aid = a.id;
+    a.send(ClientMsg::SetMusic { name: Some("网易云音乐".into()) });
+    a.send(ClientMsg::SetState { muted: true, deafened: false }); // 闭麦也能放伴奏
+    c.send(ClientMsg::SetState { muted: true, deafened: true }); // carol 静音：收不到
+    // 两件事的广播顺序不定：一次等齐
+    let cid = c.id;
+    b.wait_state(|u| {
+        u.iter().any(|x| x.id == aid && x.music.as_deref() == Some("网易云音乐") && x.muted)
+            && u.iter().any(|x| x.id == cid && x.deafened)
+    });
+
+    a.udp_send(udp::MUSIC, &udp::client_voice(1, &frame()));
+    let (k, data) = b.udp_recv().expect("bob hears the music");
+    assert_eq!(k, udp::MUSIC);
+    assert_eq!(udp::read_server_voice(&data).unwrap().0, aid);
+    assert!(c.udp_recv().is_none(), "deafened member gets nothing");
+    assert!(d.udp_recv().is_none(), "other channel gets nothing");
+    // 停止伴奏后再发的包不转
+    a.send(ClientMsg::SetMusic { name: None });
+    b.wait_state(|u| u.iter().any(|x| x.id == aid && x.music.is_none()));
+    a.udp_send(udp::MUSIC, &udp::client_voice(2, &frame()));
+    assert!(b.udp_recv().is_none(), "music after stop is dropped");
+
+    // 屏幕共享带声音：只有观看者收到
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: true });
+    b.wait_state(|u| u.iter().any(|x| x.id == aid && x.share_audio));
+    b.send(ClientMsg::Watch { target: aid, on: true });
+    b.send(ClientMsg::Ping);
+    b.wait_for(|m| matches!(m, ServerMsg::Pong));
+    a.udp_send(udp::SHARE_AUDIO, &udp::client_voice(1, &frame()));
+    let (k, _) = b.udp_recv().expect("viewer hears the shared audio");
+    assert_eq!(k, udp::SHARE_AUDIO);
+    c.send(ClientMsg::SetState { muted: false, deafened: false });
+    c.send(ClientMsg::Ping);
+    c.wait_for(|m| matches!(m, ServerMsg::Pong));
+    a.udp_send(udp::SHARE_AUDIO, &udp::client_voice(2, &frame()));
+    assert!(b.udp_recv().is_some());
+    assert!(c.udp_recv().is_none(), "non-viewer does not get shared audio");
 }

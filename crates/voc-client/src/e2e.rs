@@ -297,6 +297,16 @@ impl E2e {
         self.keyring.by_sender.get_mut(&from)?.decrypt_video(from, blob)
     }
 
+    /// 加密自己的一帧伴奏 / 共享声音（独立的密钥和计数器）
+    pub fn encrypt_stream(&mut self, stream: u8, frame: &[u8]) -> Vec<u8> {
+        self.sender.encrypt_stream(self.my_id, stream, frame)
+    }
+
+    /// 解密别人的一帧伴奏 / 共享声音，返回 (该流的帧计数器, Opus)
+    pub fn decrypt_stream(&mut self, from: u32, stream: u8, blob: &[u8]) -> Option<(u32, Vec<u8>)> {
+        self.keyring.by_sender.get_mut(&from)?.decrypt_stream(from, stream, blob)
+    }
+
     /// 解密别人的一帧语音，返回 (帧计数器, Opus)
     pub fn decrypt_frame(&mut self, from: u32, blob: &[u8]) -> Option<(u32, Vec<u8>)> {
         self.keyring.by_sender.get_mut(&from)?.decrypt(from, blob)

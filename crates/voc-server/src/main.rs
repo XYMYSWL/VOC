@@ -64,6 +64,10 @@ struct User {
     last_watchers: Vec<u32>,
     /// 能解码的视频格式
     decoders: Vec<String>,
+    /// 正在放伴奏的程序名
+    music: Option<String>,
+    /// 屏幕共享带声音
+    share_audio: bool,
     /// 最近一次链路质量上报（成员中继用）
     stats: Option<LinkReport>,
     /// 上次发给我的中继路线
@@ -122,6 +126,8 @@ impl State {
                 decoders: u.decoders.clone(),
                 p2p: u.p2p.is_some(),
                 udp: u.voice_udp,
+                music: u.music.clone(),
+                share_audio: u.sharing.is_some() && u.share_audio,
             })
             .collect();
         users.sort_by_key(|u| u.id);
@@ -208,6 +214,34 @@ impl State {
                 u.send(ServerMsg::Watchers { ids: w });
             }
         }
+    }
+
+    /// 转发伴奏（给同频道所有没静音的人，发送者闭麦也照转）/ 屏幕共享声音（给观看者）。已直连的不转。
+    fn forward_stream(&mut self, from: u32, kind: u8, seq: u16, frame: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
+        let Some(u) = self.users.get(&from) else { return Vec::new() };
+        let Some(ch) = u.channel else { return Vec::new() };
+        let music = kind == udp::MUSIC;
+        if music && u.music.is_none() || !music && (u.sharing.is_none() || !u.share_audio) {
+            return Vec::new();
+        }
+        let direct = if music { u.direct.clone() } else { u.direct_video.clone() };
+        let payload = udp::server_voice(from, seq, frame);
+        let mut out = Vec::new();
+        for (id, other) in self.users.iter_mut() {
+            if *id == from || other.channel != Some(ch) || other.deafened || direct.contains(id) {
+                continue;
+            }
+            if !music && !other.watching.contains(&from) {
+                continue;
+            }
+            // 走 TCP 隧道的人收不到（TCP 帧里没有这两种类型）
+            if let (true, Some(addr)) = (other.voice_udp, other.udp) {
+                let mut pkt = Vec::with_capacity(payload.len() + 64);
+                other.udp_seal.seal(kind, &payload, &mut pkt);
+                out.push((addr, pkt));
+            }
+        }
+        out
     }
 
     /// 转发一块图片给同频道的其他人（只转发不保存）
@@ -707,6 +741,8 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 watching: HashSet::new(),
                 last_watchers: Vec::new(),
                 decoders: Vec::new(),
+                music: None,
+                share_audio: false,
                 stats: None,
                 last_relays: Vec::new(),
                 pending_file: pending_file.clone(),
@@ -827,6 +863,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             let Some(u) = st.users.get_mut(&uid) else { return };
             u.channel = Some(channel_id);
             u.stats = None;
+            u.music = None;
             u.direct.clear();
             u.direct_video.clear();
             // 换频道：停止共享和观看
@@ -840,6 +877,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.channel.take().is_some() {
                     u.stats = None;
+                    u.music = None;
                     u.direct.clear();
                     u.direct_video.clear();
                     u.sharing = None;
@@ -940,10 +978,21 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 peer.send(ServerMsg::E2eBlob { from: uid, blob, ts: now_millis() });
             }
         }
-        ClientMsg::ShareStart { desc } => {
+        ClientMsg::SetMusic { name } => {
+            let name = name.map(|n| n.trim().chars().take(40).collect::<String>()).filter(|n| !n.is_empty());
+            if let Some(u) = st.users.get_mut(&uid) {
+                let name = if u.channel.is_some() { name } else { None };
+                if u.music != name {
+                    u.music = name;
+                    st.broadcast_state();
+                }
+            }
+        }
+        ClientMsg::ShareStart { desc, audio } => {
             let desc: String = desc.trim().chars().take(16).collect();
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.channel.is_some() {
+                    u.share_audio = audio;
                     u.sharing = Some(if desc.is_empty() { "屏幕".into() } else { desc });
                     let name = u.name.clone();
                     st.broadcast_state();
@@ -1095,6 +1144,11 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
                     }
                 }
                 udp::VIDEO => out = st.forward_video(uid, &data),
+                udp::MUSIC | udp::SHARE_AUDIO => {
+                    if let Some((seq, f)) = udp::read_client_voice(&data) {
+                        out = st.forward_stream(uid, kind, seq, f);
+                    }
+                }
                 _ => {}
             }
         }

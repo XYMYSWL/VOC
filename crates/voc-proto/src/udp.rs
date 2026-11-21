@@ -11,6 +11,10 @@ pub const PING: u8 = 1;
 pub const PONG: u8 = 2;
 pub const VOICE: u8 = 3;
 pub const VIDEO: u8 = 4;
+/// 伴奏（某个程序的声音，发给整个频道）。格式同 VOICE
+pub const MUSIC: u8 = 5;
+/// 屏幕共享的声音（发给观看者）。格式同 VOICE
+pub const SHARE_AUDIO: u8 = 6;
 
 /// 视频分片数据最大长度（加上各层包头后单个 UDP 包 < 1200 字节，避免 IP 分片）
 pub const VIDEO_FRAG: usize = 1080;

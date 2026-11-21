@@ -411,6 +411,9 @@ pub struct Link {
     last_stats: Mutex<Instant>,
     /// 屏幕画面的匀速发送队列（语音不走这里，直接发）
     pace_tx: Mutex<Option<Sender<(Instant, SocketAddr, Vec<u8>)>>>,
+    /// 伴奏 / 共享声音的外层序号（只给服务器去重用；端到端的计数器在密文里）
+    music_seq: AtomicU16,
+    share_seq: AtomicU16,
 }
 
 impl Link {
@@ -600,6 +603,38 @@ impl Link {
             } else {
                 self.tcp_send(Outgoing::Video(f.clone()));
             }
+        }
+    }
+
+    /// 发送一帧伴奏（给同频道所有人）/ 屏幕共享声音（给观看者）：能直连的直接发，其余交给服务器
+    pub fn send_stream(&self, kind: u8, blob: &[u8], buf: &mut Vec<u8>) {
+        let music = kind == udp::MUSIC;
+        let seq = if music { &self.music_seq } else { &self.share_seq }.fetch_add(1, Ordering::Relaxed);
+        let others = self.others.lock().unwrap().clone();
+        let targets: Vec<u32> = if music {
+            others
+        } else {
+            self.watchers.lock().unwrap().iter().copied().filter(|w| others.contains(w)).collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let mut sent = 0;
+        if self.p2p_active() {
+            let chosen = if music { self.alloc.lock().unwrap().0.clone() } else { self.alloc.lock().unwrap().1.clone() };
+            let payload = udp::server_voice(self.my_id, seq, blob);
+            let mut peers = self.peers.lock().unwrap();
+            for id in targets.iter().filter(|i| chosen.contains(i)) {
+                let Some(p) = peers.map.get_mut(id) else { continue };
+                if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
+                    s.seal(kind, &payload, buf);
+                    self.send_raw(buf, path);
+                    sent += 1;
+                }
+            }
+        }
+        if sent < targets.len() && self.udp_ok.load(Ordering::Relaxed) {
+            self.send_server(kind, &udp::client_voice(seq, blob), buf);
         }
     }
 
@@ -873,7 +908,7 @@ impl Link {
                     p.on_pong(&data);
                     p.path = Some(from);
                 }
-                udp::VOICE | udp::VIDEO => return Some((id, kind, data)),
+                udp::VOICE | udp::VIDEO | udp::MUSIC | udp::SHARE_AUDIO => return Some((id, kind, data)),
                 _ => {}
             }
             return None;
@@ -903,6 +938,8 @@ pub struct VoiceState {
     pub video: VideoRx,
     /// 每个在线成员能解码的视频格式（共享时协商编码格式用）
     pub caps: Mutex<HashMap<u32, Vec<String>>>,
+    /// 伴奏 / 屏幕共享声音的解码器：(发送者, 流)
+    stream_decoders: Mutex<HashMap<(u32, u8), UserDecoder>>,
 }
 
 impl VoiceState {
@@ -925,8 +962,56 @@ impl VoiceState {
         }
         self.ping_ms.store(0, Ordering::Relaxed);
         self.decoders.lock().unwrap().clear();
+        self.stream_decoders.lock().unwrap().clear();
         self.video.clear();
         *self.e2e.lock().unwrap() = None;
+    }
+}
+
+/// 处理一帧伴奏 / 屏幕共享声音：解密、去重、丢包补偿、解码，送进这个人对应的混音通道
+pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mutex<Mixer>, pcm: &mut Vec<i16>) {
+    let Some((from, _, blob)) = udp::read_server_voice(payload) else { return };
+    let stream = if kind == udp::MUSIC { voc_proto::e2e::STREAM_MUSIC } else { voc_proto::e2e::STREAM_SHARE };
+    let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
+    let Some((ctr, data)) = e2e.lock().unwrap().decrypt_stream(from, stream, blob) else { return };
+    let seq = ctr as u16;
+    let mut decs = state.stream_decoders.lock().unwrap();
+    let d = match decs.entry((from, stream)) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            let Ok(dec) = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) else { return };
+            v.insert(UserDecoder { dec, last_seq: None })
+        }
+    };
+    pcm.resize(FRAME_SAMPLES * 3, 0);
+    let mut frames: Vec<(u16, Vec<i16>)> = Vec::new();
+    if let Some(last) = d.last_seq {
+        if !seq_newer(seq, last) {
+            return;
+        }
+        let gap = seq.wrapping_sub(last).wrapping_sub(1);
+        if (1..=5).contains(&gap) {
+            for i in 0..gap {
+                let s = last.wrapping_add(1 + i);
+                let n = if i + 1 == gap {
+                    d.dec.decode(&data, &mut pcm[..FRAME_SAMPLES], true)
+                } else {
+                    d.dec.decode(&[], &mut pcm[..FRAME_SAMPLES], false)
+                };
+                if let Ok(n) = n {
+                    frames.push((s, pcm[..n].to_vec()));
+                }
+            }
+        }
+    }
+    let Ok(n) = d.dec.decode(&data, &mut pcm[..], false) else { return };
+    d.last_seq = Some(seq);
+    frames.push((seq, pcm[..n].to_vec()));
+    drop(decs);
+    let id = crate::audio::stream_mixer_id(kind, from);
+    let mut m = mixer.lock().unwrap();
+    for (s, f) in frames {
+        m.push(id, s, &f);
     }
 }
 
@@ -1033,6 +1118,8 @@ pub fn connect(
         relays: Mutex::new(Vec::new()),
         last_stats: Mutex::new(Instant::now()),
         pace_tx: Mutex::new(None),
+        music_seq: AtomicU16::new(0),
+        share_seq: AtomicU16::new(0),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1091,11 +1178,13 @@ pub fn connect(
                     }
                     udp::VOICE => on_server_voice(&data, &state, &mixer, &mut pcm),
                     udp::VIDEO => on_server_video(&data, &state),
+                    udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &data, &state, &mixer, &mut pcm),
                     _ => {}
                 }
             } else if let Some((peer, kind, v)) = l.on_peer_packet(from, pkt, &mut out) {
                 match kind {
                     udp::VIDEO => on_server_video(&v, &state),
+                    udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &v, &state, &mixer, &mut pcm),
                     _ => {
                         l.relay_forward(peer, &v, &mut out);
                         on_server_voice(&v, &state, &mixer, &mut pcm);
@@ -1723,6 +1812,86 @@ mod tests {
         // 4 Mbps 下约 120 KB 要 ~230 ms；至少要明显摊开
         assert!(took > Duration::from_millis(150), "not paced: {took:?}");
         st.disconnect();
+    }
+
+    /// 两个真实 Link 直连：A 发伴奏帧，B 解密解码进「A 的伴奏」混音通道；语音的帧序号不受影响
+    fn music_pair() -> (Arc<Link>, Arc<VoiceState>, Arc<Link>, Arc<VoiceState>, Arc<Mutex<Mixer>>, Arc<Mutex<E2e>>) {
+        use std::sync::mpsc;
+        let keys = test_keys();
+        let (ea, eb) = e2e_pair(3, 7);
+        let dummy_server: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (tx, _rx) = mpsc::channel::<Outgoing>();
+        let sa = Arc::new(VoiceState::default());
+        connect(dummy_server, &keys, 3, true, ea.clone(), tx, sa.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
+        let (tx, _rx2) = mpsc::channel::<Outgoing>();
+        let sb = Arc::new(VoiceState::default());
+        let mb = Arc::new(Mutex::new(Mixer::default()));
+        connect(dummy_server, &keys, 7, true, eb, tx, sb.clone(), mb.clone()).unwrap();
+        let (la, lb) = (sa.current_link().unwrap(), sb.current_link().unwrap());
+        let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
+        la.set_others(vec![7]);
+        lb.set_others(vec![3]);
+        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
+        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }]);
+        let t = Instant::now();
+        while !la.allocation().0.contains(&7) {
+            assert!(t.elapsed() < Duration::from_secs(5), "never went direct");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        la.in_channel.store(true, Ordering::Relaxed);
+        (la, sa, lb, sb, mb, ea)
+    }
+
+    fn music_buffered(mb: &Mutex<Mixer>, from: u32) -> bool {
+        mb.lock().unwrap().buffer_ms(crate::audio::stream_mixer_id(udp::MUSIC, from)).is_some()
+    }
+
+    #[test]
+    fn music_stream_reaches_peer_mixer() {
+        let (la, sa, _lb, sb, mb, ea) = music_pair();
+        let mut enc = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Audio).unwrap();
+        let mut out = vec![0u8; 1500];
+        let mut pkt = Vec::new();
+        for i in 0..10 {
+            let pcm: Vec<i16> = (0..FRAME_SAMPLES).map(|j| (((i * FRAME_SAMPLES + j) as f32 * 0.05).sin() * 8000.0) as i16).collect();
+            let n = enc.encode(&pcm, &mut out).unwrap();
+            let blob = ea.lock().unwrap().encrypt_stream(voc_proto::e2e::STREAM_MUSIC, &out[..n]);
+            la.send_stream(udp::MUSIC, &blob, &mut pkt);
+        }
+        let t = Instant::now();
+        while !music_buffered(&mb, 3) {
+            assert!(t.elapsed() < Duration::from_secs(2), "music did not reach B's mixer");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 伴奏不算说话（不亮绿圈），语音解码器不受影响
+        assert!(!sb.is_speaking(3));
+        assert!(sb.decoders.lock().unwrap().get(&3).is_none());
+        sa.disconnect();
+        sb.disconnect();
+    }
+
+    /// 真机：PowerShell 播一段声音，A 选它当伴奏 → B 的混音里出现 A 的伴奏。
+    /// cargo test -p voc-client music_from_real_program -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn music_from_real_program() {
+        let (_la, sa, _lb, sb, mb, _ea) = music_pair();
+        let player = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "[console]::beep(440, 4000)"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        let gain = Arc::new(crate::audio::AtomicF32::new(1.0));
+        let src = crate::streams::start(udp::MUSIC, crate::loopback::Target::Include(player.id()), sa.clone(), gain).expect("start music");
+        let t = Instant::now();
+        while !music_buffered(&mb, 3) {
+            assert!(t.elapsed() < Duration::from_secs(4), "program audio did not reach B");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("B 收到 A 的伴奏，缓冲 {:?} ms", mb.lock().unwrap().buffer_ms(crate::audio::stream_mixer_id(udp::MUSIC, 3)));
+        drop(src);
+        sa.disconnect();
+        sb.disconnect();
     }
 
     /// 真实屏幕采集 → 720p H.264 → 端到端加密 → 两个真实 Link P2P 直连 → 解码。

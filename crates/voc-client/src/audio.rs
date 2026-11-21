@@ -17,6 +17,19 @@ pub const CAPTURE_FRAME: usize = 480;
 pub const LOOPBACK_ID: u32 = 0;
 /// 提示音在混音器里使用的 id
 pub const SFX_ID: u32 = u32::MAX;
+/// 伴奏、屏幕共享声音在混音器里的 id：用户 id 加上标志位（每人各一路，音量单独调）
+pub const MUSIC_FLAG: u32 = 0x4000_0000;
+pub const SHARE_FLAG: u32 = 0x2000_0000;
+const USER_MASK: u32 = 0x0FFF_FFFF;
+
+/// kind = udp::MUSIC / udp::SHARE_AUDIO
+pub fn stream_mixer_id(kind: u8, user: u32) -> u32 {
+    if kind == voc_proto::udp::MUSIC {
+        MUSIC_FLAG | user
+    } else {
+        SHARE_FLAG | user
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Chime {
@@ -290,6 +303,8 @@ impl Stream {
 pub struct Mixer {
     streams: HashMap<u32, Stream>,
     volumes: HashMap<u32, f32>,
+    /// 暂时不播的通道（例如正在看某人带声音的屏幕共享时，他的伴奏已经在共享声音里了）
+    suppressed: std::collections::HashSet<u32>,
 }
 
 impl Mixer {
@@ -338,7 +353,11 @@ impl Mixer {
     }
 
     pub fn retain_users(&mut self, alive: impl Fn(u32) -> bool) {
-        self.streams.retain(|id, _| *id == LOOPBACK_ID || *id == SFX_ID || alive(*id));
+        self.streams.retain(|id, _| *id == LOOPBACK_ID || *id == SFX_ID || alive(*id & USER_MASK));
+    }
+
+    pub fn set_suppressed(&mut self, ids: std::collections::HashSet<u32>) {
+        self.suppressed = ids;
     }
 
     pub fn clear(&mut self) {
@@ -349,6 +368,11 @@ impl Mixer {
     fn next_sample(&mut self) -> f32 {
         let mut sum = 0.0;
         for (id, s) in self.streams.iter_mut() {
+            if self.suppressed.contains(id) {
+                s.buf.clear();
+                s.playing = false;
+                continue;
+            }
             if !s.playing {
                 if s.buf.len() >= s.prebuffer() {
                     s.playing = true;

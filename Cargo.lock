@@ -5332,6 +5332,7 @@ dependencies = [
  "voc-proto",
  "windows",
  "windows-capture",
+ "windows-core",
 ]
 
 [[package]]

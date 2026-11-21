@@ -179,6 +179,46 @@ fn video_key(key: &[u8; 32]) -> ChaCha20Poly1305 {
     ChaCha20Poly1305::new((&out).into())
 }
 
+/// 伴奏 / 屏幕共享声音：各自从语音密钥派生独立的密钥和计数器（不打乱语音的帧序号）
+pub const STREAM_MUSIC: u8 = 0;
+pub const STREAM_SHARE: u8 = 1;
+const STREAMS: usize = 2;
+
+fn stream_key(key: &[u8; 32], stream: u8) -> ChaCha20Poly1305 {
+    let label: &[u8] = if stream == STREAM_MUSIC { b"voc music v1" } else { b"voc share-audio v1" };
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<Sha256>::new(None, key).expand(label, &mut out).expect("hkdf");
+    ChaCha20Poly1305::new((&out).into())
+}
+
+fn stream_aad(sender_id: u32, stream: u8) -> [u8; 6] {
+    let mut a = [b'S'; 6];
+    a[..4].copy_from_slice(&sender_id.to_le_bytes());
+    a[5] = stream;
+    a
+}
+
+/// 64 帧防重放窗口：先检查（不更新）
+fn replay_seen(max: Option<u32>, window: u64, ctr: u32) -> bool {
+    matches!(max, Some(m) if ctr <= m && (m - ctr >= 64 || window & (1u64 << (m - ctr)) != 0))
+}
+
+/// 解密成功后记下这个计数器
+fn replay_mark(max: &mut Option<u32>, window: &mut u64, ctr: u32) {
+    match *max {
+        Some(m) if ctr <= m => *window |= 1u64 << (m - ctr),
+        Some(m) => {
+            let shift = ctr - m;
+            *window = if shift >= 64 { 0 } else { *window << shift } | 1;
+            *max = Some(ctr);
+        }
+        None => {
+            *max = Some(ctr);
+            *window = 1;
+        }
+    }
+}
+
 fn video_aad(sender_id: u32) -> [u8; 5] {
     let mut a = [b'V'; 5];
     a[..4].copy_from_slice(&sender_id.to_le_bytes());
@@ -193,6 +233,8 @@ pub struct SenderKey {
     aead: ChaCha20Poly1305,
     video_ctr: u32,
     video_aead: ChaCha20Poly1305,
+    stream_ctr: [u32; STREAMS],
+    stream_aead: [ChaCha20Poly1305; STREAMS],
 }
 
 impl SenderKey {
@@ -205,7 +247,23 @@ impl SenderKey {
             aead: ChaCha20Poly1305::new((&key).into()),
             video_ctr: 0,
             video_aead: video_key(&key),
+            stream_ctr: [0; STREAMS],
+            stream_aead: [stream_key(&key, STREAM_MUSIC), stream_key(&key, STREAM_SHARE)],
         }
+    }
+
+    /// 加密一帧伴奏 / 共享声音：epoch(2) | ctr(4) | AEAD
+    pub fn encrypt_stream(&mut self, sender_id: u32, stream: u8, frame: &[u8]) -> Vec<u8> {
+        let i = (stream as usize).min(STREAMS - 1);
+        let ctr = self.stream_ctr[i];
+        self.stream_ctr[i] = ctr.wrapping_add(1);
+        let ct = self.stream_aead[i]
+            .encrypt(&frame_nonce(self.epoch, ctr), Payload { msg: frame, aad: &stream_aad(sender_id, stream) })
+            .expect("enc");
+        let mut out = self.epoch.to_le_bytes().to_vec();
+        out.extend_from_slice(&ctr.to_le_bytes());
+        out.extend_from_slice(&ct);
+        out
     }
 
     /// 加密一整帧视频（加密后再分片）：epoch(2) | ctr(4) | AEAD
@@ -255,6 +313,9 @@ struct EpochKey {
     window: u64,
     video_aead: ChaCha20Poly1305,
     video_max: Option<u32>,
+    stream_aead: [ChaCha20Poly1305; STREAMS],
+    stream_max: [Option<u32>; STREAMS],
+    stream_window: [u64; STREAMS],
 }
 
 /// 某个发送者的语音密钥（保留最近几个 epoch，换密钥时在途的包也能解）
@@ -279,6 +340,9 @@ impl ReceiverKeys {
                 window: 0,
                 video_aead: video_key(&key),
                 video_max: None,
+                stream_aead: [stream_key(&key, STREAM_MUSIC), stream_key(&key, STREAM_SHARE)],
+                stream_max: [None; STREAMS],
+                stream_window: [0; STREAMS],
             },
         ));
         if self.epochs.len() > 3 {
@@ -326,6 +390,25 @@ impl ReceiverKeys {
 }
 
 impl ReceiverKeys {
+    /// 解密一帧伴奏 / 共享声音，返回 (该流自己的帧计数器, Opus)。重放/篡改返回 None。
+    pub fn decrypt_stream(&mut self, sender_id: u32, stream: u8, blob: &[u8]) -> Option<(u32, Vec<u8>)> {
+        if blob.len() < 6 + 16 || stream as usize >= STREAMS {
+            return None;
+        }
+        let i = stream as usize;
+        let epoch = u16::from_le_bytes([blob[0], blob[1]]);
+        let ctr = u32::from_le_bytes(blob[2..6].try_into().ok()?);
+        let (_, k) = self.epochs.iter_mut().find(|(e, _)| *e == epoch)?;
+        if replay_seen(k.stream_max[i], k.stream_window[i], ctr) {
+            return None;
+        }
+        let pt = k.stream_aead[i]
+            .decrypt(&frame_nonce(epoch, ctr), Payload { msg: &blob[6..], aad: &stream_aad(sender_id, stream) })
+            .ok()?;
+        replay_mark(&mut k.stream_max[i], &mut k.stream_window[i], ctr);
+        Some((ctr, pt))
+    }
+
     /// 解密一整帧视频。帧计数器必须递增（旧帧 / 重放直接丢弃——视频只要最新的）。
     pub fn decrypt_video(&mut self, sender_id: u32, blob: &[u8]) -> Option<Vec<u8>> {
         if blob.len() < 6 + 16 {
@@ -432,5 +515,29 @@ mod tests {
         assert!(rk.decrypt_video(6, &sk.encrypt_video(5, b"x")).is_none(), "wrong sender");
         // 视频密文不能当语音解
         assert!(rk.decrypt(5, &sk.encrypt_video(5, b"y")).is_none());
+    }
+
+    #[test]
+    fn music_and_share_streams_are_independent() {
+        let mut sk = SenderKey::new(3);
+        let mut rk = ReceiverKeys::default();
+        assert!(rk.install(&sk.export()));
+        let v0 = sk.encrypt(7, b"voice-0");
+        let m0 = sk.encrypt_stream(7, STREAM_MUSIC, b"music-0");
+        let m1 = sk.encrypt_stream(7, STREAM_MUSIC, b"music-1");
+        let s0 = sk.encrypt_stream(7, STREAM_SHARE, b"share-0");
+        let v1 = sk.encrypt(7, b"voice-1");
+        // 语音计数器不受伴奏影响：0, 1 连续
+        assert_eq!(rk.decrypt(7, &v0).unwrap().0, 0);
+        assert_eq!(rk.decrypt(7, &v1).unwrap().0, 1);
+        // 伴奏、共享声音各自从 0 数
+        assert_eq!(rk.decrypt_stream(7, STREAM_MUSIC, &m0), Some((0, b"music-0".to_vec())));
+        assert_eq!(rk.decrypt_stream(7, STREAM_MUSIC, &m1), Some((1, b"music-1".to_vec())));
+        assert_eq!(rk.decrypt_stream(7, STREAM_SHARE, &s0), Some((0, b"share-0".to_vec())));
+        // 重放、换流、换发送者、当语音解都不行
+        assert!(rk.decrypt_stream(7, STREAM_MUSIC, &m0).is_none(), "replay");
+        assert!(rk.decrypt_stream(7, STREAM_SHARE, &m1).is_none(), "wrong stream");
+        assert!(rk.decrypt_stream(8, STREAM_MUSIC, &m1).is_none(), "wrong sender");
+        assert!(rk.decrypt(7, &m1).is_none(), "music is not voice");
     }
 }

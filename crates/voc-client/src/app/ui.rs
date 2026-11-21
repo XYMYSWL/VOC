@@ -379,6 +379,13 @@ impl App {
                                 } else if th::icon_button(ui, "🖥", "共享屏幕", Tone::Normal).clicked() {
                                     self.show_share = true;
                                 }
+                                let tone = if self.music.is_some() { Tone::Accent } else { Tone::Normal };
+                                if th::icon_button(ui, "🎵", "伴奏：把某个程序的声音放给频道里的人", tone).clicked() {
+                                    self.music_window = !self.music_window;
+                                    if self.music_window {
+                                        self.music_apps = crate::loopback::audio_apps();
+                                    }
+                                }
                             }
                             if th::icon_button(ui, "⚙", "设置", Tone::Normal).clicked() {
                                 self.show_settings = !self.show_settings;
@@ -480,7 +487,7 @@ impl App {
                             } else {
                                 Some(th::LinkState::Preparing)
                             };
-                            if link_state.is_some() || u.sharing.is_some() || relaying > 0 {
+                            if link_state.is_some() || u.sharing.is_some() || relaying > 0 || u.music.is_some() {
                                 ui.horizontal(|ui| {
                                     ui.add_space(48.0);
                                     ui.spacing_mut().item_spacing.x = 4.0;
@@ -528,6 +535,10 @@ impl App {
                                             lines.join("\n")
                                         ));
                                     }
+                                    if let Some(name) = &u.music {
+                                        let tip = if is_me { "你正在放伴奏" } else { "伴奏中。右键名字可以单独调伴奏音量" };
+                                        th::pill(ui, format!("🎵 {name}"), th::ACCENT_HOVER, th::ACCENT_SOFT).on_hover_text(tip);
+                                    }
                                     if let Some(desc) = &u.sharing {
                                         if is_me {
                                             th::pill(ui, format!("🖥 共享中 {desc}"), th::ACCENT_HOVER, th::ACCENT_SOFT);
@@ -560,6 +571,14 @@ impl App {
                                         let mut v = m.volume(u.id) * 100.0;
                                         if ui.add(egui::Slider::new(&mut v, 0.0..=200.0).suffix("%").text("音量")).changed() {
                                             m.set_volume(u.id, v / 100.0);
+                                        }
+                                    }
+                                    if u.music.is_some() {
+                                        let mid = crate::audio::stream_mixer_id(voc_proto::udp::MUSIC, u.id);
+                                        let mut m = self.mixer.lock().unwrap();
+                                        let mut v = m.volume(mid) * 100.0;
+                                        if ui.add(egui::Slider::new(&mut v, 0.0..=200.0).suffix("%").text("伴奏音量")).changed() {
+                                            m.set_volume(mid, v / 100.0);
                                         }
                                     }
                                     // 嘴到耳延迟：按实际走的线路估算
@@ -1284,13 +1303,18 @@ impl App {
                 if let Some(e) = &self.share_error {
                     ui.label(RichText::new(e).color(th::RED));
                 }
+                ui.add_space(6.0);
+                let can_audio = crate::loopback::supported();
+                ui.add_enabled(can_audio, egui::Checkbox::new(&mut self.cfg.share_audio, "同时共享电脑声音（不含 VOC 自己的声音）"))
+                    .on_hover_text("游戏、视频的声音会一起发给正在看的人；队友的说话声、提示音不会被录进去。")
+                    .on_disabled_hover_text("共享电脑声音需要 Windows 11");
                 ui.add_space(8.0);
                 start = th::primary_button(ui, "开始共享", ui.available_width(), true).clicked();
             });
         if start {
             match Sharer::start(self.cfg.share.clone(), self.voice.clone()) {
                 Ok(sh) => {
-                    s.send(ClientMsg::ShareStart { desc: self.cfg.share.desc() });
+                    s.send(ClientMsg::ShareStart { desc: self.cfg.share.desc(), audio: self.cfg.share_audio && crate::loopback::supported() });
                     self.sharer = Some(sh);
                     self.share_confirmed = false;
                     self.share_error = None;
@@ -1327,6 +1351,12 @@ impl App {
     fn ui_viewers(&mut self, ctx: &egui::Context) {
         let Screen::Main(s) = &mut self.screen else { return };
         let mut close = Vec::new();
+        let mut go_full: Option<u32> = None;
+        let mut exit_full = false;
+        let mixer = self.mixer.clone();
+        if ctx.input(|i| i.pointer.delta() != Vec2::ZERO) {
+            self.fs_mouse_at = std::time::Instant::now();
+        }
         for (id, v) in self.views.iter_mut() {
             if let Some(f) = v.view.frame.lock().unwrap().as_ref() {
                 if f.seq != v.seq {
@@ -1342,6 +1372,49 @@ impl App {
             let user = s.users.iter().find(|u| u.id == *id);
             let name = user.map(|u| u.name.clone()).unwrap_or_default();
             let desc = user.and_then(|u| u.sharing.clone()).unwrap_or_default();
+            // 全屏：整个窗口只显示画面，鼠标 2 秒不动就隐藏工具栏
+            if self.fullscreen == Some(*id) {
+                let screen = ctx.content_rect();
+                let show_bar = self.fs_mouse_at.elapsed() < std::time::Duration::from_secs(2);
+                egui::Area::new(egui::Id::unique(("fullscreen", *id))).fixed_pos(screen.min).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
+                    let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                    if let Some(t) = &v.tex {
+                        let (w, h) = (v.size.0.max(1) as f32, v.size.1.max(1) as f32);
+                        let scale = (rect.width() / w).min(rect.height() / h);
+                        let img = egui::Rect::from_center_size(rect.center(), Vec2::new(w * scale, h * scale));
+                        ui.painter().image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    if resp.double_clicked() {
+                        exit_full = true;
+                    }
+                    if show_bar {
+                        let bar = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width(), 44.0));
+                        ui.painter().rect_filled(bar, 0.0, Color32::from_black_alpha(170));
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(Vec2::new(16.0, 8.0))));
+                        child.horizontal(|ui| {
+                            ui.label(RichText::new(format!("📺 {name} 的屏幕 · {desc} · {} fps", v.view.fps.load(Ordering::Relaxed))).color(Color32::WHITE));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("退出全屏").clicked() {
+                                    exit_full = true;
+                                }
+                                if user.is_some_and(|u| u.share_audio) {
+                                    let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
+                                    let mut m = mixer.lock().unwrap();
+                                    let mut vol = m.volume(sid) * 100.0;
+                                    if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").text("🔊")).changed() {
+                                        m.set_volume(sid, vol / 100.0);
+                                    }
+                                }
+                            });
+                        });
+                    }
+                });
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    exit_full = true;
+                }
+                continue;
+            }
             let mut open = true;
             egui::Window::new(RichText::new(format!("📺 {name} 的屏幕")).strong())
                 .id(egui::Id::unique(("viewer", *id)))
@@ -1359,6 +1432,17 @@ impl App {
                             th::pill(ui, dec, th::TEXT_DIM, th::BG_ELEVATED);
                         }
                         th::pill(ui, "🔒 端到端加密", th::GREEN, th::GREEN_SOFT);
+                        if user.is_some_and(|u| u.share_audio) {
+                            let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
+                            let mut m = mixer.lock().unwrap();
+                            let mut vol = m.volume(sid) * 100.0;
+                            if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").text("🔊")).on_hover_text("共享的声音音量").changed() {
+                                m.set_volume(sid, vol / 100.0);
+                            }
+                        }
+                        if ui.button("全屏").on_hover_text("全屏观看（双击画面也可以；Esc 退出）").clicked() {
+                            go_full = Some(*id);
+                        }
                     });
                     match &v.tex {
                         Some(t) => {
@@ -1366,7 +1450,12 @@ impl App {
                             let (w, h) = (v.size.0.max(1) as f32, v.size.1.max(1) as f32);
                             let scale = (avail.x / w).min(avail.y / h).max(0.05);
                             ui.centered_and_justified(|ui| {
-                                ui.add(egui::Image::new(egui::load::SizedTexture::new(t.id(), Vec2::new(w * scale, h * scale))));
+                                let r = ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::new(t.id(), Vec2::new(w * scale, h * scale))).sense(Sense::click()),
+                                );
+                                if r.double_clicked() {
+                                    go_full = Some(*id);
+                                }
                             });
                         }
                         None => {
@@ -1382,6 +1471,95 @@ impl App {
             self.views.remove(&id);
             self.voice.video.watch(id, false);
             s.send(ClientMsg::Watch { target: id, on: false });
+        }
+        if let Some(id) = go_full {
+            self.fullscreen = Some(id);
+            self.fs_mouse_at = std::time::Instant::now();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        }
+        // 对方停止共享（观看窗口没了）也要退出全屏
+        if exit_full || self.fullscreen.is_some_and(|id| !self.views.contains_key(&id)) {
+            if self.fullscreen.take().is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+        }
+    }
+
+    /// 伴奏窗口：选一个正在出声的程序，把它的声音放给频道里的人
+    fn ui_music(&mut self, ctx: &egui::Context) {
+        if !self.music_window {
+            return;
+        }
+        let in_channel = matches!(&self.screen, Screen::Main(s) if s.me().is_some_and(|u| u.channel_id.is_some()));
+        let mut open = true;
+        let mut start: Option<(u32, String)> = None;
+        let mut stop = false;
+        let mut monitor: Option<f32> = None;
+        let mut refresh = false;
+        egui::Window::new(RichText::new("🎵 伴奏").strong())
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                if !crate::loopback::supported() {
+                    ui.label(RichText::new("伴奏需要 Windows 11（Windows 10 build 20348 以上）。").color(th::YELLOW));
+                    return;
+                }
+                if !in_channel {
+                    ui.label(RichText::new("进入语音频道后才能放伴奏。").color(th::TEXT_DIM));
+                    return;
+                }
+                if let Some(m) = &self.music {
+                    ui.label(format!("正在把「{}」的声音放给频道里的人", m.name));
+                    ui.add_space(6.0);
+                    let mut v = m.monitor * 100.0;
+                    if ui.add(egui::Slider::new(&mut v, 5.0..=100.0).suffix("%").text("我这边听到的音量")).changed() {
+                        monitor = Some(v / 100.0);
+                    }
+                    ui.label(
+                        RichText::new("只影响你自己听到的大小，别人听到的不变；每个人也可以右键你的名字单独调。")
+                            .size(11.5)
+                            .color(th::TEXT_FAINT),
+                    );
+                    ui.add_space(8.0);
+                    if ui.button("⏹ 停止伴奏").clicked() {
+                        stop = true;
+                    }
+                } else {
+                    ui.label(RichText::new("选一个正在出声的程序（音乐播放器等），把它的声音放给频道里的人。不经过麦克风，闭麦也照放。").size(12.0).color(th::TEXT_DIM));
+                    ui.add_space(6.0);
+                    if ui.button("🔄 刷新程序列表").clicked() {
+                        refresh = true;
+                    }
+                    ui.add_space(4.0);
+                    if self.music_apps.is_empty() {
+                        ui.label(RichText::new("没有找到出声的程序：先让程序播放一下，再点刷新。").size(12.0).color(th::TEXT_FAINT));
+                    }
+                    for (pid, name) in &self.music_apps {
+                        if ui.add(egui::Button::new(format!("▶ {name}")).min_size(Vec2::new(ui.available_width(), 26.0))).clicked() {
+                            start = Some((*pid, name.clone()));
+                        }
+                    }
+                }
+                if let Some(e) = &self.music_error {
+                    ui.label(RichText::new(e).color(th::RED));
+                }
+            });
+        if refresh {
+            self.music_apps = crate::loopback::audio_apps();
+        }
+        if let Some((pid, name)) = start {
+            self.start_music(pid, name);
+        }
+        if stop {
+            self.stop_music();
+        }
+        if let Some(v) = monitor {
+            self.set_music_monitor(v);
+        }
+        if !open {
+            self.music_window = false;
         }
     }
 }
@@ -1507,6 +1685,7 @@ impl eframe::App for App {
         self.ui_share(&ctx);
         self.ui_viewers(&ctx);
         self.ui_image_view(&ctx);
+        self.ui_music(&ctx);
         self.demo_screenshot(&ctx);
     }
 

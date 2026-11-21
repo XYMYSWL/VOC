@@ -48,6 +48,8 @@ struct Persisted {
     close_to_tray: bool,
     /// 回声消除（外放时用）
     aec: bool,
+    /// 屏幕共享时同时共享电脑声音
+    share_audio: bool,
     /// 按键说话：虚拟键码，0 = 语音激活
     ptt_vk: u32,
     /// 上次所在的语音频道（按服务器），开机自启自动登录后回到这里
@@ -96,6 +98,7 @@ impl Default for Persisted {
             relay: true,
             close_to_tray: true,
             aec: true,
+            share_audio: true,
             ptt_vk: 0,
             last_channel: HashMap::new(),
             hw_decode: false,
@@ -223,6 +226,19 @@ enum Screen {
     Main(Box<Session>),
     /// 网络断开后自动重连
     Reconnecting(Box<Reconnect>),
+}
+
+/// 正在放的伴奏
+pub(crate) struct MusicPlaying {
+    pub pid: u32,
+    pub name: String,
+    /// 开始前这个程序在音量合成器里的音量（停止时恢复）
+    prev_volume: f32,
+    /// 我这边听到的音量（5%–100%）
+    pub monitor: f32,
+    /// 发送增益 = 1 / monitor：本地调小了，录到的也变小，要补回来，别人听到的才不变
+    gain: Arc<audio::AtomicF32>,
+    _src: crate::streams::Source,
 }
 
 /// 估算嘴到耳延迟要用的本机参数
@@ -356,6 +372,19 @@ pub struct App {
     image_view: Option<egui::TextureHandle>,
     /// 测试模式：VOC_TEST_SEND_IMAGE 的图片已经发过
     test_image_sent: bool,
+    /// 正在放的伴奏
+    music: Option<MusicPlaying>,
+    /// 伴奏窗口
+    music_window: bool,
+    music_apps: Vec<(u32, String)>,
+    music_error: Option<String>,
+    /// 屏幕共享的声音（共享时自动开）
+    share_audio_src: Option<crate::streams::Source>,
+    share_audio_failed: bool,
+    /// 全屏观看谁的屏幕
+    fullscreen: Option<u32>,
+    /// 全屏时最后一次动鼠标（2 秒不动就隐藏工具栏）
+    fs_mouse_at: std::time::Instant,
     last_xruns: u32,
     demo: Demo,
 }
@@ -442,6 +471,14 @@ impl App {
             image_jobs: mpsc::channel(),
             image_view: None,
             test_image_sent: false,
+            music: None,
+            music_window: false,
+            music_apps: Vec::new(),
+            music_error: None,
+            share_audio_src: None,
+            share_audio_failed: false,
+            fullscreen: None,
+            fs_mouse_at: std::time::Instant::now(),
             last_xruns: 0,
         };
         app.restart_audio();
@@ -550,6 +587,9 @@ impl App {
 
     /// 离开主界面前：关掉共享 / 观看 / 语音，把聊天存起来（重新连上同一个服务器时接着显示）
     fn leave_main(&mut self) {
+        self.stop_music();
+        self.share_audio_src = None;
+        self.fullscreen = None;
         self.sharer = None;
         self.share_confirmed = false;
         self.views.clear();
@@ -685,6 +725,33 @@ impl App {
                 }
             }
         }
+        // 屏幕共享的声音：共享时开，停了就关（录除了 VOC 自己以外的全部声音）
+        let want_share_audio = self.sharer.is_some() && self.cfg.share_audio && crate::loopback::supported();
+        if !want_share_audio {
+            self.share_audio_src = None;
+            self.share_audio_failed = false;
+        } else if self.share_audio_src.is_none() && !self.share_audio_failed {
+            let target = crate::loopback::Target::Exclude(std::process::id());
+            match crate::streams::start(voc_proto::udp::SHARE_AUDIO, target, self.voice.clone(), Arc::new(audio::AtomicF32::new(1.0))) {
+                Ok(src) => self.share_audio_src = Some(src),
+                Err(e) => {
+                    self.share_audio_failed = true;
+                    if let Screen::Main(s) = &mut self.screen {
+                        s.chat.push(ChatLine::System(format!("共享声音没能开启：{e}")));
+                    }
+                }
+            }
+        }
+        // 正在看某人带声音的屏幕共享时，他的伴奏已经在共享声音里了：单独那一路不再播，免得听到两遍
+        if let Screen::Main(s) = &self.screen {
+            let dup: std::collections::HashSet<u32> = self
+                .views
+                .keys()
+                .filter(|id| s.users.iter().any(|u| u.id == **id && u.share_audio && u.music.is_some()))
+                .map(|id| audio::stream_mixer_id(voc_proto::udp::MUSIC, *id))
+                .collect();
+            self.mixer.lock().unwrap().set_suppressed(dup);
+        }
         // 图片：准备好的发出去；后台解码完的贴到聊天里
         let jobs: Vec<_> = self.image_jobs.1.try_iter().collect();
         for job in jobs {
@@ -795,6 +862,42 @@ impl App {
         }
     }
 
+
+    /// 开始伴奏：录这个程序的声音发给频道里的人
+    pub(crate) fn start_music(&mut self, pid: u32, name: String) {
+        self.stop_music();
+        let gain = Arc::new(audio::AtomicF32::new(1.0));
+        match crate::streams::start(voc_proto::udp::MUSIC, crate::loopback::Target::Include(pid), self.voice.clone(), gain.clone()) {
+            Ok(src) => {
+                let prev_volume = crate::loopback::app_volume(pid).unwrap_or(1.0);
+                if let Screen::Main(s) = &self.screen {
+                    s.send(ClientMsg::SetMusic { name: Some(name.clone()) });
+                }
+                self.music = Some(MusicPlaying { pid, name, prev_volume, monitor: 1.0, gain, _src: src });
+                self.music_error = None;
+            }
+            Err(e) => self.music_error = Some(e),
+        }
+    }
+
+    /// 停止伴奏，恢复那个程序原来的音量
+    pub(crate) fn stop_music(&mut self) {
+        if let Some(m) = self.music.take() {
+            crate::loopback::set_app_volume(m.pid, m.prev_volume);
+            if let Screen::Main(s) = &self.screen {
+                s.send(ClientMsg::SetMusic { name: None });
+            }
+        }
+    }
+
+    /// 调本地监听音量：程序在音量合成器里调小，发送时按比例补回来
+    pub(crate) fn set_music_monitor(&mut self, v: f32) {
+        if let Some(m) = &mut self.music {
+            m.monitor = v.clamp(0.05, 1.0);
+            crate::loopback::set_app_volume(m.pid, m.monitor * m.prev_volume.max(0.05));
+            m.gain.set(1.0 / m.monitor);
+        }
+    }
 
     /// 端到端加密后发给同频道的人
     fn send_image(&mut self, p: crate::images::Prepared, ctx: &egui::Context) {
@@ -1169,6 +1272,8 @@ impl App {
             sharing: sharing.map(Into::into),
             p2p: true,
             udp: true,
+            music: None,
+            share_audio: false,
         };
         let (_tx, events) = mpsc::channel();
         let mut s = Session {
@@ -1180,8 +1285,8 @@ impl App {
             channels: vec![ch(1, "大厅"), ch(2, "开黑一号"), ch(3, "开黑二号"), ch(4, "挂机")],
             users: vec![
                 u(1, "小明", Some(2), false, false, None),
-                u(2, "阿豪", Some(2), false, false, Some("1080p60")),
-                u(3, "阿杰", Some(2), true, false, None),
+                UserInfo { share_audio: true, ..u(2, "阿豪", Some(2), false, false, Some("1080p60")) },
+                UserInfo { music: Some("网易云音乐".into()), ..u(3, "阿杰", Some(2), true, false, None) },
                 u(4, "小鱼", Some(2), false, false, None),
                 u(5, "Mia", Some(2), false, true, None),
                 u(10, "小林", Some(2), false, false, None),
@@ -1239,7 +1344,7 @@ impl App {
         self.demo.speaking = vec![2];
         self.demo.transport = Some(true);
         self.demo.ping = 49;
-        if kind == "viewer" {
+        if kind == "viewer" || kind == "fullscreen" {
             let view = Arc::new(View::default());
             let (w, h) = (1280usize, 720usize);
             let mut rgba = vec![0u8; w * h * 4];
@@ -1254,6 +1359,9 @@ impl App {
             }
             *view.frame.lock().unwrap() = Some(video::DecodedFrame { width: w, height: h, rgba, seq: 1 });
             self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0) });
+            if kind == "fullscreen" {
+                self.fullscreen = Some(2); // 演示只画全屏界面，不真的切换窗口全屏
+            }
         }
         s.chat_input = String::new();
         self.screen = Screen::Main(Box::new(s));

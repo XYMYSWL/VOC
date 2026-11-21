@@ -77,9 +77,15 @@ pub enum ClientMsg {
         #[serde(default)]
         video: Vec<u32>,
     },
-    /// 开始屏幕共享（desc 例如 "1080p60"，显示给别人看）
+    /// 开始屏幕共享（desc 例如 "1080p60"，显示给别人看；audio = 同时共享电脑声音）
     ShareStart {
         desc: String,
+        #[serde(default)]
+        audio: bool,
+    },
+    /// 开始 / 停止伴奏（name = 程序名，None = 停止）
+    SetMusic {
+        name: Option<String>,
     },
     ShareStop,
     /// 开始 / 停止观看某人的屏幕
@@ -228,6 +234,12 @@ pub struct UserInfo {
     /// 语音走 UDP（false = UDP 不通，走 TCP 隧道，无法直连）
     #[serde(default)]
     pub udp: bool,
+    /// 正在放伴奏的程序名
+    #[serde(default)]
+    pub music: Option<String>,
+    /// 屏幕共享带声音
+    #[serde(default)]
+    pub share_audio: bool,
 }
 
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
