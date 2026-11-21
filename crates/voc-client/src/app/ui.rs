@@ -997,6 +997,13 @@ impl App {
                     if self.settings_tab == 2 {
                     th::section(ui, "网络");
                     if ui
+                        .checkbox(&mut self.cfg.low_bandwidth, "低带宽模式（手机热点、流量少或很卡的网络）")
+                        .on_hover_text("语音 24→12 kbps、伴奏和共享声音 64→32 kbps、屏幕共享最高 480P 30 帧、看别人共享时默认低画质。\n语音每人每小时约 5 MB。")
+                        .changed()
+                    {
+                        crate::audio::LOW_BANDWIDTH.store(self.cfg.low_bandwidth, Ordering::Relaxed);
+                    }
+                    if ui
                         .checkbox(&mut self.cfg.p2p, "P2P 直连（省服务器带宽、延迟更低）")
                         .on_hover_text("能直连的队友之间语音不经过服务器。代价：同频道开启了 P2P 的成员能看到你的 IP 地址。")
                         .changed()
@@ -1344,11 +1351,15 @@ impl App {
                     }
                 });
                 ui.add_space(8.0);
+                let eff = self.cfg.share.effective(self.cfg.low_bandwidth);
+                if eff != self.cfg.share {
+                    ui.label(RichText::new(format!("低带宽模式：实际按 {} 共享", eff.desc())).size(12.0).color(th::YELLOW));
+                }
                 ui.label(
                     RichText::new(format!(
                         "每位观看者约 {:.1} Mbps（H.264；AV1 约 {:.1}）· 端到端加密 · 能直连的不经过服务器",
-                        self.cfg.share.bitrate() as f32 / 1e6,
-                        self.cfg.share.bitrate_for(crate::mf::enc::Codec::Av1) as f32 / 1e6
+                        eff.bitrate() as f32 / 1e6,
+                        eff.bitrate_for(crate::mf::enc::Codec::Av1) as f32 / 1e6
                     ))
                     .size(12.0)
                     .color(th::TEXT_DIM),
@@ -1365,9 +1376,10 @@ impl App {
                 start = th::primary_button(ui, "开始共享", ui.available_width(), true).clicked();
             });
         if start {
-            match Sharer::start(self.cfg.share.clone(), self.voice.clone()) {
+            let eff = self.cfg.share.effective(self.cfg.low_bandwidth);
+            match Sharer::start(eff.clone(), self.voice.clone()) {
                 Ok(sh) => {
-                    s.send(ClientMsg::ShareStart { desc: self.cfg.share.desc(), audio: self.cfg.share_audio && crate::loopback::supported() });
+                    s.send(ClientMsg::ShareStart { desc: eff.desc(), audio: self.cfg.share_audio && crate::loopback::supported() });
                     self.sharer = Some(sh);
                     self.share_confirmed = false;
                     self.share_error = None;

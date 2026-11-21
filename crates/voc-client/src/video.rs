@@ -43,6 +43,16 @@ impl Default for ShareConfig {
 }
 
 impl ShareConfig {
+    /// 低带宽模式下的实际设置：最高 480P 30 帧
+    pub fn effective(&self, low_bandwidth: bool) -> Self {
+        let mut c = self.clone();
+        if low_bandwidth {
+            c.height = c.height.min(480);
+            c.fps = c.fps.min(30);
+        }
+        c
+    }
+
     pub fn desc(&self) -> String {
         format!("{}p{}", self.height, self.fps)
     }

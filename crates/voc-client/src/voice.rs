@@ -58,6 +58,8 @@ const PACE_BURST: usize = 4 * 1200;
 const PACE_STALE: Duration = Duration::from_millis(250);
 /// Opus 码率
 const OPUS_BITRATE: i32 = 24_000;
+/// 低带宽模式的语音码率（Opus 在 12 kbps 下人声仍然清楚）
+const LOW_OPUS_BITRATE: i32 = 12_000;
 /// 端口预测：对方公网端口上下各试几个
 const PORT_SPRAY: u16 = 8;
 /// 每路直连语音估算占用的上行（Opus 24 kbps + 各层包头 + 随机填充，按 60 kbps 算）
@@ -1476,6 +1478,8 @@ struct Transmitter {
     pkt: Vec<u8>,
     hang: u32,
     loop_seq: u16,
+    /// 编码器当前是否按低带宽码率
+    low: bool,
 }
 
 impl Transmitter {
@@ -1492,6 +1496,7 @@ impl Transmitter {
             pkt: Vec::with_capacity(udp::MAX_PACKET),
             hang: 0,
             loop_seq: 0,
+            low: false,
         }
     }
 
@@ -1520,6 +1525,11 @@ impl Transmitter {
             return;
         }
 
+        let low = crate::audio::LOW_BANDWIDTH.load(Ordering::Relaxed);
+        if low != self.low {
+            self.low = low;
+            let _ = self.enc.set_bitrate(opus::Bitrate::Bits(if low { LOW_OPUS_BITRATE } else { OPUS_BITRATE }));
+        }
         let Ok(n) = self.enc.encode(&self.pcm, &mut self.bytes) else { return };
         let packet = &self.bytes[..n];
         if let Some(l) = self.state.current_link().filter(|l| l.in_channel.load(Ordering::Relaxed)) {

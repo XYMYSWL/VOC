@@ -10,6 +10,8 @@ use voc_proto::e2e::{STREAM_MUSIC, STREAM_SHARE};
 use voc_proto::udp;
 
 const BITRATE: i32 = 64_000;
+/// 低带宽模式
+const LOW_BITRATE: i32 = 32_000;
 /// 连续这么多帧（20 ms × 25 = 0.5 秒）几乎没声音就不发了
 const QUIET_FRAMES: u32 = 25;
 const QUIET_RMS: f32 = 1e-4;
@@ -29,6 +31,7 @@ pub fn start(kind: u8, target: Target, state: Arc<VoiceState>, gain: Arc<AtomicF
     let mut out = vec![0u8; 1500];
     let mut pcm = vec![0i16; loopback::FRAME];
     let mut quiet = 0u32;
+    let mut low = false;
     let mut pkt = Vec::with_capacity(udp::MAX_PACKET);
     let cap = loopback::start(target, move |frame| {
         let g = gain.get();
@@ -46,6 +49,11 @@ pub fn start(kind: u8, target: Target, state: Arc<VoiceState>, gain: Arc<AtomicF
         let Some(link) = state.current_link() else { return };
         if !link.in_channel.load(Ordering::Relaxed) || (kind == udp::SHARE_AUDIO && !link.has_watchers()) {
             return;
+        }
+        let l = crate::audio::LOW_BANDWIDTH.load(Ordering::Relaxed);
+        if l != low {
+            low = l;
+            let _ = enc.set_bitrate(opus::Bitrate::Bits(if l { LOW_BITRATE } else { BITRATE }));
         }
         let Ok(n) = enc.encode(&pcm, &mut out) else { return };
         let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };

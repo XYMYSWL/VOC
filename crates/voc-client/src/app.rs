@@ -52,6 +52,8 @@ struct Persisted {
     share_audio: bool,
     /// 按键说话：虚拟键码，0 = 语音激活
     ptt_vk: u32,
+    /// 低带宽模式（手机热点、流量少的网络）
+    low_bandwidth: bool,
     /// 上次所在的语音频道（按服务器），开机自启自动登录后回到这里
     last_channel: HashMap<String, u32>,
     /// 观看屏幕共享时用显卡硬解
@@ -100,6 +102,7 @@ impl Default for Persisted {
             aec: true,
             share_audio: true,
             ptt_vk: 0,
+            low_bandwidth: false,
             last_channel: HashMap::new(),
             hw_decode: false,
             auto_update: true,
@@ -415,6 +418,7 @@ impl App {
         settings.vad_threshold_db.set(cfg.vad_threshold_db);
         settings.aec.store(cfg.aec, Ordering::Relaxed);
         settings.ptt_vk.store(cfg.ptt_vk, Ordering::Relaxed);
+        crate::audio::LOW_BANDWIDTH.store(cfg.low_bandwidth, Ordering::Relaxed);
         settings.input_gain.set(cfg.input_gain);
         settings.output_volume.set(cfg.output_volume);
         let mixer = Arc::new(Mutex::new(Mixer::default()));
@@ -662,6 +666,7 @@ impl App {
                     None => "未知",
                 };
                 let _ = writeln!(d, "已连接：是 · 传输 {tr} · 到服务器 {} ms", self.voice.ping_ms.load(Ordering::Relaxed));
+                let _ = writeln!(d, "低带宽模式：{}", if self.cfg.low_bandwidth { "开" } else { "关" });
                 let _ = writeln!(d, "P2P：{} · 上行预算 {} Mbps · 帮队友中转：{}", if l.p2p_on() { "开" } else { "关" }, self.cfg.p2p_budget_mbps, if self.cfg.relay { "开" } else { "关" });
                 let states = l.punch_states();
                 let count = |f: &dyn Fn(&voice::PunchState) -> bool| states.values().filter(|s| f(s)).count();
