@@ -23,6 +23,8 @@ pub struct Snapshot {
     pub punched: usize,
     pub punching: usize,
     pub failed: usize,
+    /// 用服务器的 NAT 探测端口测出的 NAT 类型（服务器没开探测端口时为 None，退回按端口粗略判断）
+    pub nat: Option<voc_proto::NatInfo>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +135,15 @@ pub fn analyze(s: &Snapshot) -> Report {
     // NAT：公网地址就在本机上 = 没有 NAT；端口没变 = 打洞容易
     let no_nat = s.public.is_some_and(|p| s.lan.iter().any(|l| l.ip() == p.ip().to_canonical()));
     let port_changed = s.public.is_some_and(|p| p.port() != s.local_port);
-    if let Some(_p) = s.public {
+    let symmetric = s.nat.is_some_and(|n| matches!(n.kind, voc_proto::NAT_SYM_PREDICTABLE | voc_proto::NAT_SYM_RANDOM));
+    if let Some(n) = s.nat {
+        match n.kind {
+            voc_proto::NAT_OPEN => item(Level::Good, "NAT", "没有（本机直接有公网地址）".into()),
+            voc_proto::NAT_CONE => item(Level::Good, "NAT", "好打洞（去哪都用同一个端口映射）".into()),
+            voc_proto::NAT_SYM_PREDICTABLE => item(Level::Warn, "NAT", format!("对称型，但端口有规律（每次 {:+}），会尝试预测端口打洞", n.step)),
+            _ => item(Level::Bad, "NAT", "对称型，端口随机：和同样是对称型的人基本打不通，会直接走服务器".into()),
+        }
+    } else if let Some(_p) = s.public {
         if no_nat {
             item(Level::Good, "NAT", "没有（本机直接有公网地址）".into());
         } else if !port_changed {
@@ -197,7 +207,7 @@ pub fn analyze(s: &Snapshot) -> Report {
     }
     if matches!(s.portmap, PortMapStatus::CarrierNat { .. }) || double_nat {
         a.push("你在运营商级 NAT 或多层 NAT 后面，和别人打洞可能失败（失败会自动走服务器，不影响使用）。可以打电话给运营商申请公网 IP，或者在光猫里开启 IPv6。".into());
-    } else if matches!(s.portmap, PortMapStatus::Unavailable) && !no_nat && port_changed {
+    } else if matches!(s.portmap, PortMapStatus::Unavailable) && !no_nat && (symmetric || (s.nat.is_none() && port_changed)) {
         a.push("在路由器管理页面里打开 UPnP，可以明显提高和队友直连的成功率。".into());
     }
     if s.p2p && s.failed > 0 {
@@ -231,7 +241,20 @@ mod tests {
             punched: 2,
             punching: 0,
             failed: 0,
+            nat: None,
         }
+    }
+
+    #[test]
+    fn measured_nat_type_shown() {
+        let mut s = base();
+        s.nat = Some(voc_proto::NatInfo { kind: voc_proto::NAT_CONE, port: 50000, step: 0 });
+        assert_eq!(level(&analyze(&s), "NAT"), Level::Good);
+        s.nat = Some(voc_proto::NatInfo { kind: voc_proto::NAT_SYM_RANDOM, port: 50000, step: 0 });
+        s.portmap = PortMapStatus::Unavailable;
+        let r = analyze(&s);
+        assert_eq!(level(&r, "NAT"), Level::Bad);
+        assert!(r.advice.iter().any(|a| a.contains("UPnP")));
     }
 
     fn level(r: &Report, label: &str) -> Level {

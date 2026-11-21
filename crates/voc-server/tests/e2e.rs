@@ -92,6 +92,7 @@ struct Client {
     server_udp: SocketAddr,
     useal: DatagramSealer,
     uopen: DatagramOpener,
+    probe_port: u16,
 }
 
 #[derive(Debug)]
@@ -140,11 +141,13 @@ impl Client {
             server_udp,
             useal: DatagramSealer::new(&keys.udp_c2s, &keys.udp_c2s_hp),
             uopen: DatagramOpener::new(&keys.udp_s2c, &keys.udp_s2c_hp),
+            probe_port: 0,
         };
         c.send(ClientMsg::Hello { name: name.into(), version: PROTOCOL_VERSION });
         match c.recv_json() {
-            ServerMsg::Welcome { user_id, .. } => {
+            ServerMsg::Welcome { user_id, probe_port, .. } => {
                 c.id = user_id;
+                c.probe_port = probe_port;
                 Ok(c)
             }
             ServerMsg::Error { message } => Err(ConnErr::Rejected(message)),
@@ -523,8 +526,8 @@ fn p2p_signaling_punching_and_direct_voice() {
     let ia = E2eId::announce(&mut a, "alice");
     let ib = E2eId::announce(&mut b, "bob");
     let (k_a, k_b) = pair(&mut a, &ia, &mut b, &ib);
-    a.send(ClientMsg::P2pEnable { local_addrs: vec!["192.168.1.5:1234".into(), "bogus".into()] });
-    b.send(ClientMsg::P2pEnable { local_addrs: vec![] });
+    a.send(ClientMsg::P2pEnable { local_addrs: vec!["192.168.1.5:1234".into(), "bogus".into()], nat: None });
+    b.send(ClientMsg::P2pEnable { local_addrs: vec![], nat: None });
     for x in [&mut a, &mut b, &mut c] {
         x.send(ClientMsg::JoinChannel { channel_id: 1 });
     }
@@ -598,7 +601,7 @@ fn screen_share_watch_relay_and_keyframes() {
 
     // 不在共享时不能观看
     b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
-    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false });
+    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false, rtx: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.as_deref() == Some("720p30")));
     // 之前那次 Watch 无效，alice 此时没有观看者；现在正式观看
     b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
@@ -654,7 +657,7 @@ fn simulcast_layers_routed_by_viewer_choice() {
     }
     let aid = a.id;
     b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 3);
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: true });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: true, rtx: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.simulcast));
     b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
     c.send(ClientMsg::Watch { target: aid, on: true, low: true, route: 0 });
@@ -680,13 +683,126 @@ fn simulcast_layers_routed_by_viewer_choice() {
 
     // 共享者不支持分层（旧客户端）：要低画质也照收原画
     a.send(ClientMsg::ShareStop);
-    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false });
+    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false, rtx: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.as_deref() == Some("720p30") && !x.simulcast));
     b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
     c.send(ClientMsg::Watch { target: aid, on: true, low: true, route: 0 });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, low, .. } if ids == &vec![bid, cid] && low.is_empty()));
     a.udp_send(udp::VIDEO, &main[0]);
     assert!(c.udp_recv().is_some(), "old sharer: low-quality viewer still gets the only layer");
+}
+
+/// 丢包补发：服务器缓存里有的直接补发给请求者；没有的转给共享者；冗余校验包照常转发
+#[test]
+fn video_nack_served_from_cache_or_forwarded() {
+    let srv = Server::start(15);
+    let codes = srv.gen_codes(3);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap(); // 共享者
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap(); // 观看者
+    let mut c = Client::connect(srv.port, &codes[2], "carol").unwrap(); // 没在看
+    for x in [&mut a, &mut b, &mut c] {
+        x.enable_udp();
+        x.send(ClientMsg::JoinChannel { channel_id: 1 });
+    }
+    let (aid, bid) = (a.id, b.id);
+    b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 3);
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false, rtx: true });
+    b.wait_state(|u| u.iter().any(|x| x.id == aid && x.rtx));
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
+    a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if ids == &vec![bid]));
+
+    let data: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+    let frags = udp::video_fragments(7, udp::VIDEO_KEY, &data);
+    let par = udp::fec_parities(7, udp::VIDEO_KEY, &data, 10);
+    for f in frags.iter().chain(par.iter()) {
+        a.udp_send(udp::VIDEO, f);
+    }
+    for _ in 0..frags.len() + par.len() {
+        let (k, _) = b.udp_recv().expect("bob gets fragments and parity");
+        assert_eq!(k, udp::VIDEO);
+    }
+
+    // 缓存里有：直接补发给 bob，不打扰共享者
+    b.udp_send(udp::NACK, &udp::nack_payload(aid, 0, 7, &[1]));
+    let (k, d) = b.udp_recv().expect("resent from cache");
+    let (from, h, body) = udp::read_server_video(&d).unwrap();
+    assert_eq!((k, from, h.frame, h.idx), (udp::VIDEO, aid, 7, 1));
+    assert_eq!(body, udp::read_video_frag(&frags[1]).unwrap().1);
+    // 整帧
+    b.udp_send(udp::NACK, &udp::nack_payload(aid, 0, 7, &[udp::NACK_WHOLE]));
+    for i in 0..frags.len() {
+        let (_, d) = b.udp_recv().expect("whole frame resent");
+        assert_eq!(udp::read_server_video(&d).unwrap().1.idx as usize, i);
+    }
+    assert!(a.udp_recv().is_none(), "sharer not bothered when cache has it");
+
+    // 缓存里没有（共享者→服务器这段丢了）：转给共享者，开头换成请求者编号
+    b.udp_send(udp::NACK, &udp::nack_payload(aid, 0, 8, &[0, 2]));
+    let (k, d) = a.udp_recv().expect("nack forwarded to sharer");
+    assert_eq!((k, udp::read_nack(&d)), (udp::NACK, Some((bid, 0, 8, vec![0, 2]))));
+
+    // 没在看的人发的补发请求不理
+    c.udp_send(udp::NACK, &udp::nack_payload(aid, 0, 7, &[0]));
+    c.udp_send(udp::NACK, &udp::nack_payload(aid, 0, 9, &[0]));
+    assert!(c.udp_recv().is_none() && a.udp_recv().is_none());
+}
+
+/// 隐私：选了和某人走服务器（P2pHide），双方地址互不透露；其他人照常
+#[test]
+fn p2p_hide_keeps_addresses_private() {
+    let srv = Server::start(17);
+    let codes = srv.gen_codes(3);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
+    let mut c = Client::connect(srv.port, &codes[2], "carol").unwrap();
+    for x in [&mut a, &mut b, &mut c] {
+        x.enable_udp();
+        x.send(ClientMsg::P2pEnable { local_addrs: vec![], nat: None });
+    }
+    let (aid, bid, cid) = (a.id, b.id, c.id);
+    a.send(ClientMsg::P2pHide { ids: vec![bid] });
+    for x in [&mut a, &mut b, &mut c] {
+        x.send(ClientMsg::JoinChannel { channel_id: 1 });
+    }
+    let ids_of = |x: &mut Client, want: usize| match x.wait_for(|m| matches!(m, ServerMsg::Peers { peers } if peers.len() == want)) {
+        ServerMsg::Peers { peers } => peers.into_iter().map(|p| p.id).collect::<Vec<_>>(),
+        _ => unreachable!(),
+    };
+    assert_eq!(ids_of(&mut a, 1), vec![cid], "alice must not get bob's address");
+    assert_eq!(ids_of(&mut b, 1), vec![cid], "bob must not get alice's address");
+    let mut cs = ids_of(&mut c, 2);
+    cs.sort();
+    assert_eq!(cs, vec![aid, bid]);
+    // 改回自动：互相看得到
+    a.send(ClientMsg::P2pHide { ids: vec![] });
+    assert_eq!(ids_of(&mut a, 2).len(), 2);
+}
+
+/// NAT 探测端口：已登录用户的 PING 回 PONG 并附上地址；乱发的包不理
+#[test]
+fn probe_port_answers_registered_users_only() {
+    let srv = Server::start(16);
+    let codes = srv.gen_codes(1);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    if a.probe_port == 0 {
+        eprintln!("probe port could not be bound (taken); skipping");
+        return;
+    }
+    assert_eq!(a.probe_port, srv.port + 1);
+    let probe: SocketAddr = format!("127.0.0.1:{}", a.probe_port).parse().unwrap();
+    let mut p = Vec::new();
+    a.useal.seal(udp::PING, &udp::ping_payload(77), &mut p);
+    a.udp.send_to(&p, probe).unwrap();
+    let (from, pkt) = a.udp_recv_raw(1000).expect("probe pong");
+    assert_eq!(from, probe);
+    let (k, d) = a.uopen.open(&pkt).unwrap();
+    let (ts, addr) = udp::read_pong(&d).unwrap();
+    assert_eq!((k, ts, addr), (udp::PONG, 77, Some(a.udp.local_addr().unwrap())));
+    // 不是 PING、或者不是任何已登录用户加密的：不回
+    a.useal.seal(udp::VOICE, &udp::client_voice(1, b"x"), &mut p);
+    a.udp.send_to(&p, probe).unwrap();
+    a.udp.send_to(b"garbage packet", probe).unwrap();
+    assert!(a.udp_recv_raw(400).is_none());
 }
 
 /// 观看者选的画面线路转告给共享者
@@ -702,7 +818,7 @@ fn viewer_route_choice_reaches_sharer() {
     }
     let aid = a.id;
     b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 3);
-    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: true });
+    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: true, rtx: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.is_some()));
     let (bid, cid) = (b.id, c.id);
     b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 1 });
@@ -778,12 +894,12 @@ fn voice_and_video_direct_lists_are_independent() {
     let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
     for x in [&mut a, &mut b] {
         x.enable_udp();
-        x.send(ClientMsg::P2pEnable { local_addrs: vec![] });
+        x.send(ClientMsg::P2pEnable { local_addrs: vec![], nat: None });
         x.send(ClientMsg::JoinChannel { channel_id: 1 });
     }
     let (aid, bid) = (a.id, b.id);
     a.wait_for(|m| matches!(m, ServerMsg::Peers { peers } if peers.iter().any(|p| p.id == bid)));
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false, rtx: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.is_some()));
     b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if ids == &vec![bid]));
@@ -827,7 +943,7 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     let mut r = Client::connect(srv.port, &codes[2], "carol").unwrap();
     for x in [&mut a, &mut b, &mut r] {
         x.enable_udp();
-        x.send(ClientMsg::P2pEnable { local_addrs: vec![] });
+        x.send(ClientMsg::P2pEnable { local_addrs: vec![], nat: None });
         x.send(ClientMsg::JoinChannel { channel_id: 1 });
     }
     for x in [&mut a, &mut b, &mut r] {
@@ -978,7 +1094,7 @@ fn music_and_share_audio_forwarding() {
     assert!(b.udp_recv().is_none(), "music after stop is dropped");
 
     // 屏幕共享带声音：只有观看者收到
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: true, simulcast: false });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: true, simulcast: false, rtx: false });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.share_audio));
     b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
     b.send(ClientMsg::Ping);

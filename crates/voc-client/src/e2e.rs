@@ -25,6 +25,8 @@ pub struct Member {
     ek: Vec<u8>,
     pub trust: Trust,
     pub safety: String,
+    /// 对方公告的能力（BLOB_HELLO）
+    pub features: Vec<String>,
 }
 
 pub struct E2e {
@@ -44,6 +46,13 @@ pub struct E2e {
     pub pins: HashMap<String, String>,
     pub pins_dirty: bool,
     out: Vec<ClientMsg>,
+    /// 已经发过能力公告的人
+    hello_sent: std::collections::HashSet<u32>,
+    /// 下一条聊天的编号
+    next_msg: u64,
+    /// 我的个人资料（端到端发给成员）、成员发来的
+    my_profile: e2e::Profile,
+    pub profiles: HashMap<u32, e2e::Profile>,
 }
 
 pub struct ChatIn {
@@ -51,6 +60,8 @@ pub struct ChatIn {
     pub text: String,
     /// 私聊
     pub dm: bool,
+    /// 消息编号（对方是旧版本时没有，不能回应）
+    pub id: Option<u64>,
 }
 
 /// 解开的端到端信封
@@ -58,6 +69,8 @@ pub enum BlobIn {
     Chat(ChatIn),
     /// 别人发来的图片密钥和信息（图片本身随后分块到）
     Image { from: u32, meta: voc_proto::file::ImageMeta, dm: bool },
+    /// 表情回应：by 对 (r.from, r.id) 这条消息加上 / 取消 r.emoji
+    React { by: u32, r: e2e::React },
 }
 
 impl E2e {
@@ -77,6 +90,11 @@ impl E2e {
             pins,
             pins_dirty: false,
             out: Vec::new(),
+            hello_sent: Default::default(),
+            // 编号从当前时间起，重新登录后也不会和之前的重复
+            next_msg: voc_proto::now_millis() << 10,
+            my_profile: Default::default(),
+            profiles: HashMap::new(),
         };
         let sig = s.identity.sign_ek(&s.my_name, &s.kem.ek);
         s.out.push(ClientMsg::E2eAnnounce {
@@ -92,7 +110,72 @@ impl E2e {
     }
 
     pub fn take_outgoing(&mut self) -> Vec<ClientMsg> {
+        // 刚建立加密的人：发一次能力公告
+        let new: Vec<u32> = self.pairs.keys().copied().filter(|id| self.trusted(*id) && !self.hello_sent.contains(id)).collect();
+        if !new.is_empty() {
+            let hello = serde_json::to_vec(&e2e::Hello { features: vec![e2e::FEATURE_CHAT2.into()] }).expect("hello json");
+            for id in new {
+                let blob = e2e::seal_blob(&self.pairs[&id].blob, e2e::BLOB_HELLO, &hello);
+                self.out.push(ClientMsg::E2eBlob { to: id, blob: b64(&blob) });
+                self.hello_sent.insert(id);
+            }
+        }
         std::mem::take(&mut self.out)
+    }
+
+    /// 对方认识带编号的聊天和表情回应
+    pub fn supports_chat2(&self, id: u32) -> bool {
+        self.members.get(&id).is_some_and(|m| m.features.iter().any(|f| f == e2e::FEATURE_CHAT2))
+    }
+
+    /// 一条聊天发给一个人：新版本发带编号的，旧版本发纯文字
+    fn seal_chat(&self, id: u32, msg: &e2e::Chat2) -> Option<ClientMsg> {
+        let k = self.pairs.get(&id).filter(|_| self.trusted(id))?;
+        let blob = if self.supports_chat2(id) {
+            e2e::seal_blob(&k.blob, e2e::BLOB_CHAT2, &serde_json::to_vec(msg).expect("chat json"))
+        } else {
+            e2e::seal_blob(&k.blob, if msg.dm { e2e::BLOB_DM } else { e2e::BLOB_CHAT }, msg.text.as_bytes())
+        };
+        Some(ClientMsg::E2eBlob { to: id, blob: b64(&blob) })
+    }
+
+    fn new_msg_id(&mut self) -> u64 {
+        self.next_msg += 1;
+        self.next_msg
+    }
+
+    /// 更新我的个人资料，发给所有认识的新版本成员
+    pub fn set_profile(&mut self, p: e2e::Profile) {
+        self.my_profile = p;
+        let ids: Vec<u32> = self.members.keys().copied().collect();
+        self.send_profile_to(&ids);
+    }
+
+    fn send_profile_to(&mut self, to: &[u32]) {
+        let json = serde_json::to_vec(&self.my_profile).expect("profile json");
+        for &id in to {
+            if !(self.supports_chat2(id) && self.trusted(id)) {
+                continue;
+            }
+            if let Some(k) = self.pairs.get(&id) {
+                let blob = e2e::seal_blob(&k.blob, e2e::BLOB_PROFILE, &json);
+                self.out.push(ClientMsg::E2eBlob { to: id, blob: b64(&blob) });
+            }
+        }
+    }
+
+    /// 表情回应：发给 to 里认识回应的人
+    pub fn send_react(&mut self, to: &[u32], r: &e2e::React) {
+        let json = serde_json::to_vec(r).expect("react json");
+        for &id in to {
+            if !(self.supports_chat2(id) && self.trusted(id)) {
+                continue;
+            }
+            if let Some(k) = self.pairs.get(&id) {
+                let blob = e2e::seal_blob(&k.blob, e2e::BLOB_REACT, &json);
+                self.out.push(ClientMsg::E2eBlob { to: id, blob: b64(&blob) });
+            }
+        }
     }
 
     pub fn has_pair(&self, id: u32) -> bool {
@@ -133,7 +216,7 @@ impl E2e {
         self.pairs.remove(&e.id);
         self.sent_epoch.remove(&e.id);
         let safety = e2e::safety_code(&idk);
-        self.members.insert(e.id, Member { name: e.name, idk, ek, trust, safety });
+        self.members.insert(e.id, Member { name: e.name, idk, ek, trust, safety, features: Vec::new() });
         if trust != Trust::Changed {
             self.start_pair(e.id);
         }
@@ -249,7 +332,33 @@ impl E2e {
                 None
             }
             e2e::BLOB_CHAT | e2e::BLOB_DM => {
-                Some(BlobIn::Chat(ChatIn { from, text: String::from_utf8_lossy(&data).into_owned(), dm: kind == e2e::BLOB_DM }))
+                Some(BlobIn::Chat(ChatIn { from, text: String::from_utf8_lossy(&data).into_owned(), dm: kind == e2e::BLOB_DM, id: None }))
+            }
+            e2e::BLOB_CHAT2 => {
+                let c: e2e::Chat2 = serde_json::from_slice(&data).ok()?;
+                let text: String = c.text.chars().take(voc_proto::MAX_CHAT_LEN).collect();
+                Some(BlobIn::Chat(ChatIn { from, text, dm: c.dm, id: Some(c.id) }))
+            }
+            e2e::BLOB_HELLO => {
+                let h: e2e::Hello = serde_json::from_slice(&data).ok()?;
+                if let Some(m) = self.members.get_mut(&from) {
+                    m.features = h.features.into_iter().take(16).map(|f| f.chars().take(32).collect()).collect();
+                }
+                // 新认识的新版本成员：把我的资料也给他
+                if self.my_profile != e2e::Profile::default() {
+                    self.send_profile_to(&[from]);
+                }
+                None
+            }
+            e2e::BLOB_PROFILE => {
+                let mut p: e2e::Profile = serde_json::from_slice(&data).ok()?;
+                p.music = p.music.map(|m| m.chars().take(64).collect());
+                self.profiles.insert(from, p);
+                None
+            }
+            e2e::BLOB_REACT => {
+                let r: e2e::React = serde_json::from_slice(&data).ok()?;
+                e2e::REACTIONS.contains(&r.emoji.as_str()).then_some(BlobIn::React { by: from, r })
             }
             e2e::BLOB_IMAGE | e2e::BLOB_DM_IMAGE => {
                 let meta: voc_proto::file::ImageMeta = serde_json::from_slice(&data).ok()?;
@@ -260,34 +369,30 @@ impl E2e {
         }
     }
 
-    /// 给所有在线、已建立加密的成员发聊天。返回（送达人数，暂时收不到的人的昵称）。
-    pub fn send_chat(&mut self, text: &str) -> (usize, Vec<String>) {
+    /// 给所有在线、已建立加密的成员发聊天。返回（消息编号，送达人数，暂时收不到的人的昵称）。
+    pub fn send_chat(&mut self, text: &str) -> (u64, usize, Vec<String>) {
+        let msg = e2e::Chat2 { id: self.new_msg_id(), text: text.to_string(), dm: false };
         let mut sent = 0;
         let mut missing = Vec::new();
         let ids: Vec<u32> = self.members.keys().copied().collect();
         for id in ids {
-            match (self.trusted(id), self.pairs.get(&id)) {
-                (true, Some(k)) => {
-                    let blob = e2e::seal_blob(&k.blob, e2e::BLOB_CHAT, text.as_bytes());
-                    self.out.push(ClientMsg::E2eBlob { to: id, blob: b64(&blob) });
+            match self.seal_chat(id, &msg) {
+                Some(m) => {
+                    self.out.push(m);
                     sent += 1;
                 }
-                _ => missing.push(self.members[&id].name.clone()),
+                None => missing.push(self.members[&id].name.clone()),
             }
         }
-        (sent, missing)
+        (msg.id, sent, missing)
     }
 
-    /// 私聊：只发给一个人。false = 和对方的加密还没建立（或身份待核对），没发出
-    pub fn send_dm(&mut self, to: u32, text: &str) -> bool {
-        match (self.trusted(to), self.pairs.get(&to)) {
-            (true, Some(k)) => {
-                let blob = e2e::seal_blob(&k.blob, e2e::BLOB_DM, text.as_bytes());
-                self.out.push(ClientMsg::E2eBlob { to, blob: b64(&blob) });
-                true
-            }
-            _ => false,
-        }
+    /// 私聊：只发给一个人。None = 和对方的加密还没建立（或身份待核对），没发出；否则返回消息编号
+    pub fn send_dm(&mut self, to: u32, text: &str) -> Option<u64> {
+        let msg = e2e::Chat2 { id: self.new_msg_id(), text: text.to_string(), dm: true };
+        let m = self.seal_chat(to, &msg)?;
+        self.out.push(m);
+        Some(msg.id)
     }
 
     /// 把图片密钥和信息发给指定的人（同频道成员，或私聊对象 dm = true）。返回收不到的人的名字。
@@ -432,15 +537,72 @@ pub mod tests {
         assert!(!chats[0].dm);
 
         // 私聊：只有对方收得到，并标成私聊
-        assert!(a.send_dm(2, "悄悄话"));
+        assert!(a.send_dm(2, "悄悄话").is_some());
         let dms = relay(&mut a, &mut b);
         assert_eq!((dms.len(), dms[0].text.as_str(), dms[0].dm), (1, "悄悄话", true));
-        assert!(!a.send_dm(99, "没这个人"));
+        assert!(a.send_dm(99, "没这个人").is_none());
 
         // 有人离开频道：alice 换密钥，bob 的旧密钥解不开新语音
         a.set_channel_others(vec![]);
         let f2 = a.encrypt_frame(b"secret");
         assert!(b.decrypt_frame(1, &f2).is_none(), "left member must not decrypt new frames");
+    }
+
+    /// 新版本之间：聊天带编号、能回应；对方是旧版本（没发能力公告）时退回纯文字，也不发回应
+    #[test]
+    fn numbered_chat_and_reactions() {
+        let mut a = E2e::new(1, "alice", Identity::generate(), HashMap::new());
+        let mut b = E2e::new(2, "bob", Identity::generate(), HashMap::new());
+        pair_up(&mut a, &mut b);
+        assert!(a.supports_chat2(2) && b.supports_chat2(1), "hello exchanged after pairing");
+
+        let (id, sent, _) = a.send_chat("@bob 看这里");
+        assert_eq!(sent, 1);
+        let chats = relay(&mut a, &mut b);
+        assert_eq!((chats[0].id, chats[0].text.as_str()), (Some(id), "@bob 看这里"));
+
+        let r = voc_proto::e2e::React { from: 1, id, emoji: voc_proto::e2e::REACTIONS[0].into(), on: true, dm: false };
+        b.send_react(&[1], &r);
+        let mut got = None;
+        for m in b.take_outgoing() {
+            if let ClientMsg::E2eBlob { blob, .. } = m {
+                if let Some(BlobIn::React { by, r }) = a.on_blob(2, &blob) {
+                    got = Some((by, r));
+                }
+            }
+        }
+        assert_eq!(got, Some((2, r)));
+        // 不认识的表情忽略
+        b.send_react(&[1], &voc_proto::e2e::React { from: 1, id, emoji: "很长的一串".into(), on: true, dm: false });
+        for m in b.take_outgoing() {
+            if let ClientMsg::E2eBlob { blob, .. } = m {
+                assert!(a.on_blob(2, &blob).is_none());
+            }
+        }
+
+        // bob 是旧版本：没有能力公告 → alice 发纯文字（旧版本能显示），不发回应
+        a.members.get_mut(&2).unwrap().features.clear();
+        a.send_chat("老版本也能看");
+        let chats = relay(&mut a, &mut b);
+        assert_eq!((chats[0].id, chats[0].text.as_str()), (None, "老版本也能看"));
+        a.send_react(&[2], &voc_proto::e2e::React { from: 2, id: 5, emoji: "👍".into(), on: true, dm: false });
+        assert!(a.take_outgoing().is_empty());
+    }
+
+    /// 伴奏程序名只端到端给成员；后认识的成员在能力公告后也会收到
+    #[test]
+    fn profile_reaches_members_end_to_end() {
+        let mut a = E2e::new(1, "alice", Identity::generate(), HashMap::new());
+        let mut b = E2e::new(2, "bob", Identity::generate(), HashMap::new());
+        a.set_profile(voc_proto::e2e::Profile { music: Some("网易云音乐".into()) });
+        assert!(a.out.iter().all(|m| !matches!(m, ClientMsg::E2eBlob { .. })), "nobody to send to yet");
+        pair_up(&mut a, &mut b);
+        relay(&mut b, &mut a); // bob 的能力公告
+        relay(&mut a, &mut b); // alice 回给他资料
+        assert_eq!(b.profiles.get(&1).and_then(|p| p.music.as_deref()), Some("网易云音乐"));
+        a.set_profile(Default::default());
+        relay(&mut a, &mut b);
+        assert_eq!(b.profiles[&1].music, None);
     }
 
     #[test]

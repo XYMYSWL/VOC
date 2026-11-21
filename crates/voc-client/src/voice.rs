@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use voc_proto::crypto::{DatagramOpener, DatagramSealer, SessionKeys};
 use voc_proto::p2p;
 use voc_proto::udp::seq_newer;
-use voc_proto::{now_millis, udp, ClientMsg, PeerInfo, PeerStat, RelayRoute, FRAME_SAMPLES, SAMPLE_RATE};
+use voc_proto::{now_millis, udp, ClientMsg, NatInfo, PeerInfo, PeerStat, RelayRoute, FRAME_SAMPLES, SAMPLE_RATE};
 
 /// VAD 关闭前的保持帧数（20 ms × 15 = 300 ms），避免句尾被截断
 const VAD_HANGOVER: u32 = 15;
@@ -301,6 +301,8 @@ struct Peer {
     unstable_until: Option<Instant>,
     good_since: Option<Instant>,
     quality: PeerQuality,
+    /// 对方自测的 NAT 类型
+    nat: Option<NatInfo>,
 }
 
 impl Peer {
@@ -323,8 +325,43 @@ impl Peer {
             unstable_until: None,
             good_since: None,
             quality: PeerQuality::default(),
+            nat: None,
         }
     }
+}
+
+/// 按两次探测（服务器主端口、探测端口）看到的我的公网地址判断 NAT 类型
+pub fn classify_nat(main: SocketAddr, probe: SocketAddr, lan: &[SocketAddr]) -> NatInfo {
+    if lan.iter().any(|l| l.ip() == main.ip().to_canonical()) {
+        return NatInfo { kind: voc_proto::NAT_OPEN, port: main.port(), step: 0 };
+    }
+    if main == probe {
+        return NatInfo { kind: voc_proto::NAT_CONE, port: main.port(), step: 0 };
+    }
+    // 换个目标端口公网端口就变：对称型。差得不多说明是按顺序分配的，可以预测
+    let step = probe.port() as i32 - main.port() as i32;
+    if main.ip() == probe.ip() && step != 0 && step.abs() <= 64 {
+        NatInfo { kind: voc_proto::NAT_SYM_PREDICTABLE, port: probe.port(), step: step.signum() as i16 * (step.abs().min(8)) as i16 }
+    } else {
+        NatInfo { kind: voc_proto::NAT_SYM_RANDOM, port: probe.port(), step: 0 }
+    }
+}
+
+fn is_symmetric(n: Option<NatInfo>) -> bool {
+    n.is_some_and(|n| n.kind == voc_proto::NAT_SYM_PREDICTABLE || n.kind == voc_proto::NAT_SYM_RANDOM)
+}
+
+/// 两边都是对称型、且至少一边端口随机：基本打不通，直接走服务器，不白等
+pub fn hopeless_pair(me: Option<NatInfo>, peer: Option<NatInfo>) -> bool {
+    is_symmetric(me) && is_symmetric(peer) && [me, peer].iter().any(|n| n.is_some_and(|n| n.kind == voc_proto::NAT_SYM_RANDOM))
+}
+
+/// 对方是可预测的对称型：按它的步长猜接下来几个端口
+pub fn predicted_ports(n: NatInfo) -> Vec<u16> {
+    if n.kind != voc_proto::NAT_SYM_PREDICTABLE || n.step == 0 {
+        return Vec::new();
+    }
+    (1..=16i32).map(|i| n.port as i32 + n.step as i32 * i).filter(|p| (1024..=65535).contains(p)).map(|p| p as u16).collect()
 }
 
 impl Peer {
@@ -454,6 +491,11 @@ pub struct Link {
     created: Instant,
     /// 服务器看到的我的公网地址（新版服务器在 PONG 里告诉我）
     public_addr: Mutex<Option<SocketAddr>>,
+    /// 服务器的 NAT 探测端口，以及从那里看到的我的公网地址
+    probe: Option<SocketAddr>,
+    probe_addr: Mutex<Option<SocketAddr>>,
+    /// 自测的 NAT 类型（测出来后告诉服务器，打洞时对方据此选策略）
+    pub nat: Mutex<Option<NatInfo>>,
     /// 最近 30 次服务器 PING：(发送时间, 收到回复)，算丢包率
     srv_pings: Mutex<std::collections::VecDeque<(u64, bool)>>,
     /// 发出的字节数（UDP 含 IP/UDP 头，TCP 隧道只算语音和画面），诊断「上行是不是被占满」用
@@ -464,7 +506,15 @@ pub struct Link {
     route_prefs: Mutex<HashMap<u32, RoutePref>>,
     /// 服务器最近一次发来的直连候选（改了线路后重新套用）
     last_peer_list: Mutex<Vec<PeerInfo>>,
+    /// 最近约 1 秒发出的画面分片（观看者请求补发时从这里取）：(时间, 画质层, 帧号, 分片)
+    video_hist: Mutex<std::collections::VecDeque<(Instant, u8, u32, Vec<Vec<u8>>)>>,
+    /// 发出的画面分片数、被请求补发的分片数（估计丢包率，决定冗余校验包的比例）
+    video_frags_sent: AtomicU32,
+    video_frags_nacked: AtomicU32,
 }
+
+/// 补发用的画面历史保留多久
+const VIDEO_HIST: Duration = Duration::from_millis(1000);
 
 impl Link {
     fn send_raw(&self, buf: &[u8], to: SocketAddr) {
@@ -610,7 +660,9 @@ impl Link {
         }
         if on {
             let local_addrs = self.local_addrs.lock().unwrap().clone();
-            self.tcp_send(Outgoing::Msg(ClientMsg::P2pEnable { local_addrs }));
+            let nat = *self.nat.lock().unwrap();
+            self.tcp_send(Outgoing::Msg(ClientMsg::P2pEnable { local_addrs, nat }));
+            self.send_p2p_hide();
         } else {
             *self.peers.lock().unwrap() = Peers::default();
             self.tcp_send(Outgoing::Msg(ClientMsg::P2pDisable));
@@ -655,11 +707,22 @@ impl Link {
         self.watchers.lock().unwrap().len()
     }
 
-    /// 发送一帧视频的全部分片（low = 低画质层）：这一层能 P2P 直连的观看者直接发，其余交给服务器按层中转
+    /// 发送一帧视频的全部分片（low = 低画质层）：这一层能 P2P 直连的观看者直接发，其余交给服务器按层中转。
+    /// 数据分片记下来，观看者请求补发时重发
     pub fn send_video(&self, frags: &[Vec<u8>], buf: &mut Vec<u8>, low: bool) {
         let watchers = self.layer_watchers(low);
         if watchers.is_empty() {
             return;
+        }
+        if let Some((h, _)) = frags.first().and_then(|f| udp::read_video_frag(f)) {
+            let data: Vec<Vec<u8>> = frags.iter().filter(|f| udp::read_video_frag(f).is_some_and(|(x, _)| !x.is_parity())).cloned().collect();
+            self.video_frags_sent.fetch_add(data.len() as u32, Ordering::Relaxed);
+            let mut hist = self.video_hist.lock().unwrap();
+            let now = Instant::now();
+            while hist.front().is_some_and(|e| now.duration_since(e.0) > VIDEO_HIST) {
+                hist.pop_front();
+            }
+            hist.push_back((now, h.flags & udp::VIDEO_LOW, h.frame, data));
         }
         let mut direct = 0;
         if self.p2p_active() {
@@ -753,6 +816,7 @@ impl Link {
             punched: count(&|s| matches!(s, PunchState::Connected(_))),
             punching: count(&|s| matches!(s, PunchState::Punching(_))),
             failed: count(&|s| matches!(s, PunchState::Failed(_))),
+            nat: *self.nat.lock().unwrap(),
         }
     }
 
@@ -772,6 +836,61 @@ impl Link {
         }
     }
 
+    /// 观看者请求补发：peer = 直连收到的（直接重发给他），None = 服务器转来的（重发给服务器，服务器照常转发）
+    pub fn resend_video(&self, peer: Option<u32>, nack: &[u8]) {
+        let Some((_, layer, frame, idxs)) = udp::read_nack(nack) else { return };
+        let frags: Vec<Vec<u8>> = {
+            let hist = self.video_hist.lock().unwrap();
+            let Some(e) = hist.iter().rev().find(|e| e.1 == layer && e.2 == frame) else { return };
+            if idxs.contains(&udp::NACK_WHOLE) {
+                e.3.clone()
+            } else {
+                idxs.iter().filter_map(|i| e.3.get(*i as usize).cloned()).collect()
+            }
+        };
+        self.video_frags_nacked.fetch_add(frags.len() as u32, Ordering::Relaxed);
+        let mut buf = Vec::new();
+        match peer {
+            Some(id) => {
+                let mut peers = self.peers.lock().unwrap();
+                let Some(p) = peers.map.get_mut(&id) else { return };
+                if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
+                    for f in &frags {
+                        s.seal(udp::VIDEO, &udp::server_video(self.my_id, f), &mut buf);
+                        self.send_paced(path, &buf);
+                    }
+                }
+            }
+            None => {
+                for f in &frags {
+                    self.sealer.lock().unwrap().seal(udp::VIDEO, f, &mut buf);
+                    self.send_paced(self.server, &buf);
+                }
+            }
+        }
+    }
+
+    /// 取走 (发出的画面分片数, 被请求补发的分片数)
+    pub fn take_video_loss(&self) -> (u32, u32) {
+        (self.video_frags_sent.swap(0, Ordering::Relaxed), self.video_frags_nacked.swap(0, Ordering::Relaxed))
+    }
+
+    /// 向共享者请求补发：画面是直连收到的就直连发给他，否则发给服务器（服务器要支持）
+    fn send_nack(&self, to: u32, direct: bool, server_rtx: bool, payload: &[u8]) {
+        let mut buf = Vec::new();
+        if direct {
+            let mut peers = self.peers.lock().unwrap();
+            if let Some(p) = peers.map.get_mut(&to) {
+                if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
+                    s.seal(udp::NACK, payload, &mut buf);
+                    self.send_raw(&buf, path);
+                }
+            }
+        } else if server_rtx && self.udp_ok.load(Ordering::Relaxed) {
+            self.send_server(udp::NACK, payload, &mut buf);
+        }
+    }
+
     pub fn request_keyframe(&self, from: u32) {
         self.tcp_send(Outgoing::Msg(ClientMsg::KeyframeRequest { target: from }));
     }
@@ -787,8 +906,30 @@ impl Link {
             l.clone()
         };
         if self.p2p_enabled.load(Ordering::Relaxed) {
-            self.tcp_send(Outgoing::Msg(ClientMsg::P2pEnable { local_addrs: list }));
+            let nat = *self.nat.lock().unwrap();
+            self.tcp_send(Outgoing::Msg(ClientMsg::P2pEnable { local_addrs: list, nat }));
         }
+    }
+
+    /// 两次探测都有结果了：判断 NAT 类型，变了就告诉服务器
+    fn update_nat(&self) {
+        let (Some(main), Some(probe)) = (*self.public_addr.lock().unwrap(), *self.probe_addr.lock().unwrap()) else { return };
+        let n = classify_nat(main, probe, &self.lan_addrs);
+        let changed = {
+            let mut cur = self.nat.lock().unwrap();
+            let changed = *cur != Some(n);
+            *cur = Some(n);
+            changed
+        };
+        if changed && self.p2p_enabled.load(Ordering::Relaxed) {
+            let local_addrs = self.local_addrs.lock().unwrap().clone();
+            self.tcp_send(Outgoing::Msg(ClientMsg::P2pEnable { local_addrs, nat: Some(n) }));
+        }
+    }
+
+    /// 和这个人两边都是对称型 NAT，不打洞
+    fn hopeless(&self, p: &Peer) -> bool {
+        hopeless_pair(*self.nat.lock().unwrap(), p.nat)
     }
 
     /// 本机是否开启了 P2P
@@ -809,7 +950,7 @@ impl Link {
                     PunchState::Connected(p.quality)
                 } else {
                     let secs = p.punch_started.map_or(0, |t| t.elapsed().as_secs() as u32);
-                    if secs < PUNCH_FAST_SECS {
+                    if secs < PUNCH_FAST_SECS && !self.hopeless(p) {
                         PunchState::Punching(secs)
                     } else {
                         PunchState::Failed(secs)
@@ -836,9 +977,20 @@ impl Link {
             }
             *cur = prefs;
         }
+        self.send_p2p_hide();
         // 「走服务器」的人从直连候选里去掉，改回来的重新打洞
         let list = self.last_peer_list.lock().unwrap().clone();
         self.on_peers(list);
+    }
+
+    /// 告诉服务器：选了走服务器的人，双方地址互不透露
+    fn send_p2p_hide(&self) {
+        if !self.p2p_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut ids: Vec<u32> = self.route_prefs.lock().unwrap().iter().filter(|(_, r)| **r == RoutePref::Server).map(|(id, _)| *id).collect();
+        ids.sort();
+        self.tcp_send(Outgoing::Msg(ClientMsg::P2pHide { ids }));
     }
 
     pub fn route_pref(&self, id: u32) -> RoutePref {
@@ -858,6 +1010,7 @@ impl Link {
         for info in list {
             let cands: Vec<SocketAddr> = info.addrs.iter().filter_map(|a| a.parse().ok()).map(norm).collect();
             let p = peers.map.entry(info.id).or_insert_with(|| Peer::new(Vec::new()));
+            p.nat = info.nat;
             if p.cands != cands {
                 p.cands = cands;
                 p.punch_started = None; // 有新地址：重新快速打洞
@@ -868,6 +1021,7 @@ impl Link {
     /// 每 100 ms 调一次：打洞、保活、判断断开、同步直连名单
     fn tick(&self, buf: &mut Vec<u8>) {
         let others = self.others.lock().unwrap().clone();
+        let my_nat = *self.nat.lock().unwrap();
         let active = self.p2p_active();
         let mut peers = self.peers.lock().unwrap();
         let now = Instant::now();
@@ -903,7 +1057,8 @@ impl Link {
             if !p.confirmed {
                 // 头 15 秒每 200 ms 打一次洞，之后每 2 秒试一次（对方换了网络等情况）
                 let started = *p.punch_started.get_or_insert(now);
-                let interval = if now.duration_since(started) < Duration::from_secs(PUNCH_FAST_SECS as u64) {
+                let hopeless = hopeless_pair(my_nat, p.nat);
+                let interval = if !hopeless && now.duration_since(started) < Duration::from_secs(PUNCH_FAST_SECS as u64) {
                     Duration::from_millis(200)
                 } else {
                     Duration::from_secs(2)
@@ -922,6 +1077,13 @@ impl Link {
                     let elapsed = now.duration_since(started);
                     let spray = elapsed > Duration::from_secs(2) && elapsed < Duration::from_secs(30) && p.punch_round % 5 == 0;
                     p.punch_round = p.punch_round.wrapping_add(1);
+                    // 对方是可预测的对称型 NAT：按它的步长朝接下来的端口打（每轮都打）
+                    if let (Some(n), Some(public)) = (p.nat, p.cands.first().copied()) {
+                        for port in predicted_ports(n) {
+                            s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
+                            self.send_raw(buf, SocketAddr::new(public.ip(), port));
+                        }
+                    }
                     if let (true, Some(public)) = (spray, p.cands.first().copied()) {
                         for d in 1..=PORT_SPRAY {
                             for port in [public.port().wrapping_add(d), public.port().wrapping_sub(d)] {
@@ -1075,7 +1237,7 @@ impl Link {
                     p.on_pong(&data);
                     p.path = Some(from);
                 }
-                udp::VOICE | udp::VIDEO | udp::MUSIC | udp::SHARE_AUDIO => return Some((id, kind, data)),
+                udp::VOICE | udp::VIDEO | udp::MUSIC | udp::SHARE_AUDIO | udp::NACK => return Some((id, kind, data)),
                 _ => {}
             }
             return None;
@@ -1109,6 +1271,10 @@ pub struct VoiceState {
     stream_decoders: Mutex<HashMap<(u32, u8), UserDecoder>>,
     /// 最近收到某人画面的线路：(是不是 P2P 直连, 时间)
     video_path: Mutex<HashMap<u32, (bool, Instant)>>,
+    /// 屏幕共享支持补发的人
+    pub rtx_sharers: Mutex<std::collections::HashSet<u32>>,
+    /// 服务器支持转发补发请求
+    pub server_rtx: AtomicBool,
 }
 
 impl VoiceState {
@@ -1201,9 +1367,45 @@ pub fn on_server_video(payload: &[u8], state: &VoiceState, direct: bool) {
         state.video_path.lock().unwrap().insert(from, (direct, Instant::now()));
     }
     let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
-    let req = state.video.on_packet(payload, |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
-    if let (Some(from), Some(l)) = (req, state.current_link()) {
+    let acts = state.video.on_packet(payload, |f| state.rtx_sharers.lock().unwrap().contains(&f), |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
+    apply_video_actions(state, acts);
+}
+
+/// 测试用：环境变量 VOC_TEST_LOSS=百分比，随机丢掉收到的画面包（模拟网络丢包）
+fn test_drop_video() -> bool {
+    static LOSS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static RNG: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let loss = *LOSS.get_or_init(|| std::env::var("VOC_TEST_LOSS").ok().and_then(|v| v.parse::<f32>().ok()).map(|p| (p * 100.0) as u32).unwrap_or(0));
+    if loss == 0 {
+        return false;
+    }
+    let mut x = RNG.load(Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    RNG.store(x, Ordering::Relaxed);
+    (x % 10_000) < loss as u64
+}
+
+/// 定时检查正在看的画面（尾巴丢片、等补发超时）
+pub fn video_tick(state: &VoiceState) {
+    let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
+    let acts = state.video.tick(|f| state.rtx_sharers.lock().unwrap().contains(&f), |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
+    apply_video_actions(state, acts);
+}
+
+fn apply_video_actions(state: &VoiceState, acts: crate::video::RxActions) {
+    if acts == crate::video::RxActions::default() {
+        return;
+    }
+    let Some(l) = state.current_link() else { return };
+    for from in acts.keyframes {
         l.request_keyframe(from);
+    }
+    let server_rtx = state.server_rtx.load(Ordering::Relaxed);
+    for (from, layer, frame, idxs) in acts.nacks {
+        let direct = state.video_direct(from) == Some(true);
+        l.send_nack(from, direct, server_rtx, &udp::nack_payload(from, layer, frame, &idxs));
     }
 }
 
@@ -1262,6 +1464,7 @@ pub fn on_server_voice(payload: &[u8], state: &VoiceState, mixer: &Mutex<Mixer>,
 /// 建立加密 UDP 链路（含 P2P）并启动接收与定时线程
 pub fn connect(
     server: SocketAddr,
+    probe_port: u16,
     keys: &SessionKeys,
     my_id: u32,
     p2p_on: bool,
@@ -1311,11 +1514,17 @@ pub fn connect(
         local_port: port,
         created: Instant::now(),
         public_addr: Mutex::new(None),
+        probe: (probe_port != 0).then(|| norm(SocketAddr::new(server.ip(), probe_port))),
+        probe_addr: Mutex::new(None),
+        nat: Mutex::new(None),
         srv_pings: Mutex::new(std::collections::VecDeque::new()),
         sent_bytes: AtomicU64::new(0),
         up_history: Mutex::new(std::collections::VecDeque::new()),
         route_prefs: Mutex::new(HashMap::new()),
         last_peer_list: Mutex::new(Vec::new()),
+        video_hist: Mutex::new(std::collections::VecDeque::new()),
+        video_frags_sent: AtomicU32::new(0),
+        video_frags_nacked: AtomicU32::new(0),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1345,6 +1554,12 @@ pub fn connect(
                 last_sent = sent;
                 let ts = now_millis();
                 l.send_server(udp::PING, &udp::ping_payload(ts), &mut buf);
+                if let Some(probe) = l.probe {
+                    if n < 100 || n % 300 == 0 {
+                        l.sealer.lock().unwrap().seal(udp::PING, &udp::ping_payload(ts), &mut buf);
+                        l.send_raw(&buf, probe);
+                    }
+                }
                 {
                     let mut p = l.srv_pings.lock().unwrap();
                     p.push_back((ts, false));
@@ -1362,6 +1577,7 @@ pub fn connect(
                 }
             }
             l.tick(&mut buf);
+            video_tick(&st);
             n = n.wrapping_add(1);
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1380,6 +1596,15 @@ pub fn connect(
             let Ok((n, from)) = recv_sock.recv_from(&mut buf) else { continue };
             let from = norm(from);
             let pkt = &buf[..n];
+            if Some(from) == l.probe {
+                if let Some((udp::PONG, data)) = opener.open(pkt) {
+                    if let Some((_, Some(addr))) = udp::read_pong(&data) {
+                        *l.probe_addr.lock().unwrap() = Some(addr);
+                        l.update_nat();
+                    }
+                }
+                continue;
+            }
             if from == l.server {
                 let Some((kind, data)) = opener.open(pkt) else { continue };
                 match kind {
@@ -1391,6 +1616,7 @@ pub fn connect(
                         }
                         if public.is_some() {
                             *l.public_addr.lock().unwrap() = public;
+                            l.update_nat();
                         }
                         l.last_pong_ms.store(now, Ordering::Relaxed);
                         let rtt = (now.saturating_sub(sent) as u32).max(1);
@@ -1398,13 +1624,17 @@ pub fn connect(
                         l.server_rtt.store(rtt, Ordering::Relaxed);
                     }
                     udp::VOICE => on_server_voice(&data, &state, &mixer, &mut pcm),
+                    udp::VIDEO if test_drop_video() => {}
                     udp::VIDEO => on_server_video(&data, &state, false),
+                    udp::NACK => l.resend_video(None, &data),
                     udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &data, &state, &mixer, &mut pcm),
                     _ => {}
                 }
             } else if let Some((peer, kind, v)) = l.on_peer_packet(from, pkt, &mut out) {
                 match kind {
+                    udp::VIDEO if test_drop_video() => {}
                     udp::VIDEO => on_server_video(&v, &state, true),
+                    udp::NACK => l.resend_video(Some(peer), &v),
                     udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &v, &state, &mixer, &mut pcm),
                     _ => {
                         l.relay_forward(peer, &v, &mut out);
@@ -1705,6 +1935,27 @@ impl Transmitter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nat_classification_and_strategy() {
+        let lan: Vec<SocketAddr> = vec!["192.168.1.5:40000".parse().unwrap()];
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let cone = classify_nat(a("1.2.3.4:40000"), a("1.2.3.4:40000"), &lan);
+        assert_eq!(cone.kind, voc_proto::NAT_CONE);
+        let open = classify_nat(a("192.168.1.5:40000"), a("192.168.1.5:40000"), &lan);
+        assert_eq!(open.kind, voc_proto::NAT_OPEN);
+        let pred = classify_nat(a("1.2.3.4:40000"), a("1.2.3.4:40002"), &lan);
+        assert_eq!((pred.kind, pred.port, pred.step), (voc_proto::NAT_SYM_PREDICTABLE, 40002, 2));
+        assert_eq!(&predicted_ports(pred)[..3], &[40004, 40006, 40008]);
+        let rnd = classify_nat(a("1.2.3.4:40000"), a("1.2.3.4:61234"), &lan);
+        assert_eq!(rnd.kind, voc_proto::NAT_SYM_RANDOM);
+        assert!(predicted_ports(rnd).is_empty());
+        // 两边都对称且有一边随机：不打洞；一边好打洞就照打
+        assert!(hopeless_pair(Some(rnd), Some(pred)));
+        assert!(!hopeless_pair(Some(pred), Some(pred)));
+        assert!(!hopeless_pair(Some(rnd), Some(cone)));
+        assert!(!hopeless_pair(None, Some(rnd)), "unknown: keep trying");
+    }
+
     use super::*;
     use crate::e2e::tests::pair_up;
     use voc_proto::e2e::Identity;
@@ -1861,7 +2112,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             let link = st.current_link().unwrap();
             (link, st, rx)
         };
@@ -1870,8 +2121,8 @@ mod tests {
         let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
         la.set_others(vec![7]);
         lb.set_others(vec![3]);
-        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
-        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }]);
+        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)], nat: None }]);
+        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)], nat: None }]);
 
         let t = Instant::now();
         while !(la.direct_peers().contains_key(&7) && lb.direct_peers().contains_key(&3)) {
@@ -1953,7 +2204,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             (st.current_link().unwrap(), st, rx)
         };
         let (la, sa, rxa) = mk(3, es[0].clone());
@@ -1965,9 +2216,9 @@ mod tests {
             l.set_others(ids.iter().copied().filter(|&x| x != me).collect());
         }
         // A 只认识 R；B 只认识 R；R 认识两人
-        la.on_peers(vec![PeerInfo { id: 5, addrs: vec![addr(&lr)] }]);
-        lb.on_peers(vec![PeerInfo { id: 5, addrs: vec![addr(&lr)] }]);
-        lr.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }, PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
+        la.on_peers(vec![PeerInfo { id: 5, addrs: vec![addr(&lr)], nat: None }]);
+        lb.on_peers(vec![PeerInfo { id: 5, addrs: vec![addr(&lr)], nat: None }]);
+        lr.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)], nat: None }, PeerInfo { id: 7, addrs: vec![addr(&lb)], nat: None }]);
         let t = Instant::now();
         while !(la.direct_peers().contains_key(&5) && lb.direct_peers().contains_key(&5) && lr.direct_peers().len() == 2) {
             assert!(t.elapsed() < Duration::from_secs(5), "hole punching did not complete");
@@ -2044,7 +2295,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             (st.current_link().unwrap(), st, rx)
         };
         let (la, sa, _rxa) = mk(3, ea);
@@ -2052,8 +2303,8 @@ mod tests {
         let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
         la.set_others(vec![7]);
         lb.set_others(vec![3]);
-        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
-        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }]);
+        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)], nat: None }]);
+        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)], nat: None }]);
         let t = Instant::now();
         while !la.allocation().0.contains(&7) {
             assert!(t.elapsed() < Duration::from_secs(5), "never went direct");
@@ -2081,7 +2332,7 @@ mod tests {
         sink.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let (tx, _rx) = mpsc::channel::<Outgoing>();
         let st = Arc::new(VoiceState::default());
-        connect(sink.local_addr().unwrap(), &keys, 3, false, ea, tx, st.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
+        connect(sink.local_addr().unwrap(), 0, &keys, 3, false, ea, tx, st.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
         let l = st.current_link().unwrap();
         l.udp_ok.store(true, Ordering::Relaxed);
         l.set_watchers(vec![7], vec![]);
@@ -2112,17 +2363,17 @@ mod tests {
         let dummy_server: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let (tx, _rx) = mpsc::channel::<Outgoing>();
         let sa = Arc::new(VoiceState::default());
-        connect(dummy_server, &keys, 3, true, ea.clone(), tx, sa.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
+        connect(dummy_server, 0, &keys, 3, true, ea.clone(), tx, sa.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
         let (tx, _rx2) = mpsc::channel::<Outgoing>();
         let sb = Arc::new(VoiceState::default());
         let mb = Arc::new(Mutex::new(Mixer::default()));
-        connect(dummy_server, &keys, 7, true, eb, tx, sb.clone(), mb.clone()).unwrap();
+        connect(dummy_server, 0, &keys, 7, true, eb, tx, sb.clone(), mb.clone()).unwrap();
         let (la, lb) = (sa.current_link().unwrap(), sb.current_link().unwrap());
         let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
         la.set_others(vec![7]);
         lb.set_others(vec![3]);
-        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
-        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }]);
+        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)], nat: None }]);
+        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)], nat: None }]);
         let t = Instant::now();
         while !la.allocation().0.contains(&7) {
             assert!(t.elapsed() < Duration::from_secs(5), "never went direct");
@@ -2234,7 +2485,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             let link = st.current_link().unwrap();
             (link, st, rx)
         };
@@ -2243,8 +2494,8 @@ mod tests {
         let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
         la.set_others(vec![7]);
         lb.set_others(vec![3]);
-        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)] }]);
-        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)] }]);
+        la.on_peers(vec![PeerInfo { id: 7, addrs: vec![addr(&lb)], nat: None }]);
+        lb.on_peers(vec![PeerInfo { id: 3, addrs: vec![addr(&la)], nat: None }]);
         let t = Instant::now();
         while !(la.direct_peers().contains_key(&7) && lb.direct_peers().contains_key(&3)) {
             assert!(t.elapsed() < Duration::from_secs(5), "hole punching did not complete");

@@ -41,6 +41,56 @@ pub const BLOB_IMAGE: u8 = 3;
 pub const BLOB_DM: u8 = 4;
 /// 私聊图片的密钥和信息
 pub const BLOB_DM_IMAGE: u8 = 5;
+/// 能力公告（JSON [`Hello`]），建立加密后互相发一次；旧版客户端忽略
+pub const BLOB_HELLO: u8 = 6;
+/// 带编号的聊天（JSON [`Chat2`]），只发给公告过 [`FEATURE_CHAT2`] 的人，其余人仍发 BLOB_CHAT / BLOB_DM
+pub const BLOB_CHAT2: u8 = 7;
+/// 表情回应（JSON [`React`]）
+pub const BLOB_REACT: u8 = 8;
+
+/// 个人资料（JSON [`Profile`]）：只给成员看、服务器看不到的信息，例如正在放伴奏的程序名
+pub const BLOB_PROFILE: u8 = 9;
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct Profile {
+    /// 正在放伴奏的程序名（服务器那边只知道「在放伴奏」）
+    #[serde(default)]
+    pub music: Option<String>,
+}
+
+/// 能力：认识 BLOB_CHAT2 / BLOB_REACT
+pub const FEATURE_CHAT2: &str = "chat2";
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct Hello {
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// 带编号的聊天消息：编号由发送者生成，(发送者, 编号) 唯一，回应靠它找到消息
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct Chat2 {
+    pub id: u64,
+    pub text: String,
+    /// 私聊
+    #[serde(default)]
+    pub dm: bool,
+}
+
+/// 对某条消息的表情回应：on = 加上 / 取消
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct React {
+    /// 被回应的消息：(发送者, 编号)
+    pub from: u32,
+    pub id: u64,
+    pub emoji: String,
+    pub on: bool,
+    #[serde(default)]
+    pub dm: bool,
+}
+
+/// 可以用的回应表情（收到别的就忽略，防止塞进奇怪的长字符串）
+pub const REACTIONS: [&str; 6] = ["👍", "😂", "❤", "😮", "😢", "👎"];
 
 const CTX_EK: &[u8] = b"voc e2e ek v1";
 const CTX_PAIR: &[u8] = b"voc e2e pair v1";

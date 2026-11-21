@@ -246,6 +246,8 @@ pub struct HwEncoder {
     frame_no: i64,
     need_input: u32,
     pub name: String,
+    /// 编码器接受了「逐行刷新」（画面按条带逐帧刷新，不再定期发整张关键帧）
+    pub intra_refresh: bool,
     _d3d: Option<(IMFDXGIDeviceManager, ID3D11Device)>,
 }
 
@@ -315,6 +317,16 @@ impl HwEncoder {
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps * 10));
             }
+            // 逐行刷新：用 1 秒刷完整个画面，丢包后自愈，也去掉定期整张关键帧的瞬间大流量。
+            // 不是所有显卡编码器都支持，支持的才把关键帧间隔拉长
+            let intra_refresh = std::env::var_os("VOC_NO_INTRA_REFRESH").is_none()
+                && codec_api.as_ref().is_some_and(|api| {
+                    api.IsSupported(&CODECAPI_AVEncVideoGradualIntraRefresh).is_ok()
+                        && api.SetValue(&CODECAPI_AVEncVideoGradualIntraRefresh, &VARIANT::from(fps)).is_ok()
+                });
+            if let (true, Some(api)) = (intra_refresh, &codec_api) {
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(fps * 60));
+            }
 
             // 先设输出类型，再设输入类型（编码器的要求）
             let out = MFCreateMediaType()?;
@@ -340,7 +352,7 @@ impl HwEncoder {
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             let events: IMFMediaEventGenerator = mft.cast()?;
-            Ok(Self { mft, events, codec_api, width, height, fps, frame_no: 0, need_input: 0, name: info.name.clone(), _d3d: d3d })
+            Ok(Self { mft, events, codec_api, width, height, fps, frame_no: 0, need_input: 0, name: info.name.clone(), intra_refresh, _d3d: d3d })
         }
     }
 

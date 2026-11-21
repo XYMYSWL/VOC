@@ -52,6 +52,11 @@ struct Persisted {
     share_audio: bool,
     /// 按键说话：虚拟键码，0 = 语音激活
     ptt_vk: u32,
+    /// 被 @、收到私聊时弹 Windows 通知
+    notify: bool,
+    /// 全局快捷键：闭麦 / 静音（游戏里也有效）
+    mute_key: crate::hotkey::Hotkey,
+    deafen_key: crate::hotkey::Hotkey,
     /// 低带宽模式（手机热点、流量少的网络）
     low_bandwidth: bool,
     /// 手动选的线路：服务器地址 → 昵称 → 选择（没有的按自动）
@@ -62,6 +67,8 @@ struct Persisted {
     hw_decode: bool,
     /// 启动时检查更新
     auto_update: bool,
+    /// 中国大陆加速更新：经国内 GitHub 镜像下载
+    update_accel: bool,
     /// 进出频道提示音
     sfx: bool,
     sfx_volume: f32,
@@ -104,11 +111,15 @@ impl Default for Persisted {
             aec: true,
             share_audio: true,
             ptt_vk: 0,
+            notify: true,
+            mute_key: crate::hotkey::Hotkey::ctrl(0x4D),
+            deafen_key: crate::hotkey::Hotkey::ctrl(0x44),
             low_bandwidth: false,
             routes: HashMap::new(),
             last_channel: HashMap::new(),
             hw_decode: false,
             auto_update: true,
+            update_accel: false,
             sfx: true,
             sfx_volume: 0.7,
             identity_seed: String::new(),
@@ -118,7 +129,8 @@ impl Default for Persisted {
 }
 
 enum ChatLine {
-    User { from: String, text: String, ts: u64, mine: bool },
+    /// id = (发送者, 编号)，对方是旧版本时没有（不能回应）；reactions = 表情 → 回应的人
+    User { from: String, text: String, ts: u64, mine: bool, id: Option<(u32, u64)>, reactions: Vec<(String, Vec<u32>)> },
     System(String),
     Image(Box<ImageLine>),
 }
@@ -356,6 +368,52 @@ fn wipe_dm(t: &mut DmThread) {
     wipe_chat(&mut t.lines);
 }
 
+/// 消息里有没有 @这个人（名字后面紧跟字母数字的不算，例如 @小明明 不算 @小明）
+pub fn mentions(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let pat = format!("@{name}");
+    text.match_indices(&pat).any(|(i, _)| text[i + pat.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric()))
+}
+
+/// 正在输入的 @：返回 @ 后面已经打的字（输入框末尾是 "@xx" 时）
+pub fn mention_prefix(input: &str) -> Option<&str> {
+    let at = input.rfind('@')?;
+    let rest = &input[at + 1..];
+    let ok_before = input[..at].chars().last().is_none_or(|c| c.is_whitespace());
+    (ok_before && !rest.contains(char::is_whitespace) && rest.chars().count() <= voc_proto::MAX_NAME_LEN).then_some(rest)
+}
+
+/// 给某条消息加上 / 取消某人的表情回应
+fn apply_reaction(lines: &mut [ChatLine], msg: (u32, u64), emoji: &str, by: u32, on: bool) {
+    for l in lines.iter_mut().rev() {
+        if let ChatLine::User { id: Some(i), reactions, .. } = l {
+            if *i != msg {
+                continue;
+            }
+            match reactions.iter().position(|(e, _)| e == emoji) {
+                Some(k) => {
+                    let who = &mut reactions[k].1;
+                    who.retain(|w| *w != by);
+                    if on {
+                        who.push(by);
+                    }
+                    if who.is_empty() {
+                        reactions.remove(k);
+                    }
+                }
+                None if on => reactions.push((emoji.to_string(), vec![by])),
+                None => {}
+            }
+            return;
+        }
+    }
+}
+
+/// 告诉服务器的伴奏名（真正的程序名端到端发给成员，见 Profile）
+pub const MUSIC_PLACEHOLDER: &str = "伴奏";
+
 fn wipe_chat(lines: &mut Vec<ChatLine>) {
     let wipe = wipe_string;
     for l in lines.iter_mut() {
@@ -425,6 +483,14 @@ pub struct App {
     big_audio_buffer: bool,
     /// 正在等用户按下新的说话键
     ptt_capture: bool,
+    /// 全局快捷键检测；正在录哪个快捷键（0 闭麦，1 静音）
+    hotkeys: crate::hotkey::Watcher,
+    hotkey_capture: Option<usize>,
+    /// 窗口不在前台时收到的消息数（托盘显示，回到窗口清零）
+    unread: u32,
+    /// 这一轮收消息攒下的：新消息数、要弹的通知 (标题, 内容)
+    unread_new: u32,
+    pending_notes: Vec<(String, String)>,
     /// 正在接收的图片
     images: crate::images::ImageStore,
     /// 后台准备好的待发送图片（选图 / 粘贴 / 拖入）
@@ -494,6 +560,7 @@ impl App {
         let denoise: DenoiseSlot = Arc::new(Mutex::new(None));
         voice::spawn_encoder(frames_rx, settings.clone(), voice.clone(), mixer.clone(), denoise.clone());
 
+        let hotkeys = crate::hotkey::Watcher::spawn(vec![cfg.mute_key, cfg.deafen_key], cc.egui_ctx.clone());
         let mut app = Self {
             code_input: cfg.code.clone(),
             show_code: false,
@@ -536,6 +603,11 @@ impl App {
             last_device_check: std::time::Instant::now(),
             big_audio_buffer: false,
             ptt_capture: false,
+            hotkeys,
+            hotkey_capture: None,
+            unread: 0,
+            unread_new: 0,
+            pending_notes: Vec::new(),
             images: crate::images::ImageStore::default(),
             image_jobs: mpsc::channel(),
             image_view: None,
@@ -557,6 +629,7 @@ impl App {
         if std::env::var("VOC_DEMO").is_err() {
             let icon = crate::window_icon();
             app.tray = crate::tray::Tray::new(&cc.egui_ctx, icon.rgba, icon.width, icon.height);
+            app.updater.accel.store(app.cfg.update_accel, Ordering::Relaxed);
             app.autostart = crate::autostart::state();
         }
         let at_startup = crate::autostart::launched_at_startup();
@@ -715,6 +788,54 @@ impl App {
         }
     }
 
+    /// 处理收消息时攒下的提醒：VOC 窗口不在前台（缩到托盘 / 在玩游戏）时记未读；
+    /// 被 @ 或收到私聊时弹 Windows 通知（安装版），任务栏图标闪一下
+    fn flush_notes(&mut self) {
+        let notes = std::mem::take(&mut self.pending_notes);
+        let new = std::mem::take(&mut self.unread_new);
+        let focused = !self.hidden && self.egui_ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused || self.demo.active {
+            return;
+        }
+        self.unread += new;
+        if !self.cfg.notify || notes.is_empty() {
+            return;
+        }
+        self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        for (title, body) in notes.into_iter().take(3) {
+            let body: String = body.chars().take(80).collect();
+            crate::notify::toast(&title, &body);
+        }
+    }
+
+    /// 全局快捷键按下了：切换闭麦 / 静音，响一声提示（游戏里看不到窗口也知道切成功了）
+    fn handle_hotkeys(&mut self) {
+        let fired = self.hotkeys.take();
+        if fired == 0 {
+            return;
+        }
+        for (bit, flag) in [(1u32, &self.settings.muted), (2, &self.settings.deafened)] {
+            if fired & bit == 0 {
+                continue;
+            }
+            let on = !flag.fetch_xor(true, Ordering::Relaxed);
+            if self.cfg.sfx {
+                let mut m = self.mixer.lock().unwrap();
+                m.set_volume(SFX_ID, self.cfg.sfx_volume);
+                for f in audio::chime(if on { Chime::MuteOn } else { Chime::MuteOff }).chunks(voc_proto::FRAME_SAMPLES) {
+                    self.sfx_seq = self.sfx_seq.wrapping_add(1);
+                    m.push(SFX_ID, self.sfx_seq, f);
+                }
+            }
+        }
+        self.sync_voice_state();
+    }
+
+    /// 改了快捷键后交给后台检测线程
+    fn apply_hotkeys(&self) {
+        self.hotkeys.set_keys(vec![self.cfg.mute_key, self.cfg.deafen_key]);
+    }
+
     fn sync_voice_state(&self) {
         if let Screen::Main(s) = &self.screen {
             s.send(ClientMsg::SetState {
@@ -736,9 +857,14 @@ impl App {
             self.test_share_started = true;
             let mut cfg = self.cfg.share.clone();
             cfg.height = h.parse().unwrap_or(720);
+            // VOC_TEST_FPS / VOC_TEST_QUALITY（0 标准 1 高 2 极高）；VOC_TEST_RTX=0 模拟不支持补发的旧版共享者
+            let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+            cfg.fps = env("VOC_TEST_FPS").unwrap_or(cfg.fps);
+            cfg.quality = env("VOC_TEST_QUALITY").map(|q| q as u8).unwrap_or(cfg.quality);
+            let rtx = env("VOC_TEST_RTX") != Some(0);
             match Sharer::start(cfg.clone(), self.voice.clone()) {
                 Ok(sh) => {
-                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true });
+                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true, rtx });
                     self.sharer = Some(sh);
                 }
                 Err(e) => eprintln!("VOC_TEST_SHARE 失败：{e}"),
@@ -771,7 +897,8 @@ impl App {
         if let Some(sh) = &self.sharer {
             let st = &sh.stats;
             line += &format!(
-                "| 共享 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
+                "| 共享 冗余 {} 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
+                st.fec_k.load(Ordering::Relaxed),
                 st.capture_fps.load(Ordering::Relaxed),
                 st.fps.load(Ordering::Relaxed),
                 st.kbps.load(Ordering::Relaxed),
@@ -786,10 +913,11 @@ impl App {
             let f = v.view.frame.lock().unwrap();
             let (w, h, seq) = f.as_ref().map(|f| (f.width, f.height, f.seq)).unwrap_or((0, 0, 0));
             line += &format!(
-                "| 看 #{id} {w}x{h} 已解 {seq} 帧 {} fps 解码器 {:?} 线路 {:?} ",
+                "| 看 #{id} {w}x{h} 已解 {seq} 帧 {} fps 解码器 {:?} 线路 {:?} 恢复(校验,补发) {:?} ",
                 v.view.fps.load(Ordering::Relaxed),
                 v.view.decoder.lock().unwrap(),
-                self.voice.video_direct(*id).map(|d| if d { "直连" } else { "服务器" })
+                self.voice.video_direct(*id).map(|d| if d { "直连" } else { "服务器" }),
+                self.voice.video.recovery_stats(*id)
             );
         }
         use std::io::Write;
@@ -865,8 +993,9 @@ impl App {
                         let st = &sh.stats;
                         let _ = writeln!(
                             d,
-                            "屏幕共享：{} · 观看 {} 人（其中流畅 {} 人）· 实际 {}×{} {} fps {} kbps · 码率 {}% · {} · {}",
+                            "屏幕共享：{} {} · 观看 {} 人（其中流畅 {} 人）· 实际 {}×{} {} fps {} kbps · 流畅层码率 {}% · 冗余 {} · {} · {}",
                             sh.cfg.desc(),
+                            video::QUALITIES.get(sh.cfg.quality as usize).map(|q| q.0).unwrap_or("?"),
                             l.watcher_count(),
                             st.low_watchers.load(Ordering::Relaxed),
                             st.width.load(Ordering::Relaxed),
@@ -874,6 +1003,10 @@ impl App {
                             st.fps.load(Ordering::Relaxed),
                             st.kbps.load(Ordering::Relaxed),
                             st.rate_pct.load(Ordering::Relaxed),
+                            match st.fec_k.load(Ordering::Relaxed) {
+                                0 => "无".to_string(),
+                                k => format!("每 {k} 片 1 个"),
+                            },
                             st.encoder.lock().unwrap(),
                             st.pipeline.lock().unwrap(),
                         );
@@ -884,6 +1017,16 @@ impl App {
                 }
                 let _ = writeln!(d, "伴奏：{}", if self.music.is_some() { "正在放" } else { "没放" });
                 let _ = writeln!(d, "在看别人的共享：{} 路", self.views.len());
+                for id in self.views.keys() {
+                    if let Some((fec, rtx)) = self.voice.video.recovery_stats(*id) {
+                        let rtx_on = self.voice.rtx_sharers.lock().unwrap().contains(id);
+                        let _ = writeln!(
+                            d,
+                            "  看 #{id}：校验包恢复 {fec} 片 · 补发收回 {rtx} 片 · 对方{}补发",
+                            if rtx_on { "支持" } else { "不支持（旧版本）" }
+                        );
+                    }
+                }
                 // 同频道每个人：加密、线路、有没有收到他的声音（排查「我能听到他、他听不到我」）
                 let yn = |b: bool| if b { "是" } else { "否" };
                 let my_ch = s.me().and_then(|u| u.channel_id);
@@ -985,11 +1128,14 @@ impl App {
 
     /// 窗口隐藏时也要跑的事：网络、托盘、关窗口缩托盘、更新、设备拔插
     fn background(&mut self, ctx: &egui::Context) {
+        self.handle_hotkeys();
         if self.updater.get() == crate::update::UpdateState::Launched {
             self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if let Some(d) = self.poll_network() {
+        let dropped = self.poll_network();
+        self.flush_notes();
+        if let Some(d) = dropped {
             if d.retry && !self.demo.active {
                 self.begin_reconnect(d.reason);
             } else {
@@ -1097,7 +1243,12 @@ impl App {
                 Screen::Reconnecting(_) => "正在重连…".into(),
                 _ => "未连接".into(),
             };
+            if !self.hidden && ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+                self.unread = 0;
+            }
+            let status = if self.unread > 0 { format!("{status} · {} 条未读", self.unread) } else { status };
             t.set_state(m, d, &status);
+            t.set_unread(self.unread > 0);
         }
         // 关窗口 → 缩到托盘
         if ctx.input(|i| i.viewport().close_requested()) && self.cfg.close_to_tray && self.tray.is_some() && !self.quitting && !self.demo.active {
@@ -1158,7 +1309,11 @@ impl App {
             Ok(src) => {
                 let prev_volume = crate::loopback::app_volume(pid).unwrap_or(1.0);
                 if let Screen::Main(s) = &self.screen {
-                    s.send(ClientMsg::SetMusic { name: Some(name.clone()) });
+                    // 程序名只端到端发给成员；服务器只知道「在放伴奏」
+                    s.send(ClientMsg::SetMusic { name: Some(MUSIC_PLACEHOLDER.into()) });
+                    if let Some(e2e) = &s.e2e {
+                        e2e.lock().unwrap().set_profile(voc_proto::e2e::Profile { music: Some(name.clone()) });
+                    }
                 }
                 self.music = Some(MusicPlaying { pid, name, prev_volume, monitor: 1.0, gain, _src: src });
                 self.music_error = None;
@@ -1173,6 +1328,9 @@ impl App {
             crate::loopback::set_app_volume(m.pid, m.prev_volume);
             if let Screen::Main(s) = &self.screen {
                 s.send(ClientMsg::SetMusic { name: None });
+                if let Some(e2e) = &s.e2e {
+                    e2e.lock().unwrap().set_profile(Default::default());
+                }
             }
         }
     }
@@ -1330,8 +1488,9 @@ impl App {
                     apply_image_events(s, ev, &self.egui_ctx);
                 }
                 NetEvent::Msg(msg) => match msg {
-                    ServerMsg::Welcome { user_id, udp_port, server_name, features } => {
+                    ServerMsg::Welcome { user_id, udp_port, server_name, features, probe_port } => {
                         s.user_id = user_id;
+                        self.voice.server_rtx.store(features.iter().any(|f| f == voc_proto::FEATURE_VIDEO_RTX), Ordering::Relaxed);
                         s.features = features;
                         s.server_name = server_name;
                         let Some(conn) = &s.conn else { continue };
@@ -1345,8 +1504,12 @@ impl App {
                             pins,
                         )));
                         s.e2e = Some(e2e.clone());
+                        if let Some(m) = &self.music {
+                            e2e.lock().unwrap().set_profile(voc_proto::e2e::Profile { music: Some(m.name.clone()) });
+                        }
                         if let Err(e) = voice::connect(
                             udp_addr,
+                            probe_port,
                             &conn.keys,
                             user_id,
                             self.cfg.p2p,
@@ -1398,6 +1561,7 @@ impl App {
                         let ids: Vec<u32> = s.users.iter().map(|u| u.id).collect();
                         self.mixer.lock().unwrap().retain_users(|id| ids.contains(&id));
                         *self.voice.caps.lock().unwrap() = s.users.iter().map(|u| (u.id, u.decoders.clone())).collect();
+                        *self.voice.rtx_sharers.lock().unwrap() = s.users.iter().filter(|u| u.rtx).map(|u| u.id).collect();
                         // 进出提示音：只看我所在的频道；第一次收到状态（刚登录）不响
                         let my_ch = s.me().and_then(|u| u.channel_id);
                         let mut now_members: Vec<u32> = s
@@ -1504,7 +1668,14 @@ impl App {
                         match msg {
                             Some(crate::e2e::BlobIn::Chat(c)) => {
                                 let from = s.name_of(c.from);
-                                let line = ChatLine::User { from: from.clone(), text: c.text, ts, mine: false };
+                                let my_name = s.me().map(|u| u.name.clone()).unwrap_or_default();
+                                // 私聊、或频道里有人 @我：VOC 不在前台时提醒
+                                if c.dm || mentions(&c.text, &my_name) {
+                                    let title = if c.dm { format!("{from} 发来私聊") } else { format!("{from} 在频道里 @了你") };
+                                    self.pending_notes.push((title, c.text.clone()));
+                                }
+                                self.unread_new += 1;
+                                let line = ChatLine::User { from: from.clone(), text: c.text, ts, mine: false, id: c.id.map(|i| (c.from, i)), reactions: Vec::new() };
                                 if c.dm {
                                     s.push_dm(&from, line);
                                 } else {
@@ -1512,6 +1683,7 @@ impl App {
                                 }
                             }
                             Some(crate::e2e::BlobIn::Image { from, meta, dm }) => {
+                                self.unread_new += 1;
                                 let total = meta.chunks;
                                 let name = s.name_of(from);
                                 let line = ChatLine::Image(Box::new(ImageLine {
@@ -1531,6 +1703,11 @@ impl App {
                                 }
                                 let ev = self.images.on_meta(from, meta);
                                 apply_image_events(s, ev, &self.egui_ctx);
+                            }
+                            Some(crate::e2e::BlobIn::React { by, r }) => {
+                                let peer = s.name_of(by);
+                                let lines = if r.dm { s.lines_for(Some(&peer)) } else { &mut s.chat };
+                                apply_reaction(lines, (r.from, r.id), &r.emoji, by, r.on);
                             }
                             None => {}
                         }
@@ -1610,6 +1787,7 @@ impl App {
             music: None,
             share_audio: false,
             simulcast: sharing.is_some(),
+            rtx: false,
         };
         let (_tx, events) = mpsc::channel();
         let mut s = Session {
@@ -1634,12 +1812,12 @@ impl App {
             ],
             chat: vec![
                 ChatLine::System("小明 进入了语音频道「开黑一号」".into()),
-                ChatLine::User { from: "阿豪".into(), text: "今晚八点三角洲，来不来".into(), ts: now - 600_000, mine: false },
-                ChatLine::User { from: "阿豪".into(), text: "我先开个屏幕给你们看配装".into(), ts: now - 590_000, mine: false },
-                ChatLine::User { from: "小明".into(), text: "来！我把降噪开了，键盘声应该听不到了".into(), ts: now - 420_000, mine: true },
+                ChatLine::User { from: "阿豪".into(), text: "今晚八点三角洲，来不来".into(), ts: now - 600_000, mine: false, id: None, reactions: Vec::new() },
+                ChatLine::User { from: "阿豪".into(), text: "我先开个屏幕给你们看配装".into(), ts: now - 590_000, mine: false, id: None, reactions: Vec::new() },
+                ChatLine::User { from: "小明".into(), text: "来！我把降噪开了，键盘声应该听不到了".into(), ts: now - 420_000, mine: true, id: None, reactions: Vec::new() },
                 ChatLine::System("阿豪 开始了屏幕共享".into()),
-                ChatLine::User { from: "阿杰".into(), text: "我这边网络有点卡，先闭麦听你们说".into(), ts: now - 120_000, mine: false },
-                ChatLine::User { from: "Mia".into(), text: "1080p60 好清楚 👍".into(), ts: now - 30_000, mine: false },
+                ChatLine::User { from: "阿杰".into(), text: "我这边网络有点卡，先闭麦听你们说".into(), ts: now - 120_000, mine: false, id: None, reactions: Vec::new() },
+                ChatLine::User { from: "Mia".into(), text: "1080p60 好清楚 👍".into(), ts: now - 30_000, mine: false, id: None, reactions: Vec::new() },
             ],
             chat_input: String::new(),
             new_channel: String::new(),
@@ -1647,7 +1825,7 @@ impl App {
             e2e: None,
             dms: vec![DmThread {
                 peer: "阿豪".into(),
-                lines: vec![ChatLine::User { from: "阿豪".into(), text: "等下帮我看看配装，别在频道里说".into(), ts: now - 60_000, mine: false }],
+                lines: vec![ChatLine::User { from: "阿豪".into(), text: "等下帮我看看配装，别在频道里说".into(), ts: now - 60_000, mine: false, id: None, reactions: Vec::new() }],
                 unread: 1,
             }],
             chat_tab: None,
@@ -1850,6 +2028,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mention_detection() {
+        assert!(mentions("@小明 来一下", "小明"));
+        assert!(mentions("快来@小明", "小明"));
+        assert!(mentions("@小明，开黑", "小明"));
+        assert!(!mentions("@小明明 来", "小明"), "longer name is someone else");
+        assert!(!mentions("小明 来", "小明"));
+        assert!(!mentions("@ 来", ""));
+        assert_eq!(mention_prefix("你好 @小"), Some("小"));
+        assert_eq!(mention_prefix("@"), Some(""));
+        assert_eq!(mention_prefix("邮箱a@b"), None, "not after a space");
+        assert_eq!(mention_prefix("@小明 好"), None, "already finished");
+    }
+
+    #[test]
+    fn reactions_toggle() {
+        let mut lines = vec![ChatLine::User { from: "a".into(), text: "x".into(), ts: 0, mine: false, id: Some((1, 5)), reactions: Vec::new() }];
+        let get = |l: &[ChatLine]| match &l[0] {
+            ChatLine::User { reactions, .. } => reactions.clone(),
+            _ => unreachable!(),
+        };
+        apply_reaction(&mut lines, (1, 5), "👍", 2, true);
+        apply_reaction(&mut lines, (1, 5), "👍", 3, true);
+        apply_reaction(&mut lines, (1, 5), "👍", 3, true); // 重复不算两次
+        apply_reaction(&mut lines, (1, 6), "👍", 3, true); // 别的消息
+        assert_eq!(get(&lines), vec![("👍".to_string(), vec![2, 3])]);
+        apply_reaction(&mut lines, (1, 5), "👍", 2, false);
+        apply_reaction(&mut lines, (1, 5), "👍", 3, false);
+        assert!(get(&lines).is_empty());
+    }
+
+    #[test]
     fn ptt_key_names() {
         assert_eq!(vk_name(0x05), "鼠标侧键 1");
         assert_eq!(vk_name(0x06), "鼠标侧键 2");
@@ -1873,7 +2082,7 @@ mod tests {
         let old = unsafe { std::slice::from_raw_parts(p, n) };
         assert!(old.iter().all(|&b| b == 0));
         let mut chat = vec![
-            ChatLine::User { from: "小明".into(), text: "你好".into(), ts: 0, mine: false },
+            ChatLine::User { from: "小明".into(), text: "你好".into(), ts: 0, mine: false, id: None, reactions: Vec::new() },
             ChatLine::System("小明 进入了频道".into()),
         ];
         wipe_chat(&mut chat);

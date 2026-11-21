@@ -204,15 +204,19 @@ if command -v timedatectl >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------- 防火墙
+# NAT 探测端口（服务器默认用主端口 + 1，帮客户端判断 NAT 类型）
+PROBE_PORT=$((VOC_PORT + 1))
 if [ "$FIREWALL" -eq 1 ]; then
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        info "ufw 放行 $VOC_PORT/tcp 和 $VOC_PORT/udp"
+        info "ufw 放行 $VOC_PORT/tcp、$VOC_PORT/udp 和 NAT 探测端口 $PROBE_PORT/udp"
         ufw allow "$VOC_PORT/tcp" >/dev/null
         ufw allow "$VOC_PORT/udp" >/dev/null
+        ufw allow "$PROBE_PORT/udp" >/dev/null
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        info "firewalld 放行 $VOC_PORT/tcp 和 $VOC_PORT/udp"
+        info "firewalld 放行 $VOC_PORT/tcp、$VOC_PORT/udp 和 NAT 探测端口 $PROBE_PORT/udp"
         firewall-cmd --permanent --add-port="$VOC_PORT/tcp" >/dev/null
         firewall-cmd --permanent --add-port="$VOC_PORT/udp" >/dev/null
+        firewall-cmd --permanent --add-port="$PROBE_PORT/udp" >/dev/null
         firewall-cmd --reload >/dev/null
     else
         info "未检测到启用中的 ufw / firewalld，跳过本机防火墙设置"
@@ -257,4 +261,4 @@ echo "  sudo voc list-codes / revoke-code <ID>"
 echo "  sudo voc status / logs / restart"
 echo "  sudo voc upgrade                     升级到最新版（保留授权码和配置）"
 echo
-red "⚠ 如果是云服务器（阿里云、腾讯云、AWS 等），还要在控制台的「安全组 / 防火墙」里放行 TCP 和 UDP 的 $VOC_PORT 端口。"
+red "⚠ 如果是云服务器（阿里云、腾讯云、AWS 等），还要在控制台的「安全组 / 防火墙」里放行 TCP 和 UDP 的 $VOC_PORT 端口，以及 UDP $PROBE_PORT（NAT 探测，可选）。"

@@ -48,6 +48,10 @@ struct User {
     voice_udp: bool,
     /// 开启 P2P 时：自报的本地地址
     p2p: Option<Vec<String>>,
+    /// 自测的 NAT 类型
+    nat: Option<NatInfo>,
+    /// 选了和这些人走服务器：双方的地址互不透露
+    p2p_hide: HashSet<u32>,
     /// 端到端加密身份公告
     e2e: Option<E2eEntry>,
     /// 已与之直连的成员：不再替该用户把语音转发给他们
@@ -66,6 +70,10 @@ struct User {
     watch_route: HashMap<u32, u8>,
     /// 我的屏幕共享有低画质层
     simulcast: bool,
+    /// 我的屏幕共享支持丢包补发（收到 NACK 会重发）和冗余校验包
+    rtx: bool,
+    /// 我最近发出的画面分片（观看者补发请求先从这里找，找不到再转给我）
+    video_cache: VideoCache,
     /// 上次发给我的观看者名单（我是共享者时）：全部、要低画质的、选了 P2P 的、选了走服务器的
     last_watchers: (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>),
     /// 能解码的视频格式
@@ -84,6 +92,59 @@ struct User {
     uploads: HashMap<u64, (u32, u32, Instant, Option<u32>)>,
     /// 还没开始上传的私聊图片：id → 接收者
     upload_to: HashMap<u64, u32>,
+}
+
+/// 共享者最近的画面分片：(画质层, 帧号) → 分片号 → 分片（含分片头）
+#[derive(Default)]
+struct VideoCache {
+    frames: HashMap<(u8, u32), HashMap<u16, Vec<u8>>>,
+    order: std::collections::VecDeque<(u8, u32)>,
+    bytes: usize,
+}
+
+/// 每个共享者最多缓存多少字节的画面（约 1 秒的 25 Mbps）
+const VIDEO_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const VIDEO_CACHE_FRAMES: usize = 240;
+
+impl VideoCache {
+    fn insert(&mut self, layer: u8, frame: u32, idx: u16, frag: &[u8]) {
+        let key = (layer, frame);
+        let e = self.frames.entry(key).or_insert_with(|| {
+            self.order.push_back(key);
+            HashMap::new()
+        });
+        if e.insert(idx, frag.to_vec()).is_none() {
+            self.bytes += frag.len();
+        }
+        while self.bytes > VIDEO_CACHE_BYTES || self.order.len() > VIDEO_CACHE_FRAMES {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some(m) = self.frames.remove(&old) {
+                self.bytes -= m.values().map(|v| v.len()).sum::<usize>();
+            }
+        }
+    }
+
+    /// 找补发请求要的分片：(找到的, 没找到的分片号)。整帧请求时只要缓存里有这一帧的全部数据片就算找到
+    fn lookup(&self, layer: u8, frame: u32, idxs: &[u16]) -> (Vec<Vec<u8>>, Vec<u16>) {
+        let Some(m) = self.frames.get(&(layer, frame)) else { return (Vec::new(), idxs.to_vec()) };
+        let (mut found, mut missing) = (Vec::new(), Vec::new());
+        for &i in idxs {
+            if i == udp::NACK_WHOLE {
+                let count = m.values().next().and_then(|f| udp::read_video_frag(f)).map(|(h, _)| h.count).unwrap_or(0);
+                if count > 0 && (0..count).all(|j| m.contains_key(&j)) {
+                    found.extend((0..count).map(|j| m[&j].clone()));
+                } else {
+                    missing.push(i);
+                }
+            } else {
+                match m.get(&i) {
+                    Some(f) => found.push(f.clone()),
+                    None => missing.push(i),
+                }
+            }
+        }
+        (found, missing)
+    }
 }
 
 /// 客户端上报的链路质量
@@ -108,6 +169,8 @@ impl User {
 struct State {
     server_name: String,
     udp_port: u16,
+    /// NAT 探测端口，0 = 没开
+    probe_port: u16,
     users: HashMap<u32, User>,
     addr_map: HashMap<SocketAddr, u32>,
     channels: Vec<ChannelInfo>,
@@ -139,6 +202,7 @@ impl State {
                 music: u.music.clone(),
                 share_audio: u.sharing.is_some() && u.share_audio,
                 simulcast: u.sharing.is_some() && u.simulcast,
+                rtx: u.sharing.is_some() && u.rtx,
             })
             .collect();
         users.sort_by_key(|u| u.id);
@@ -163,25 +227,37 @@ impl State {
         self.channels.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_default()
     }
 
-    /// 给每个开启 P2P 的用户推送「同频道、也开启了 P2P、UDP 地址已知」的成员列表（有变化才发）
+    /// 给每个开启 P2P 的用户推送「同频道、也开启了 P2P、UDP 地址已知」的成员列表（有变化才发）。
+    /// 隐私：任何一方选了和对方走服务器，双方地址互不透露；局域网地址只给同一个局域网（公网 IP 相同）的人
     fn push_peers(&mut self) {
-        let infos: Vec<(u32, Option<u32>, PeerInfo)> = self
+        struct Cand {
+            id: u32,
+            ch: Option<u32>,
+            public: SocketAddr,
+            local: Vec<String>,
+            nat: Option<NatInfo>,
+            hide: HashSet<u32>,
+        }
+        let cands: Vec<Cand> = self
             .users
             .iter()
             .filter_map(|(id, u)| {
                 let local = u.p2p.as_ref()?;
-                let public = u.udp?;
-                let mut addrs = vec![public.to_string()];
-                addrs.extend(local.iter().take(8).cloned());
-                Some((*id, u.channel, PeerInfo { id: *id, addrs }))
+                Some(Cand { id: *id, ch: u.channel, public: u.udp?, local: local.iter().take(8).cloned().collect(), nat: u.nat, hide: u.p2p_hide.clone() })
             })
             .collect();
         for (id, u) in self.users.iter_mut() {
+            let my_public = u.udp.map(|a| a.ip().to_canonical());
             let mut peers: Vec<PeerInfo> = match (&u.p2p, u.channel) {
-                (Some(_), Some(ch)) => infos
+                (Some(_), Some(ch)) => cands
                     .iter()
-                    .filter(|(pid, pch, _)| pid != id && *pch == Some(ch))
-                    .map(|(_, _, p)| p.clone())
+                    .filter(|c| c.id != *id && c.ch == Some(ch) && !c.hide.contains(id) && !u.p2p_hide.contains(&c.id))
+                    .map(|c| {
+                        let same_lan = my_public == Some(c.public.ip().to_canonical());
+                        let mut addrs = vec![c.public.to_string()];
+                        addrs.extend(c.local.iter().filter(|a| same_lan || a.parse::<SocketAddr>().is_ok_and(|a| is_public(a.ip()))).cloned());
+                        PeerInfo { id: c.id, addrs, nat: c.nat }
+                    })
                     .collect(),
                 _ => Vec::new(),
             };
@@ -365,6 +441,9 @@ impl State {
         let simulcast = u.simulcast;
         let direct = u.direct_video.clone();
         let payload = udp::server_video(from, frag);
+        if let Some(u) = self.users.get_mut(&from) {
+            u.video_cache.insert(f.flags & udp::VIDEO_LOW, f.frame, f.idx, frag);
+        }
         let mut out = Vec::new();
         for (id, other) in self.users.iter_mut() {
             if other.channel != Some(ch) || !other.watching.contains(&from) || direct.contains(id) {
@@ -383,6 +462,33 @@ impl State {
                     let _ = other.tx.send(Out::Video(payload.clone()));
                 }
             }
+        }
+        out
+    }
+
+    /// 观看者的补发请求：缓存里有的直接重发给他，没有的转给共享者（共享者重发后照常转发）
+    fn on_nack(&mut self, uid: u32, data: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
+        let mut out = Vec::new();
+        let Some((target, layer, frame, idxs)) = udp::read_nack(data) else { return out };
+        let (Some(me), Some(t)) = (self.users.get(&uid), self.users.get(&target)) else { return out };
+        if !me.watching.contains(&target) || t.sharing.is_none() {
+            return out;
+        }
+        let (found, missing) = t.video_cache.lookup(layer, frame, &idxs);
+        let sharer = (t.rtx, t.voice_udp, t.udp);
+        let me = self.users.get_mut(&uid).unwrap();
+        if let (true, Some(addr)) = (me.voice_udp, me.udp) {
+            for f in found {
+                let mut pkt = Vec::new();
+                me.udp_seal.seal(udp::VIDEO, &udp::server_video(target, &f), &mut pkt);
+                out.push((addr, pkt));
+            }
+        }
+        if let (false, (true, true, Some(addr))) = (missing.is_empty(), sharer) {
+            let t = self.users.get_mut(&target).unwrap();
+            let mut pkt = Vec::new();
+            t.udp_seal.seal(udp::NACK, &udp::nack_payload(uid, layer, frame, &missing), &mut pkt);
+            out.push((addr, pkt));
         }
         out
     }
@@ -421,6 +527,8 @@ impl State {
 
 struct Config {
     bind: SocketAddr,
+    /// NAT 探测端口，None = 主端口 + 1，Some(0) = 不开
+    probe_port: Option<u16>,
     name: String,
     channels: Vec<String>,
     codes: PathBuf,
@@ -440,6 +548,7 @@ VOC 服务器
     -n, --name       服务器名称
     -c, --channels   初始语音频道
         --codes      授权码文件，默认 voc-codes.json
+        --probe-port NAT 探测用的 UDP 端口，默认主端口 + 1（7879），0 = 不开
 
 管理授权码（服务器运行中也可以执行，立即生效）：
   voc-server gen-code [-n 数量] [--note 备注] [--days 有效天数] [--codes 文件]
@@ -494,6 +603,7 @@ fn main() {
 fn parse_run(args: &[String], codes: PathBuf) -> Config {
     let mut cfg = Config {
         bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
+        probe_port: None,
         name: "VOC 服务器".into(),
         channels: vec!["大厅".into(), "开黑一号".into(), "开黑二号".into(), "挂机".into()],
         codes,
@@ -504,6 +614,7 @@ fn parse_run(args: &[String], codes: PathBuf) -> Config {
         match a.as_str() {
             "--bind" | "-b" => cfg.bind = val().parse().unwrap_or_else(|_| die("--bind 格式应为 IP:端口")),
             "--name" | "-n" => cfg.name = val(),
+            "--probe-port" => cfg.probe_port = Some(val().parse().unwrap_or_else(|_| die("--probe-port 必须是端口号"))),
             "--channels" | "-c" => {
                 cfg.channels = val().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             }
@@ -561,6 +672,19 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let tcp = TcpListener::bind(cfg.bind).await?;
     let udp_sock = Arc::new(bind_udp(cfg.bind)?);
     let port = tcp.local_addr()?.port();
+    // NAT 探测端口：开不了（被占用等）不影响主服务
+    let probe_port = cfg.probe_port.unwrap_or(port.wrapping_add(1));
+    let probe_sock = if probe_port == 0 {
+        None
+    } else {
+        match bind_udp(SocketAddr::new(cfg.bind.ip(), probe_port)) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                eprintln!("[VOC] NAT 探测端口 UDP {probe_port} 开不了（{e}），客户端将无法准确判断 NAT 类型");
+                None
+            }
+        }
+    };
 
     let channels: Vec<ChannelInfo> =
         cfg.channels.iter().enumerate().map(|(i, n)| ChannelInfo { id: i as u32 + 1, name: n.clone() }).collect();
@@ -568,6 +692,10 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let state: Shared = Arc::new(Mutex::new(State {
         server_name: cfg.name.clone(),
         udp_port: udp_sock.local_addr()?.port(),
+        probe_port: match &probe_sock {
+            Some(s) => s.local_addr()?.port(),
+            None => 0,
+        },
         next_user: 1,
         next_channel: channels.len() as u32 + 1,
         channels,
@@ -587,6 +715,10 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     println!("[VOC] 加密：ML-KEM-768 + ChaCha20-Poly1305，全流量随机化；放行 TCP 与 UDP 端口 {port}");
 
     tokio::spawn(udp_loop(state.clone(), udp_sock.clone()));
+    if let Some(p) = probe_sock {
+        println!("[VOC] NAT 探测：UDP {}（云服务器的安全组也要放行这个 UDP 端口）", p.local_addr()?.port());
+        tokio::spawn(probe_loop(state.clone(), p));
+    }
     tokio::spawn(revocation_loop(state.clone()));
     tokio::spawn(relay_loop(state.clone()));
 
@@ -758,7 +890,8 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
             user_id: id,
             udp_port: st.udp_port,
             server_name: st.server_name.clone(),
-            features: vec![voc_proto::FEATURE_DM_FILE.into(), voc_proto::FEATURE_PONG_ADDR.into()],
+            features: vec![voc_proto::FEATURE_DM_FILE.into(), voc_proto::FEATURE_PONG_ADDR.into(), voc_proto::FEATURE_VIDEO_RTX.into()],
+            probe_port: st.probe_port,
         }));
         st.users.insert(
             id,
@@ -775,6 +908,8 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 udp_seal: DatagramSealer::new(&keys.udp_s2c, &keys.udp_s2c_hp),
                 voice_udp: false, // 等客户端确认 UDP 通了再切过去
                 p2p: None,
+                nat: None,
+                p2p_hide: HashSet::new(),
                 e2e: None,
                 direct: HashSet::new(),
                 direct_video: HashSet::new(),
@@ -784,6 +919,8 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 watch_low: HashSet::new(),
                 watch_route: HashMap::new(),
                 simulcast: false,
+                rtx: false,
+                video_cache: VideoCache::default(),
                 last_watchers: Default::default(),
                 decoders: Vec::new(),
                 music: None,
@@ -959,7 +1096,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 u.send(ServerMsg::Pong);
             }
         }
-        ClientMsg::P2pEnable { local_addrs } => {
+        ClientMsg::P2pEnable { local_addrs, nat } => {
             let local: Vec<String> = local_addrs
                 .into_iter()
                 .filter(|a| a.parse::<SocketAddr>().is_ok())
@@ -968,8 +1105,21 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             if let Some(u) = st.users.get_mut(&uid) {
                 let was = u.p2p.is_some();
                 u.p2p = Some(local);
+                if nat.is_some() {
+                    u.nat = nat;
+                }
                 if !was {
                     st.broadcast_state();
+                }
+                st.push_peers();
+            }
+        }
+        ClientMsg::P2pHide { ids } => {
+            if let Some(u) = st.users.get_mut(&uid) {
+                let ids: HashSet<u32> = ids.into_iter().take(64).collect();
+                if u.p2p_hide != ids {
+                    u.p2p_hide = ids;
+                    st.push_peers();
                 }
             }
         }
@@ -1045,12 +1195,14 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::ShareStart { desc, audio, simulcast } => {
+        ClientMsg::ShareStart { desc, audio, simulcast, rtx } => {
             let desc: String = desc.trim().chars().take(16).collect();
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.channel.is_some() {
                     u.share_audio = audio;
                     u.simulcast = simulcast;
+                    u.rtx = rtx;
+                    u.video_cache = VideoCache::default();
                     u.sharing = Some(if desc.is_empty() { "屏幕".into() } else { desc });
                     let name = u.name.clone();
                     st.broadcast_state();
@@ -1164,6 +1316,47 @@ async fn relay_loop(state: Shared) {
     }
 }
 
+/// 公网地址（局域网、运营商级 NAT、IPv6 本地 / 链路本地地址都不算）
+fn is_public(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || (o[0] == 100 && (o[1] & 0xC0) == 64))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments()[0];
+            !(v6.is_loopback() || v6.is_unspecified() || (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// NAT 探测端口：只回答 PING（告诉客户端从这个端口看到的它的地址），其他包一律不理。
+/// 同样要求是已登录用户、用自己的密钥加密，不是公开的 STUN
+async fn probe_loop(state: Shared, sock: Arc<UdpSocket>) {
+    let mut buf = [0u8; 256];
+    loop {
+        let Ok((n, addr)) = sock.recv_from(&mut buf).await else { continue };
+        let reply = {
+            let mut st = state.lock().unwrap();
+            let mut reply = None;
+            for u in st.users.values_mut().take(MAX_TRIAL) {
+                if let Some((kind, data)) = u.udp_open.open(&buf[..n]) {
+                    if kind == udp::PING {
+                        let mut p = Vec::new();
+                        u.udp_seal.seal(udp::PONG, &udp::pong_payload(&data, addr), &mut p);
+                        reply = Some(p);
+                    }
+                    break;
+                }
+            }
+            reply
+        };
+        if let Some(p) = reply {
+            let _ = sock.send_to(&p, addr).await;
+        }
+    }
+}
+
 /// 未知地址最多试解多少个用户（防止被随机包刷 CPU）
 const MAX_TRIAL: usize = 512;
 
@@ -1215,6 +1408,7 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
                     }
                 }
                 udp::VIDEO => out = st.forward_video(uid, &data),
+                udp::NACK => out = st.on_nack(uid, &data),
                 udp::MUSIC | udp::SHARE_AUDIO => {
                     if let Some((seq, f)) = udp::read_client_voice(&data) {
                         out = st.forward_stream(uid, kind, seq, f);
@@ -1225,6 +1419,21 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
         }
         for (a, p) in &out {
             let _ = sock.send_to(p, a).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public;
+
+    #[test]
+    fn public_address_filter() {
+        for a in ["8.8.8.8", "2408:8000::1", "1.2.3.4"] {
+            assert!(is_public(a.parse().unwrap()), "{a}");
+        }
+        for a in ["192.168.1.5", "10.0.0.2", "172.20.1.1", "100.70.1.2", "169.254.3.4", "127.0.0.1", "fd00::1", "fe80::1", "::ffff:192.168.0.1"] {
+            assert!(!is_public(a.parse().unwrap()), "{a}");
         }
     }
 }

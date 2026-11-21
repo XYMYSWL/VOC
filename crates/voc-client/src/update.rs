@@ -1,8 +1,14 @@
 //! 检查更新：读 GitHub Releases 的最新版本号，比当前版本新就提示。
 //! 安装版（MSIX）还可以「一键更新」：下载 Release 里的 VOC-Setup.exe，核对 GitHub 给出的 SHA-256，运行它并退出客户端。
 //! 只发匿名的 HTTPS GET（User-Agent 是固定的 "VOC-update-check"），不上传任何本机信息。
+//!
+//! 中国大陆加速：打开后安装程序改从 GitHub 加速镜像（[`MIRRORS`]，把 GitHub 地址拼在镜像地址后面）下载，
+//! 一个不行换下一个，最后才直连 GitHub。版本号和 SHA-256 仍然从 GitHub 官方接口取，
+//! 镜像只负责传文件，文件对不上 SHA-256 就丢掉——所以没有 SHA-256 的版本不走镜像。
+//! 官方接口连不上时才经镜像问版本号，这时只提示有新版本、给下载链接，不一键安装（版本信息本身没法核对）。
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +20,25 @@ pub const REPO: &str = match option_env!("VOC_REPO") {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release 里安装程序的文件名
 pub const SETUP_ASSET: &str = "VOC-Setup.exe";
+/// 绿色版压缩包
+pub const PORTABLE_ASSET: &str = "VOC-portable.zip";
+/// 国内的 GitHub 加速镜像（地址前缀，后面直接拼 https://github.com/... ），按顺序试
+pub const MIRRORS: [&str; 3] = ["https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.org/"];
+
+/// 经第一个加速镜像下载最新版某个文件的链接（给手动下载用）
+pub fn accel_link(asset: &str) -> String {
+    format!("{}https://github.com/{REPO}/releases/latest/download/{asset}", MIRRORS[0])
+}
+
+/// 下载安装程序要依次尝试的地址：加速时先各个镜像（要有 SHA-256 才能用镜像），最后直连 GitHub
+fn download_urls(asset: &SetupAsset, accel: bool) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if accel && asset.sha256.is_some() {
+        v.extend(MIRRORS.iter().map(|m| format!("{m}{}", asset.url)));
+    }
+    v.push(asset.url.clone());
+    v
+}
 
 /// Release 里的安装程序
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,11 +65,13 @@ pub enum UpdateState {
 #[derive(Clone)]
 pub struct Updater {
     pub state: Arc<Mutex<UpdateState>>,
+    /// 中国大陆加速（设置里的开关）
+    pub accel: Arc<AtomicBool>,
 }
 
 impl Default for Updater {
     fn default() -> Self {
-        Self { state: Arc::new(Mutex::new(UpdateState::Idle)) }
+        Self { state: Arc::new(Mutex::new(UpdateState::Idle)), accel: Arc::new(AtomicBool::new(false)) }
     }
 }
 
@@ -74,8 +101,9 @@ impl Updater {
             *st = UpdateState::Checking;
         }
         let st = self.state.clone();
+        let accel = self.accel.load(Ordering::Relaxed);
         std::thread::spawn(move || {
-            let r = fetch_latest().map(|rel| {
+            let r = fetch_latest(accel).map(|rel| {
                 if is_newer(&rel.tag, VERSION) {
                     UpdateState::Available { version: rel.tag.trim_start_matches('v').to_string(), url: rel.page, setup: rel.setup }
                 } else {
@@ -97,12 +125,20 @@ impl Updater {
         let UpdateState::Available { version, setup: Some(asset), .. } = self.get() else { return };
         *self.state.lock().unwrap() = UpdateState::Downloading { version: version.clone(), percent: 0 };
         let st = self.state.clone();
+        let urls = download_urls(&asset, self.accel.load(Ordering::Relaxed));
         std::thread::spawn(move || {
             let progress = |p: u8| {
                 *st.lock().unwrap() = UpdateState::Downloading { version: version.clone(), percent: p };
                 ctx.request_repaint();
             };
-            let r = download_and_run(&asset, &version, progress);
+            // 一个地址不行（连不上、下载中断、校验不对）换下一个
+            let mut r = Err("没有可用的下载地址".to_string());
+            for url in &urls {
+                r = download_and_run(url, &asset, &version, &progress);
+                if r.is_ok() {
+                    break;
+                }
+            }
             *st.lock().unwrap() = match r {
                 Ok(()) => UpdateState::Launched,
                 Err(e) => UpdateState::Failed(e),
@@ -122,18 +158,34 @@ struct Release {
     setup: Option<SetupAsset>,
 }
 
-fn fetch_latest() -> Result<Release, String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = agent(Some(Duration::from_secs(8)))
-        .get(&url)
+fn get_text(url: &str) -> Result<String, String> {
+    agent(Some(Duration::from_secs(8)))
+        .get(url)
         .header("User-Agent", "VOC-update-check")
         .header("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|e| format!("检查更新失败：{e}"))?
+        .map_err(|e| e.to_string())?
         .body_mut()
         .read_to_string()
-        .map_err(|e| e.to_string())?;
-    parse_release(&body)
+        .map_err(|e| e.to_string())
+}
+
+fn fetch_latest(accel: bool) -> Result<Release, String> {
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let err = match get_text(&url).and_then(|b| parse_release(&b)) {
+        Ok(r) => return Ok(r),
+        Err(e) => e,
+    };
+    if accel {
+        // 官方接口连不上：经镜像问版本号。版本信息没法核对，只提示、不给一键安装
+        for m in MIRRORS {
+            if let Ok(mut r) = get_text(&format!("{m}{url}")).and_then(|b| parse_release(&b)) {
+                r.setup = None;
+                return Ok(r);
+            }
+        }
+    }
+    Err(format!("检查更新失败：{err}"))
 }
 
 fn parse_release(body: &str) -> Result<Release, String> {
@@ -157,10 +209,10 @@ fn parse_release(body: &str) -> Result<Release, String> {
     Ok(Release { tag, page, setup })
 }
 
-fn download_and_run(asset: &SetupAsset, version: &str, progress: impl Fn(u8)) -> Result<(), String> {
+fn download_and_run(url: &str, asset: &SetupAsset, version: &str, progress: &impl Fn(u8)) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let mut resp = agent(None)
-        .get(&asset.url)
+        .get(url)
         .header("User-Agent", "VOC-update-check")
         .call()
         .map_err(|e| format!("下载失败：{e}"))?;
@@ -261,6 +313,21 @@ mod tests {
     }
 
     #[test]
+    fn accelerated_download_order() {
+        let url = format!("https://github.com/{REPO}/releases/download/v9.0.0/VOC-Setup.exe");
+        let with_hash = SetupAsset { url: url.clone(), sha256: Some("ab".into()), size: 1 };
+        let v = download_urls(&with_hash, true);
+        assert_eq!(v.len(), MIRRORS.len() + 1);
+        assert_eq!(v[0], format!("{}{url}", MIRRORS[0]));
+        assert_eq!(v.last().unwrap(), &url, "GitHub itself is the last resort");
+        // 不加速、或没有 SHA-256（镜像给的文件没法核对）：只直连
+        assert_eq!(download_urls(&with_hash, false), vec![url.clone()]);
+        let no_hash = SetupAsset { sha256: None, ..with_hash };
+        assert_eq!(download_urls(&no_hash, true), vec![url]);
+        assert!(accel_link(PORTABLE_ASSET).ends_with("/releases/latest/download/VOC-portable.zip"));
+    }
+
+    #[test]
     fn not_packaged_in_tests() {
         assert!(!is_packaged());
     }
@@ -269,7 +336,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_fetch() {
-        let r = fetch_latest().unwrap();
+        let r = fetch_latest(false).unwrap();
         println!("latest = {} {} setup = {:?}", r.tag, r.page, r.setup);
         assert!(r.tag.starts_with('v'));
     }

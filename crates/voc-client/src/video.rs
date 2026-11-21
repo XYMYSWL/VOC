@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use voc_proto::udp::{self, VideoFrag, VIDEO_KEY};
+use voc_proto::udp::{self, VIDEO_KEY};
 
 /// 观看时用硬件解码（DXVA）；否则 CPU 软解
 pub static HW_DECODE: AtomicBool = AtomicBool::new(false);
@@ -34,13 +34,18 @@ pub struct ShareConfig {
     pub monitor: usize,
     /// 编码器：auto（自动挑最好的显卡编码器）/ software（CPU）/ vendor:<厂商号>（指定显卡）
     pub encoder: String,
+    /// 画质（码率档位）：0 标准 / 1 高 / 2 极高
+    pub quality: u8,
 }
 
 impl Default for ShareConfig {
     fn default() -> Self {
-        Self { height: 720, fps: 30, monitor: 0, encoder: "auto".into() }
+        Self { height: 720, fps: 30, monitor: 0, encoder: "auto".into(), quality: 1 }
     }
 }
+
+/// 画质档位：(名字, 码率倍数)。1080P 60 帧约 5.5 / 12 / 25 Mbps
+pub const QUALITIES: [(&str, f32); 3] = [("标准", 1.0), ("高", 2.2), ("极高", 4.5)];
 
 impl ShareConfig {
     /// 低带宽模式下的实际设置：最高 480P 30 帧
@@ -49,13 +54,14 @@ impl ShareConfig {
         if low_bandwidth {
             c.height = c.height.min(480);
             c.fps = c.fps.min(30);
+            c.quality = 0;
         }
         c
     }
 
-    /// 低画质层：360P，帧率同原画
+    /// 低画质层：360P，帧率同原画，标准码率
     pub fn low_layer(&self) -> Self {
-        Self { height: 360, ..self.clone() }
+        Self { height: 360, quality: 0, ..self.clone() }
     }
 
     pub fn desc(&self) -> String {
@@ -74,7 +80,8 @@ impl ShareConfig {
             (_, false) => 3500,
             (_, true) => 5500,
         };
-        kbps * 1000
+        let mult = QUALITIES.get(self.quality as usize).map(|q| q.1).unwrap_or(1.0);
+        (kbps as f32 * mult) as u32 * 1000
     }
 
     /// 某种编码格式下的目标码率：同等画质下 HEVC / AV1 需要的码率更低
@@ -389,6 +396,11 @@ impl VideoEncoder {
         Encoder::with_api_config(OpenH264API::from_source(), c).map_err(|e| e.to_string())
     }
 
+    /// 当前编码器开了逐行刷新（不用定期发关键帧）
+    pub fn intra_refresh(&self) -> bool {
+        matches!(&self.cur, Some((_, _, _, _, Backend::Hw(e))) if e.intra_refresh)
+    }
+
     /// 当前在用的编码器描述，例如 "AV1 · NVIDIA AV1 Encoder MFT"
     pub fn describe(&self) -> Option<String> {
         self.cur.as_ref().map(|(_, _, c, n, _)| format!("{} · {n}", c.label()))
@@ -473,6 +485,8 @@ pub struct ShareStats {
     pub pipeline: Mutex<String>,
     /// 当前码率占设定值的百分比（网络拥堵时自动降低）
     pub rate_pct: AtomicU32,
+    /// 冗余校验包：每几片一个，0 = 没加
+    pub fec_k: AtomicU32,
     /// 看低画质层的人数
     pub low_watchers: AtomicU32,
 }
@@ -627,6 +641,29 @@ impl Drop for Sharer {
     }
 }
 
+/// 冗余校验包的比例：每秒按「被请求补发的分片 / 发出的分片」估计丢包率。
+/// 丢包 ≥ 3% 每 5 片加 1 个校验包，≥ 0.3% 每 10 片加 1 个；没丢包 10 秒后关掉。返回 (k, 剩余保持秒数)
+pub fn fec_level(k: usize, hold: u32, sent: u32, nacked: u32) -> (usize, u32) {
+    if sent < 50 {
+        return (k, hold); // 这一秒发得太少，不好判断
+    }
+    let loss = nacked as f32 / sent as f32;
+    let want = if loss >= 0.03 {
+        5
+    } else if loss >= 0.003 {
+        10
+    } else {
+        0
+    };
+    if want > 0 && (k == 0 || want <= k) {
+        (want, 10)
+    } else if hold > 0 {
+        (k, hold - 1)
+    } else {
+        (want, 0)
+    }
+}
+
 /// 码率自适应：每秒看一次。观看者频繁要关键帧（≥2 次 / 秒）或匀速队列丢包 → 降到 70%（最低 30%）；
 /// 连续 4 秒正常 → 每秒回升 10%，直到设定值
 pub fn adapt_rate(scale: f32, calm_secs: &mut u32, key_requests: u32, pace_drops: u32) -> f32 {
@@ -655,7 +692,9 @@ fn encode_loop(
     key_requests: Arc<AtomicU32>,
 ) {
     let pref = cfg.encoder.clone();
-    let full_bps = cfg.bitrate();
+    let (main_bps, low_bps) = (cfg.bitrate(), cfg.low_layer().bitrate());
+    // 冗余校验包：按观看者请求补发的比例（≈丢包率）决定每几片加一个校验包，0 = 不加
+    let (mut fec_k, mut fec_hold) = (0usize, 0u32);
     let mut low_enc = VideoEncoder::new(cfg.low_layer());
     let mut enc = VideoEncoder::new(cfg);
     let mut low_frame_no = 0u32;
@@ -693,8 +732,9 @@ fn encode_loop(
             last_watchers = ver;
             force_key.store(true, Ordering::Relaxed); // 有新观看者，马上给关键帧
         }
-        // 每 10 秒兜底一个关键帧
-        let key = force_key.swap(false, Ordering::Relaxed) || last_key.elapsed() > Duration::from_secs(10);
+        // 每 10 秒兜底一个关键帧（编码器开了逐行刷新时 60 秒）
+        let periodic = Duration::from_secs(if enc.intra_refresh() { 60 } else { 10 });
+        let key = force_key.swap(false, Ordering::Relaxed) || last_key.elapsed() > periodic;
         // 两层：原画给大多数人，360P 低画质层给选了「流畅」的人；哪层没人看就不编码
         let (main_ids, low_ids) = (link.layer_watchers(false), link.layer_watchers(true));
         let (want_main, want_low) = (!main_ids.is_empty(), !low_ids.is_empty());
@@ -807,7 +847,7 @@ fn encode_loop(
             _ => enc.describe(),
         };
         if let Some(d) = desc {
-            *stats.encoder.lock().unwrap() = d;
+            *stats.encoder.lock().unwrap() = if enc.intra_refresh() { format!("{d} · 逐行刷新") } else { d };
         }
         let Some(e2e) = state.e2e.lock().unwrap().clone() else { continue };
         for (low, ef) in frames {
@@ -823,7 +863,10 @@ fn encode_loop(
             } else {
                 &mut frame_no
             };
-            let frags = udp::video_fragments(*no, flags, &sealed);
+            let mut frags = udp::video_fragments(*no, flags, &sealed);
+            if fec_k > 0 {
+                frags.extend(udp::fec_parities(*no, flags, &sealed, fec_k));
+            }
             *no = no.wrapping_add(1);
             link.send_video(&frags, &mut buf, low);
             sec_bytes += sealed.len();
@@ -835,14 +878,16 @@ fn encode_loop(
             }
         }
         if sec_start.elapsed() >= Duration::from_secs(1) {
-            // 码率自适应
+            // 码率自适应：只调「流畅」层；「原画」层固定按设定码率（选原画的人要的就是清楚，网络扛不住的自己切流畅）
             let new_scale = adapt_rate(scale, &mut calm, key_requests.swap(0, Ordering::Relaxed), link.take_pace_drops());
             if (new_scale - scale).abs() > 0.01 {
                 scale = new_scale;
-                enc.set_rate_scale(scale);
                 low_enc.set_rate_scale(scale);
-                link.set_video_bps((full_bps as f32 * scale) as u32);
             }
+            link.set_video_bps(if want_main { main_bps } else { 0 } + if want_low { (low_bps as f32 * scale) as u32 } else { 0 });
+            let (sent, nacked) = link.take_video_loss();
+            (fec_k, fec_hold) = fec_level(fec_k, fec_hold, sent, nacked);
+            stats.fec_k.store(fec_k as u32, Ordering::Relaxed);
             stats.rate_pct.store((scale * 100.0).round() as u32, Ordering::Relaxed);
             let secs = sec_start.elapsed().as_secs_f64();
             stats.fps.store((sec_frames as f64 / secs).round() as u32, Ordering::Relaxed);
@@ -901,17 +946,21 @@ pub struct View {
 }
 
 struct Stream {
-    /// 当前收到的画质层（flags 的 VIDEO_LOW 位）；换层时帧号重新开始
-    layer: u8,
-    cur: Option<u32>,
-    frags: Vec<Option<Vec<u8>>>,
-    got: usize,
-    flags: u8,
-    last_done: Option<u32>,
+    /// 帧重组缓冲（乱序、补发、冗余校验包都在这里处理）
+    asm: crate::vrecv::Assembler,
     need_key: bool,
     last_req: Option<Instant>,
     dec_tx: SyncSender<(u8, Vec<u8>)>,
     view: Arc<View>,
+}
+
+/// 收包 / 定时检查后要做的事
+#[derive(Default, Debug, PartialEq)]
+pub struct RxActions {
+    /// 要向这些共享者请求关键帧
+    pub keyframes: Vec<u32>,
+    /// 要请求补发：(共享者, 画质层, 帧号, 缺的分片号)
+    pub nacks: Vec<(u32, u8, u32, Vec<u16>)>,
 }
 
 #[derive(Default)]
@@ -939,21 +988,7 @@ impl VideoRx {
         let (tx, rx) = mpsc::sync_channel::<(u8, Vec<u8>)>(64);
         let (v, ctx) = (view.clone(), self.ctx.lock().unwrap().clone());
         std::thread::Builder::new().name("video-decode".into()).spawn(move || decode_loop(rx, v, ctx)).ok()?;
-        s.insert(
-            from,
-            Stream {
-                layer: 0,
-                cur: None,
-                frags: Vec::new(),
-                got: 0,
-                flags: 0,
-                last_done: None,
-                need_key: true,
-                last_req: None,
-                dec_tx: tx,
-                view: view.clone(),
-            },
-        );
+        s.insert(from, Stream { asm: Default::default(), need_key: true, last_req: None, dec_tx: tx, view: view.clone() });
         Some(view)
     }
 
@@ -961,77 +996,79 @@ impl VideoRx {
         self.streams.lock().unwrap().clear();
     }
 
-    /// 收到一个视频分片（服务器中转 / P2P / TCP 隧道）。返回 true 表示需要向发送者请求关键帧。
-    pub fn on_packet(&self, payload: &[u8], decrypt: impl FnOnce(u32, &[u8]) -> Option<Vec<u8>>) -> Option<u32> {
-        let (from, f, data) = udp::read_server_video(payload)?;
+    /// 收到一个视频分片（服务器中转 / P2P / TCP 隧道）。rtx(共享者) = 他支持补发
+    pub fn on_packet(
+        &self,
+        payload: &[u8],
+        rtx: impl Fn(u32) -> bool,
+        mut decrypt: impl FnMut(u32, &[u8]) -> Option<Vec<u8>>,
+    ) -> RxActions {
+        let mut acts = RxActions::default();
+        let Some((from, f, data)) = udp::read_server_video(payload) else { return acts };
         let mut streams = self.streams.lock().unwrap();
-        let s = streams.get_mut(&from)?; // 没在看就丢弃
-        if s.view.decode_failed.swap(false, Ordering::Relaxed) {
+        let Some(s) = streams.get_mut(&from) else { return acts }; // 没在看就丢弃
+        let now = Instant::now();
+        if s.asm.add(f, data, now) {
             s.need_key = true;
         }
-        let complete = s.add(f, data);
-        if let Some((frame_id, flags, blob)) = complete {
-            let key = flags & VIDEO_KEY != 0;
-            match decrypt(from, &blob) {
-                Some(bits) if key || !s.need_key => {
-                    if key {
-                        s.need_key = false;
-                    }
-                    if s.dec_tx.try_send((udp::flags_codec(flags), bits)).is_err() {
-                        s.need_key = true; // 解码跟不上，丢帧后要从关键帧重新开始
-                    }
-                }
-                Some(_) => {} // 等关键帧
-                None => s.need_key = true,
-            }
-            s.last_done = Some(frame_id);
+        s.pump(from, now, rtx(from), &mut decrypt, &mut acts);
+        acts
+    }
+
+    /// 定时检查（没有新包时也要发现尾巴丢片、超时放弃）
+    pub fn tick(&self, rtx: impl Fn(u32) -> bool, mut decrypt: impl FnMut(u32, &[u8]) -> Option<Vec<u8>>) -> RxActions {
+        let mut acts = RxActions::default();
+        let now = Instant::now();
+        for (from, s) in self.streams.lock().unwrap().iter_mut() {
+            s.pump(*from, now, rtx(*from), &mut decrypt, &mut acts);
         }
-        // 需要关键帧时，最多每 300 ms 请求一次
-        if s.need_key && s.last_req.is_none_or(|t| t.elapsed() > Duration::from_millis(300)) {
-            s.last_req = Some(Instant::now());
-            return Some(from);
-        }
-        None
+        acts
+    }
+
+    /// 统计：(校验包恢复的片数, 补发收回的片数)
+    pub fn recovery_stats(&self, from: u32) -> Option<(u32, u32)> {
+        self.streams.lock().unwrap().get(&from).map(|s| (s.asm.fec_recovered, s.asm.rtx_recovered))
     }
 }
 
 impl Stream {
-    /// 加入分片；凑齐一帧时返回 (帧号, flags, 数据)
-    fn add(&mut self, f: VideoFrag, data: &[u8]) -> Option<(u32, u8, Vec<u8>)> {
-        let layer = f.flags & udp::VIDEO_LOW;
-        if layer != self.layer {
-            // 切换了画质：另一层的帧号是独立的，从它的关键帧重新开始
-            self.layer = layer;
-            self.cur = None;
-            self.last_done = None;
+    fn pump(
+        &mut self,
+        from: u32,
+        now: Instant,
+        rtx: bool,
+        decrypt: &mut impl FnMut(u32, &[u8]) -> Option<Vec<u8>>,
+        acts: &mut RxActions,
+    ) {
+        if self.view.decode_failed.swap(false, Ordering::Relaxed) {
             self.need_key = true;
         }
-        match self.cur {
-            Some(c) if f.frame == c => {}
-            Some(c) if f.frame.wrapping_sub(c) > 0x8000_0000 => return None, // 旧帧的迟到分片
-            _ => {
-                // 开始新的一帧：上一帧没收齐，或中间整帧丢失 → 之后的 P 帧都解不对，等关键帧
-                let continuous = self.last_done.is_some_and(|d| f.frame == d.wrapping_add(1));
-                if !continuous {
-                    self.need_key = true;
+        let out = self.asm.poll(now, self.need_key, rtx);
+        if out.gap {
+            self.need_key = true; // 中间丢了帧，之后的非关键帧解不对
+        }
+        for (_, flags, blob) in out.frames {
+            let key = flags & VIDEO_KEY != 0;
+            match decrypt(from, &blob) {
+                Some(bits) if key || !self.need_key => {
+                    if key {
+                        self.need_key = false;
+                    }
+                    if self.dec_tx.try_send((udp::flags_codec(flags), bits)).is_err() {
+                        self.need_key = true; // 解码跟不上，丢帧后要从关键帧重新开始
+                    }
                 }
-                self.cur = Some(f.frame);
-                self.frags = vec![None; f.count as usize];
-                self.got = 0;
-                self.flags = f.flags;
+                Some(_) => {} // 等关键帧
+                None => self.need_key = true,
             }
         }
-        if f.count as usize != self.frags.len() || self.frags[f.idx as usize].is_some() {
-            return None;
+        let layer = self.asm.layer();
+        acts.nacks.extend(out.nacks.into_iter().map(|(frame, idxs)| (from, layer, frame, idxs)));
+        // 需要关键帧时，最多每 300 ms 请求一次
+        if self.need_key && self.last_req.is_none_or(|t| now.duration_since(t) > Duration::from_millis(300)) {
+            self.last_req = Some(now);
+            acts.keyframes.push(from);
         }
-        self.frags[f.idx as usize] = Some(data.to_vec());
-        self.got += 1;
-        if self.got < self.frags.len() {
-            return None;
-        }
-        let all: Vec<u8> = self.frags.drain(..).flatten().flatten().collect();
-        self.cur = None;
-        Some((f.frame, self.flags, all))
     }
 }
 
@@ -1180,9 +1217,7 @@ mod tests {
                 frags.pop(); // 第 4 帧丢一片 → 之后要等关键帧
             }
             for f in frags {
-                if rx.on_packet(&udp::server_video(7, &f), |from, b| rk.decrypt_video(from, b)).is_some() {
-                    key_requests += 1;
-                }
+                key_requests += rx.on_packet(&udp::server_video(7, &f), |_| false, |from, b| rk.decrypt_video(from, b)).keyframes.len();
             }
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -1192,44 +1227,57 @@ mod tests {
         assert_eq!(fr.rgba.len(), 854 * 480 * 4);
         assert!(key_requests >= 1, "packet loss must trigger a keyframe request");
         // 没在看的人的包直接丢弃
-        assert!(rx.on_packet(&udp::server_video(99, &udp::video_fragments(0, VIDEO_KEY, b"x")[0]), |_, _| None).is_none());
+        assert_eq!(rx.on_packet(&udp::server_video(99, &udp::video_fragments(0, VIDEO_KEY, b"x")[0]), |_| true, |_, _| None), RxActions::default());
     }
 
     #[test]
     fn layer_switch_restarts_from_keyframe() {
-        let (tx, _rx) = mpsc::sync_channel(8);
-        let mut st = Stream {
-            layer: 0,
-            cur: None,
-            frags: Vec::new(),
-            got: 0,
-            flags: 0,
-            last_done: None,
-            need_key: true,
-            last_req: None,
-            dec_tx: tx,
-            view: Arc::new(View::default()),
-        };
-        let feed = |st: &mut Stream, frame: u32, flags: u8| {
+        let rx = VideoRx::default();
+        let _view = rx.watch(7, true).unwrap();
+        let need_key = || rx.streams.lock().unwrap()[&7].need_key;
+        let feed = |frame: u32, flags: u8| {
             let f = udp::video_fragments(frame, flags, b"x");
-            let (h, d) = udp::read_video_frag(&f[0]).unwrap();
-            if let Some((id, flags, _)) = st.add(h, d) {
-                if flags & udp::VIDEO_KEY != 0 {
-                    st.need_key = false;
-                }
-                st.last_done = Some(id);
-            }
+            rx.on_packet(&udp::server_video(7, &f[0]), |_| true, |_, b| Some(b.to_vec()));
         };
         // 原画：关键帧后连续的 P 帧不用再要关键帧
-        feed(&mut st, 100, udp::VIDEO_KEY);
-        feed(&mut st, 101, 0);
-        assert!(!st.need_key);
+        feed(100, udp::VIDEO_KEY);
+        feed(101, 0);
+        assert!(!need_key());
         // 换到低画质层：帧号从 0 开始，必须等它的关键帧
-        feed(&mut st, 0, udp::VIDEO_LOW);
-        assert!(st.need_key);
-        feed(&mut st, 1, udp::VIDEO_LOW | udp::VIDEO_KEY);
-        feed(&mut st, 2, udp::VIDEO_LOW);
-        assert!(!st.need_key);
+        feed(0, udp::VIDEO_LOW);
+        assert!(need_key());
+        feed(1, udp::VIDEO_LOW | udp::VIDEO_KEY);
+        feed(2, udp::VIDEO_LOW);
+        assert!(!need_key());
+    }
+
+    /// 支持补发时：缺片先请求补发，不请求关键帧；补到后接着播
+    #[test]
+    fn loss_is_nacked_instead_of_keyframe() {
+        let rx = VideoRx::default();
+        let _view = rx.watch(7, true).unwrap();
+        let data = vec![5u8; 4000];
+        let f0 = udp::video_fragments(0, udp::VIDEO_KEY, &data);
+        let f1 = udp::video_fragments(1, 0, &data);
+        for f in &f0 {
+            rx.on_packet(&udp::server_video(7, f), |_| true, |_, b| Some(b.to_vec())); // 开头没关键帧时会要一次，正常
+        }
+        let mut acts = RxActions::default();
+        for (i, f) in f1.iter().enumerate() {
+            if i != 1 {
+                let a = rx.on_packet(&udp::server_video(7, f), |_| true, |_, b| Some(b.to_vec()));
+                acts.keyframes.extend(a.keyframes);
+                acts.nacks.extend(a.nacks);
+            }
+        }
+        assert!(acts.keyframes.is_empty(), "{acts:?}");
+        std::thread::sleep(Duration::from_millis(40));
+        let a = rx.tick(|_| true, |_, b| Some(b.to_vec()));
+        assert_eq!(a.nacks, vec![(7, 0, 1, vec![1])]);
+        assert!(a.keyframes.is_empty());
+        let a = rx.on_packet(&udp::server_video(7, &f1[1]), |_| true, |_, b| Some(b.to_vec()));
+        assert_eq!(a, RxActions::default());
+        assert!(!rx.streams.lock().unwrap()[&7].need_key);
     }
 
     #[test]
@@ -1274,6 +1322,32 @@ mod tests {
             s = adapt_rate(s, &mut calm, 0, 0);
         }
         assert_eq!(s, 1.0);
+    }
+
+    #[test]
+    fn fec_follows_loss() {
+        // 没丢包：不加
+        assert_eq!(fec_level(0, 0, 1000, 0), (0, 0));
+        // 1% 丢包：每 10 片一个；5%：每 5 片一个
+        assert_eq!(fec_level(0, 0, 1000, 10), (10, 10));
+        assert_eq!(fec_level(10, 10, 1000, 50), (5, 10));
+        // 丢包变少：保持 10 秒再降
+        let (mut k, mut h) = (5, 10);
+        for _ in 0..10 {
+            (k, h) = fec_level(k, h, 1000, 0);
+            assert_eq!(k, 5);
+        }
+        assert_eq!(fec_level(k, h, 1000, 0), (0, 0));
+        // 发得太少不判断
+        assert_eq!(fec_level(5, 3, 10, 10), (5, 3));
+    }
+
+    #[test]
+    fn quality_tiers() {
+        let c = |q| ShareConfig { height: 1080, fps: 60, quality: q, ..Default::default() };
+        assert_eq!((c(0).bitrate(), c(1).bitrate(), c(2).bitrate()), (5_500_000, 12_100_000, 24_750_000));
+        assert_eq!(c(2).effective(true).quality, 0, "low bandwidth forces standard");
+        assert_eq!(c(2).low_layer().bitrate(), 650_000);
     }
 
     #[test]
@@ -1364,6 +1438,40 @@ mod tests {
             println!("{name}: fresh decoder from 2nd keyframe decoded {got} frames");
             assert!(keys.len() >= 2 && keys[1].1.contains(&7) && keys[1].1.contains(&5), "{name}: forced keyframe must be IDR with SPS");
             assert!(got > 0, "{name}: a new viewer must be able to start from a forced keyframe");
+        }
+    }
+
+    /// 真实显卡：哪些编码器接受逐行刷新、开了以后关键帧间隔和能否正常解码（需要显卡，默认不跑）
+    #[test]
+    #[ignore]
+    fn intra_refresh_support() {
+        mfenc::mf_init().unwrap();
+        let (w, h) = (1280usize, 720usize);
+        for info in hw_encoders() {
+            let Ok(mut enc) = HwEncoder::new(info, w as u32, h as u32, 30, 4_000_000) else { continue };
+            let mut pkts = Vec::new();
+            for t in 0..90 {
+                let mut i420 = Vec::new();
+                bgra_to_i420(&test_frame(w, h, t), w, h, w, h, &mut i420);
+                let mut nv12 = Vec::new();
+                i420_to_nv12(&i420, w, h, &mut nv12);
+                if t == 0 {
+                    enc.force_keyframe();
+                }
+                pkts.extend(enc.encode(&nv12).unwrap());
+            }
+            let keys = pkts.iter().filter(|p| p.1).count();
+            let mut decoded = 0;
+            if local_decoders().contains(&info.codec) {
+                if let Some(mut d) = make_decoder(info.codec, true, w as u32, h as u32) {
+                    for p in &pkts {
+                        if let Dec::Mf(m) = &mut d {
+                            decoded += m.decode(&p.0).map(|f| f.len()).unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            println!("{}: intra_refresh={} packets={} keyframes={keys} decoded={decoded}", info.name, enc.intra_refresh, pkts.len());
         }
     }
 

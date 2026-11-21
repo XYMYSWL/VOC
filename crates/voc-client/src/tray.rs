@@ -21,6 +21,30 @@ pub struct Tray {
     deaf: CheckMenuItem,
     rx: Mutex<Receiver<TrayAction>>,
     last_tip: Mutex<String>,
+    /// 平时的图标、带红点的图标（有未读消息）
+    icons: (tray_icon::Icon, tray_icon::Icon),
+    unread: Mutex<bool>,
+}
+
+/// 在图标右上角画一个红点
+fn with_dot(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    let r = w.min(h) as f32 * 0.22;
+    let (cx, cy) = (w as f32 - r - 0.5, r + 0.5);
+    for y in 0..h {
+        for x in 0..w {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let a = (r + 0.5 - d).clamp(0.0, 1.0);
+            if a > 0.0 {
+                let i = ((y * w + x) * 4) as usize;
+                for (k, c) in [237u8, 66, 69].into_iter().enumerate() {
+                    out[i + k] = (c as f32 * a + out[i + k] as f32 * (1.0 - a)) as u8;
+                }
+                out[i + 3] = out[i + 3].max((a * 255.0) as u8);
+            }
+        }
+    }
+    out
 }
 
 impl Tray {
@@ -33,9 +57,10 @@ impl Tray {
         let menu = Menu::new();
         menu.append_items(&[&show, &PredefinedMenuItem::separator(), &mute, &deaf, &PredefinedMenuItem::separator(), &quit]).ok()?;
 
+        let dotted = tray_icon::Icon::from_rgba(with_dot(&icon_rgba, w, h), w, h).ok()?;
         let icon = tray_icon::Icon::from_rgba(icon_rgba, w, h).ok()?;
         let tray = TrayIconBuilder::new()
-            .with_icon(icon)
+            .with_icon(icon.clone())
             .with_tooltip("VOC")
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
@@ -72,12 +97,21 @@ impl Tray {
                 ctx2.request_repaint();
             }
         }));
-        Some(Self { icon: tray, mute, deaf, rx: Mutex::new(rx), last_tip: Mutex::new(String::new()) })
+        Some(Self { icon: tray, mute, deaf, rx: Mutex::new(rx), last_tip: Mutex::new(String::new()), icons: (icon, dotted), unread: Mutex::new(false) })
     }
 
     /// 取出用户在托盘上的操作
     pub fn poll(&self) -> Vec<TrayAction> {
         self.rx.lock().unwrap().try_iter().collect()
+    }
+
+    /// 有未读消息时图标带红点
+    pub fn set_unread(&self, on: bool) {
+        let mut u = self.unread.lock().unwrap();
+        if *u != on {
+            let _ = self.icon.set_icon(Some(if on { self.icons.1.clone() } else { self.icons.0.clone() }));
+            *u = on;
+        }
     }
 
     /// 同步闭麦 / 静音勾选和提示文字（有变化才更新）

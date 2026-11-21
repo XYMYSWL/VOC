@@ -376,13 +376,14 @@ impl App {
                             ui.spacing_mut().item_spacing.x = 4.0;
                             let muted = self.settings.muted.load(Ordering::Relaxed);
                             let deaf = self.settings.deafened.load(Ordering::Relaxed);
-                            let (mi, mt) = if muted { ("🎙", "取消闭麦（Ctrl+M）") } else { ("🎙", "闭麦（Ctrl+M）") };
-                            if th::icon_button(ui, mi, mt, if muted { Tone::Danger } else { Tone::Normal }).clicked() {
+                            let (mk, dk) = (self.cfg.mute_key.label(), self.cfg.deafen_key.label());
+                            let mt = if muted { format!("取消闭麦（{mk}）") } else { format!("闭麦（{mk}）") };
+                            if th::icon_button(ui, "🎙", &mt, if muted { Tone::Danger } else { Tone::Normal }).clicked() {
                                 self.settings.muted.store(!muted, Ordering::Relaxed);
                                 toggled_state = true;
                             }
-                            let (di, dt) = if deaf { ("🔇", "取消静音（Ctrl+D）") } else { ("🎧", "静音：听不到别人（Ctrl+D）") };
-                            if th::icon_button(ui, di, dt, if deaf { Tone::Danger } else { Tone::Normal }).clicked() {
+                            let (di, dt) = if deaf { ("🔇", format!("取消静音（{dk}）")) } else { ("🎧", format!("静音：听不到别人（{dk}）")) };
+                            if th::icon_button(ui, di, &dt, if deaf { Tone::Danger } else { Tone::Normal }).clicked() {
                                 self.settings.deafened.store(!deaf, Ordering::Relaxed);
                                 toggled_state = true;
                             }
@@ -562,6 +563,13 @@ impl App {
                                     }
                                     if let Some(name) = &u.music {
                                         let tip = if is_me { "你正在放伴奏" } else { "伴奏中。右键名字可以单独调伴奏音量" };
+                                        // 程序名是端到端发来的（服务器只知道在放伴奏）；自己的直接用本地的
+                                        let real = if is_me {
+                                            self.music.as_ref().map(|m| m.name.clone())
+                                        } else {
+                                            s.e2e.as_ref().and_then(|e| e.lock().unwrap().profiles.get(&u.id).and_then(|p| p.music.clone()))
+                                        };
+                                        let name = real.unwrap_or_else(|| name.clone());
                                         th::pill(ui, format!("🎵 {name}"), th::ACCENT_HOVER, th::ACCENT_SOFT).on_hover_text(tip);
                                     }
                                     if let Some(desc) = &u.sharing {
@@ -699,6 +707,10 @@ impl App {
 
         let mut pick_image = false;
         let mut open_image: Option<egui::TextureHandle> = None;
+        // 点了表情回应：(消息, 表情)
+        let mut react: Option<((u32, u64), String)> = None;
+        let my_id = s.user_id;
+        let my_name = s.me().map(|u| u.name.clone()).unwrap_or_default();
         // ---------------- 中间：文字聊天
         egui::CentralPanel::default().frame(egui::Frame::new().fill(th::BG_PANEL).inner_margin(Margin::symmetric(18, 12))).show(
             ui,
@@ -735,6 +747,29 @@ impl App {
                         );
                         ui.add_space(4.0);
                     }
+                    if let (None, Some(prefix)) = (&s.chat_tab, crate::app::mention_prefix(&s.chat_input)) {
+                        let prefix = prefix.to_lowercase();
+                        let names: Vec<String> = s
+                            .users
+                            .iter()
+                            .filter(|u| u.id != my_id && u.name.to_lowercase().starts_with(&prefix))
+                            .map(|u| u.name.clone())
+                            .take(8)
+                            .collect();
+                        if !names.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("提及：").size(12.0).color(th::TEXT_DIM));
+                                for n in names {
+                                    if ui.small_button(format!("@{n}")).clicked() {
+                                        let at = s.chat_input.rfind('@').unwrap_or(s.chat_input.len());
+                                        s.chat_input.truncate(at);
+                                        s.chat_input.push_str(&format!("@{n} "));
+                                    }
+                                }
+                            });
+                            ui.add_space(2.0);
+                        }
+                    }
                     egui::Frame::new()
                         .fill(th::BG_ELEVATED)
                         .corner_radius(CornerRadius::same(12))
@@ -750,7 +785,7 @@ impl App {
                             }
                             let hint = match &s.chat_tab {
                                 Some(p) => format!("私聊 {p}…（只有对方看得到 · 端到端加密）"),
-                                None => "发送消息…（回车发送 · 端到端加密）".to_string(),
+                                None => "发送消息…（回车发送 · @ 提及某人 · 端到端加密）".to_string(),
                             };
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut s.chat_input)
@@ -764,14 +799,21 @@ impl App {
                                 let text = text.trim().chars().take(voc_proto::MAX_CHAT_LEN).collect::<String>();
                                 if let (false, Some(peer)) = (text.is_empty(), s.chat_tab.clone()) {
                                     let id = s.id_by_name(&peer);
-                                    let ok = match (id, &s.e2e) {
+                                    let sent = match (id, &s.e2e) {
                                         (Some(id), Some(e2e)) => e2e.lock().unwrap().send_dm(id, &text),
-                                        _ => false,
+                                        _ => None,
                                     };
                                     let me = s.me().map(|u| u.name.clone()).unwrap_or_default();
                                     let t = s.dm(&peer);
-                                    if ok {
-                                        t.lines.push(ChatLine::User { from: me, text, ts: voc_proto::now_millis(), mine: true });
+                                    if let Some(mid) = sent {
+                                        t.lines.push(ChatLine::User {
+                                            from: me,
+                                            text,
+                                            ts: voc_proto::now_millis(),
+                                            mine: true,
+                                            id: Some((my_id, mid)),
+                                            reactions: Vec::new(),
+                                        });
                                     } else {
                                         t.lines.push(ChatLine::System(
                                             if id.is_none() { "对方不在线，消息没有发出" } else { "和对方的加密尚未建立（或身份待核对），消息没有发出" }.into(),
@@ -779,8 +821,10 @@ impl App {
                                         s.chat_input = text;
                                     }
                                 } else if !text.is_empty() {
+                                    let mut mid = None;
                                     if let Some(e2e) = &s.e2e {
-                                        let (_, missing) = e2e.lock().unwrap().send_chat(&text);
+                                        let (id, _, missing) = e2e.lock().unwrap().send_chat(&text);
+                                        mid = Some((my_id, id));
                                         if !missing.is_empty() {
                                             s.chat.push(ChatLine::System(format!(
                                                 "以下成员暂时收不到这条消息（加密尚未建立或身份待核对）：{}",
@@ -789,7 +833,7 @@ impl App {
                                         }
                                     }
                                     let me = s.me().map(|u| u.name.clone()).unwrap_or_default();
-                                    s.chat.push(ChatLine::User { from: me, text, ts: voc_proto::now_millis(), mine: true });
+                                    s.chat.push(ChatLine::User { from: me, text, ts: voc_proto::now_millis(), mine: true, id: mid, reactions: Vec::new() });
                                 }
                                 r.request_focus();
                             }
@@ -822,13 +866,51 @@ impl App {
                     let mut prev: Option<(&str, u64)> = None;
                     for line in lines {
                         match line {
-                            ChatLine::User { from, text, ts, mine } => {
+                            ChatLine::User { from, text, ts, mine, id, reactions } => {
                                 // 同一人 5 分钟内的连续消息合并显示
                                 let grouped = prev.is_some_and(|(p, t)| p == from && ts.saturating_sub(t) < 300_000);
+                                let at_me = !*mine && crate::app::mentions(text, &my_name);
+                                // 消息正文：@我 的高亮；能回应的右键出表情
+                                let body = |ui: &mut egui::Ui, react: &mut Option<((u32, u64), String)>| {
+                                    let mut rt = RichText::new(text);
+                                    if at_me {
+                                        rt = rt.color(th::YELLOW);
+                                    }
+                                    let r = ui.add(egui::Label::new(rt).wrap().sense(Sense::click()));
+                                    if let Some(mid) = id {
+                                        let r = r.on_hover_text("右键：表情回应");
+                                        r.context_menu(|ui| {
+                                            ui.horizontal(|ui| {
+                                                for e in voc_proto::e2e::REACTIONS {
+                                                    if ui.button(RichText::new(e).size(18.0)).clicked() {
+                                                        *react = Some((*mid, e.to_string()));
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
+                                        });
+                                    }
+                                    if !reactions.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (e, who) in reactions {
+                                                let mine_r = who.contains(&my_id);
+                                                let names: Vec<String> = who.iter().map(|w| s.name_of(*w)).collect();
+                                                let b = egui::Button::new(RichText::new(format!("{e} {}", who.len())).size(12.5))
+                                                    .selected(mine_r)
+                                                    .corner_radius(CornerRadius::same(10));
+                                                if ui.add(b).on_hover_text(names.join("、")).clicked() {
+                                                    if let Some(mid) = id {
+                                                        *react = Some((*mid, e.clone()));
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                };
                                 if grouped {
                                     ui.horizontal(|ui| {
                                         ui.add_space(48.0);
-                                        ui.add(egui::Label::new(RichText::new(text)).wrap());
+                                        ui.vertical(|ui| body(ui, &mut react));
                                     });
                                 } else {
                                     ui.add_space(8.0);
@@ -840,8 +922,11 @@ impl App {
                                                 let c = if *mine { th::ACCENT_HOVER } else { th::name_color(from) };
                                                 ui.label(RichText::new(from).strong().color(c));
                                                 ui.label(RichText::new(th::fmt_time(*ts)).size(11.5).color(th::TEXT_FAINT));
+                                                if at_me {
+                                                    th::pill(ui, "@你", th::YELLOW, th::BG_ELEVATED);
+                                                }
                                             });
-                                            ui.add(egui::Label::new(RichText::new(text)).wrap());
+                                            body(ui, &mut react);
                                         });
                                     });
                                 }
@@ -906,6 +991,22 @@ impl App {
         // ---------------- 动作
         if let Some(t) = open_image {
             self.image_view = Some(t);
+        }
+        if let Some((mid, emoji)) = react {
+            let peer = s.chat_tab.clone();
+            let lines = s.lines_for(peer.as_deref());
+            // 已经点过同一个表情就是取消
+            let on = !lines.iter().any(|l| matches!(l, ChatLine::User { id: Some(i), reactions, .. }
+                if *i == mid && reactions.iter().any(|(e, w)| *e == emoji && w.contains(&my_id))));
+            crate::app::apply_reaction(lines, mid, &emoji, my_id, on);
+            let to: Vec<u32> = match &peer {
+                Some(p) => s.id_by_name(p).into_iter().collect(),
+                None => s.users.iter().map(|u| u.id).filter(|i| *i != my_id).collect(),
+            };
+            if let Some(e2e) = &s.e2e {
+                let r = voc_proto::e2e::React { from: mid.0, id: mid.1, emoji, on, dm: peer.is_some() };
+                e2e.lock().unwrap().send_react(&to, &r);
+            }
         }
         if let Some(tab) = switch_tab {
             s.chat_tab = tab;
@@ -1068,6 +1169,48 @@ impl App {
                         });
                         ui.label(RichText::new("在游戏里也有效。松开后多发 0.2 秒，句尾不会被截断。").size(11.5).color(th::TEXT_FAINT));
                     }
+                    ui.add_space(8.0);
+                    th::section(ui, "快捷键");
+                    let mut changed = false;
+                    for (i, what) in ["闭麦", "静音"].into_iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{what}："));
+                            if self.hotkey_capture == Some(i) {
+                                ui.label(RichText::new("请按下快捷键（可以带 Ctrl / Shift / Alt），Esc 取消").color(th::YELLOW));
+                                ctx.request_repaint();
+                                if let Some(r) = crate::hotkey::capture() {
+                                    if let Some(k) = r {
+                                        *if i == 0 { &mut self.cfg.mute_key } else { &mut self.cfg.deafen_key } = k;
+                                        changed = true;
+                                    }
+                                    self.hotkey_capture = None;
+                                    self.hotkeys.paused.store(false, Ordering::Relaxed);
+                                }
+                            } else {
+                                let k = if i == 0 { self.cfg.mute_key } else { self.cfg.deafen_key };
+                                ui.label(RichText::new(k.label()).strong());
+                                if ui.small_button("更改").clicked() {
+                                    self.hotkey_capture = Some(i);
+                                    self.hotkeys.paused.store(true, Ordering::Relaxed);
+                                }
+                                if k.is_set() && ui.small_button("清除").clicked() {
+                                    *if i == 0 { &mut self.cfg.mute_key } else { &mut self.cfg.deafen_key } = Default::default();
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                    if changed {
+                        self.apply_hotkeys();
+                    }
+                    let clash = |k: crate::hotkey::Hotkey| k.is_set() && !k.ctrl && !k.shift && !k.alt && k.vk == self.cfg.ptt_vk;
+                    if self.cfg.mute_key.is_set() && self.cfg.mute_key == self.cfg.deafen_key {
+                        ui.label(RichText::new("闭麦和静音用了同一个快捷键，请换一个").size(11.5).color(th::YELLOW));
+                    } else if clash(self.cfg.mute_key) || clash(self.cfg.deafen_key) {
+                        ui.label(RichText::new("快捷键和按键说话的键一样，请换一个").size(11.5).color(th::YELLOW));
+                    } else {
+                        ui.label(RichText::new("在游戏里也有效；按下时响一声（低音 = 闭麦 / 静音，高音 = 恢复）").size(11.5).color(th::TEXT_FAINT));
+                    }
                     let level = self.settings.input_level_db.get();
                     level_meter(ui, level, self.cfg.vad_threshold_db, self.settings.transmitting.load(Ordering::Relaxed));
                     if self.cfg.ptt_vk == 0 {
@@ -1096,8 +1239,10 @@ impl App {
                         self.cfg.output_volume = vol / 100.0;
                         self.settings.output_volume.set(self.cfg.output_volume);
                     }
+                    ui.checkbox(&mut self.cfg.notify, "被 @ 或收到私聊时弹出 Windows 通知（VOC 不在前台时）")
+                        .on_hover_text("安装版才能弹通知；绿色版只会让任务栏图标闪烁、托盘图标显示红点");
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.cfg.sfx, "进出频道提示音");
+                        ui.checkbox(&mut self.cfg.sfx, "进出频道 / 快捷键提示音");
                         if self.cfg.sfx {
                             let mut v = self.cfg.sfx_volume * 100.0;
                             if ui.add(egui::Slider::new(&mut v, 0.0..=100.0).suffix("%").show_value(false)).changed() {
@@ -1162,7 +1307,8 @@ impl App {
                     }
                     if ui
                         .checkbox(&mut self.cfg.p2p, "P2P 直连（省服务器带宽、延迟更低）")
-                        .on_hover_text("能直连的队友之间语音不经过服务器。代价：同频道开启了 P2P 的成员能看到你的 IP 地址。")
+                        .on_hover_text("能直连的队友之间语音不经过服务器。代价：同频道开启了 P2P 的成员能拿到你的公网 IP（局域网地址只给同一个局域网的人）。
+关掉 = 不暴露 IP，所有声音和画面都经服务器。也可以右键某个人选「走服务器」，只对他隐藏。")
                         .changed()
                     {
                         if let Some(l) = self.voice.current_link() {
@@ -1317,6 +1463,13 @@ impl App {
                     ui.add_space(8.0);
                     th::section(ui, "更新");
                     ui.checkbox(&mut self.cfg.auto_update, "启动时自动检查更新");
+                    if ui
+                        .checkbox(&mut self.cfg.update_accel, "中国大陆加速更新")
+                        .on_hover_text("连不上 GitHub 或下载很慢时打开：安装包改从国内的 GitHub 加速镜像下载（一个不行自动换下一个）。\n版本号和 SHA-256 仍从 GitHub 官方取，下载的文件对不上就丢掉，镜像改不了安装包。")
+                        .changed()
+                    {
+                        self.updater.accel.store(self.cfg.update_accel, Ordering::Relaxed);
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("🔄 检查更新").clicked() {
                             self.updater.check(ctx.clone());
@@ -1337,6 +1490,11 @@ impl App {
                                 } else {
                                     ui.hyperlink_to(RichText::new(format!("发现新版本 v{version}，点此下载")).color(th::ACCENT_HOVER), url);
                                 }
+                                if self.cfg.update_accel {
+                                    let asset = if crate::update::is_packaged() { crate::update::SETUP_ASSET } else { crate::update::PORTABLE_ASSET };
+                                    ui.hyperlink_to(RichText::new("国内加速下载").size(12.0), crate::update::accel_link(asset))
+                                        .on_hover_text("经国内 GitHub 加速镜像下载（第三方镜像，手动下载时不会自动核对 SHA-256）");
+                                }
                             }
                             crate::update::UpdateState::Downloading { percent, .. } => {
                                 ui.add(egui::ProgressBar::new(percent as f32 / 100.0).desired_width(160.0).show_percentage());
@@ -1346,6 +1504,9 @@ impl App {
                             }
                             crate::update::UpdateState::Failed(e) => {
                                 ui.label(RichText::new(e).size(12.0).color(th::RED));
+                                if !self.cfg.update_accel {
+                                    ui.label(RichText::new("在中国大陆连不上 GitHub？勾上上面的「中国大陆加速更新」再试").size(11.5).color(th::TEXT_DIM));
+                                }
                             }
                         }
                     });
@@ -1451,15 +1612,18 @@ impl App {
                             ui.label(format!("{} fps（采集 {}）", st.fps.load(Ordering::Relaxed), st.capture_fps.load(Ordering::Relaxed)));
                             ui.end_row();
                             ui.label(RichText::new("码率").color(th::TEXT_DIM));
+                            let mbps = st.kbps.load(Ordering::Relaxed) as f32 / 1000.0;
+                            let fec = match st.fec_k.load(Ordering::Relaxed) {
+                                0 => String::new(),
+                                k => format!(" · 有丢包，已加冗余（每 {k} 片 1 个）"),
+                            };
                             let pct = st.rate_pct.load(Ordering::Relaxed);
-                            if pct < 100 {
-                                ui.label(RichText::new(format!(
-                                    "{:.1} Mbps（网络拥堵，已自动降到 {pct}%）",
-                                    st.kbps.load(Ordering::Relaxed) as f32 / 1000.0
-                                ))
-                                .color(th::YELLOW));
+                            if pct < 100 && st.low_watchers.load(Ordering::Relaxed) > 0 {
+                                ui.label(RichText::new(format!("{mbps:.1} Mbps · 流畅层已自动降到 {pct}%{fec}")).color(th::YELLOW));
+                            } else if fec.is_empty() {
+                                ui.label(format!("{mbps:.1} Mbps"));
                             } else {
-                                ui.label(format!("{:.1} Mbps", st.kbps.load(Ordering::Relaxed) as f32 / 1000.0));
+                                ui.label(RichText::new(format!("{mbps:.1} Mbps{fec}")).color(th::YELLOW));
                             }
                             ui.end_row();
                             ui.label(RichText::new("编码").color(th::TEXT_DIM));
@@ -1505,6 +1669,10 @@ impl App {
                 th::section(ui, "帧率");
                 th::segmented(ui, &mut self.cfg.share.fps, &[(30, "30 帧"), (60, "60 帧")]);
                 ui.add_space(6.0);
+                th::section(ui, "画质");
+                let q: Vec<(u8, &str)> = video::QUALITIES.iter().enumerate().map(|(i, q)| (i as u8, q.0)).collect();
+                th::segmented(ui, &mut self.cfg.share.quality, &q);
+                ui.add_space(6.0);
                 th::section(ui, "编码器");
                 let choices = video::encoder_choices();
                 let cur = choices.iter().find(|c| c.0 == self.cfg.share.encoder).map(|c| c.1.clone()).unwrap_or_else(|| choices[0].1.clone());
@@ -1546,6 +1714,7 @@ impl App {
                         desc: eff.desc(),
                         audio: self.cfg.share_audio && crate::loopback::supported(),
                         simulcast: true,
+                        rtx: true,
                     });
                     self.sharer = Some(sh);
                     self.share_confirmed = false;
@@ -1945,17 +2114,8 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let (m, d) = ui.input(|i| {
-            (i.modifiers.command && i.key_pressed(egui::Key::M), i.modifiers.command && i.key_pressed(egui::Key::D))
-        });
-        if m {
-            self.settings.muted.fetch_xor(true, Ordering::Relaxed);
-            self.sync_voice_state();
-        }
-        if d {
-            self.settings.deafened.fetch_xor(true, Ordering::Relaxed);
-            self.sync_voice_state();
-        }
+        // 闭麦 / 静音快捷键由后台线程全局检测（hotkey.rs），窗口在不在前台都一样
+        self.handle_hotkeys();
 
         match &self.screen {
             Screen::Login { error } => {

@@ -37,21 +37,27 @@ pub enum Chime {
     Join,
     /// 有人离开频道：下行两音
     Leave,
+    /// 快捷键闭麦 / 静音：一声低音
+    MuteOn,
+    /// 快捷键开麦 / 取消静音：一声高音
+    MuteOff,
 }
 
 /// 合成提示音（混音采样率，单声道）：两个带包络的柔和正弦音，叠一点二次谐波让声音更圆润
 pub fn chime(kind: Chime) -> Vec<i16> {
     // 「噔、噔」两声：每声约 0.17 秒，中间停 0.06 秒；进入低→高，离开高→低
     let (a, b) = (659.25f32, 987.77f32); // E5、B5
-    let notes = match kind {
-        Chime::Join => [a, b],
-        Chime::Leave => [b, a],
+    let notes: &[f32] = match kind {
+        Chime::Join => &[a, b],
+        Chime::Leave => &[b, a],
+        Chime::MuteOn => &[440.0],
+        Chime::MuteOff => &[a],
     };
     const NOTE: f32 = 0.17;
     const GAP: f32 = 0.06;
     let sr = SAMPLE_RATE as f32;
     let mut out = Vec::new();
-    for (k, freq) in notes.into_iter().enumerate() {
+    for (k, &freq) in notes.iter().enumerate() {
         if k > 0 {
             out.extend(std::iter::repeat_n(0i16, (GAP * sr) as usize));
         }

@@ -54,11 +54,17 @@ pub enum ClientMsg {
     E2eAnnounce {
         entry: E2eEntry,
     },
-    /// 开启 P2P：本机候选地址（局域网 / IPv6）
+    /// 开启 P2P：本机候选地址（局域网 / IPv6）；nat = 自测的 NAT 类型（打洞策略用，测出来后再发一次）
     P2pEnable {
         local_addrs: Vec<String>,
+        #[serde(default)]
+        nat: Option<NatInfo>,
     },
     P2pDisable,
+    /// 我选了和这些人「走服务器」：不要把我的地址给他们，也不要把他们的给我（隐私）
+    P2pHide {
+        ids: Vec<u32>,
+    },
     /// 给某个成员的 ML-KEM 密文与签名（base64），服务器原样转发
     PeerKey {
         to: u32,
@@ -85,6 +91,9 @@ pub enum ClientMsg {
         audio: bool,
         #[serde(default)]
         simulcast: bool,
+        /// 支持丢包补发（NACK）和冗余校验包（FEC）
+        #[serde(default)]
+        rtx: bool,
     },
     /// 开始 / 停止伴奏（name = 程序名，None = 停止）
     SetMusic {
@@ -159,6 +168,9 @@ pub enum ServerMsg {
         /// 服务器支持的新功能（旧服务器为空），见 FEATURE_*
         #[serde(default)]
         features: Vec<String>,
+        /// NAT 探测端口（UDP，只回答「我看到你的地址」）；0 = 没有
+        #[serde(default)]
+        probe_port: u16,
     },
     Error {
         message: String,
@@ -234,7 +246,32 @@ pub struct PeerInfo {
     pub id: u32,
     /// 候选地址：第一个是服务器观察到的公网地址，其余为对方自报的本地地址
     pub addrs: Vec<String>,
+    /// 对方自测的 NAT 类型
+    #[serde(default)]
+    pub nat: Option<NatInfo>,
 }
+
+/// NAT 类型（客户端向服务器的两个端口各问一次自己的公网地址，比较得出）
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NatInfo {
+    /// 见 NAT_*
+    pub kind: u8,
+    /// 最近一次分配的公网端口（对称型 NAT 端口预测用）
+    #[serde(default)]
+    pub port: u16,
+    /// 对称型 NAT 每换一个目标端口加多少（可预测时）
+    #[serde(default)]
+    pub step: i16,
+}
+
+/// 没有 NAT（公网地址就在本机上）
+pub const NAT_OPEN: u8 = 1;
+/// 去哪都用同一个映射：好打洞
+pub const NAT_CONE: u8 = 2;
+/// 对称型，端口按固定步长分配：可以预测
+pub const NAT_SYM_PREDICTABLE: u8 = 3;
+/// 对称型，端口随机：基本打不通
+pub const NAT_SYM_RANDOM: u8 = 4;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ChannelInfo {
@@ -270,12 +307,17 @@ pub struct UserInfo {
     /// 屏幕共享有低画质层可选
     #[serde(default)]
     pub simulcast: bool,
+    /// 屏幕共享支持丢包补发和冗余校验包
+    #[serde(default)]
+    pub rtx: bool,
 }
 
 /// 服务器功能：私聊发图（FileTarget）
 pub const FEATURE_DM_FILE: &str = "dm_file";
 /// 服务器功能：PONG 里附上客户端公网地址
 pub const FEATURE_PONG_ADDR: &str = "pong_addr";
+/// 服务器功能：转发视频补发请求（udp::NACK）、缓存最近的画面分片直接补发、转发冗余校验包
+pub const FEATURE_VIDEO_RTX: &str = "video_rtx";
 
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
     let mut s = serde_json::to_string(msg).expect("serialize");
