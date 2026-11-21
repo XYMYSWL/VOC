@@ -19,8 +19,9 @@ pub const SHARE_AUDIO: u8 = 6;
 
 /// 视频分片数据最大长度（加上各层包头后单个 UDP 包 < 1200 字节，避免 IP 分片）
 pub const VIDEO_FRAG: usize = 1080;
-/// 视频分片 flags：bit0 = 关键帧，bit1-2 = 编码格式（0 H.264，1 HEVC，2 AV1）
+/// 视频分片 flags：bit0 = 关键帧，bit1-2 = 编码格式（0 H.264，1 HEVC，2 AV1），bit3 = 低画质层（360P）
 pub const VIDEO_KEY: u8 = 1;
+pub const VIDEO_LOW: u8 = 8;
 pub const CODEC_H264: u8 = 0;
 pub const CODEC_HEVC: u8 = 1;
 pub const CODEC_AV1: u8 = 2;

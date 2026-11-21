@@ -162,17 +162,11 @@ impl Converter {
         self.luid
     }
 
-    /// 处理一帧：缩放到 out_w × out_h 的 NV12 纹理（在本设备上）
-    pub fn convert(&mut self, f: &GpuFrame, out_w: u32, out_h: u32, fps: u32) -> Result<ID3D11Texture2D> {
+    /// 处理一帧：缩放到 out_w × out_h 的 NV12 纹理（在本设备上）。
+    /// keep = 同一帧还要再转一次（低画质层）：用完不还给采集端，留给下一次转换
+    pub fn convert(&mut self, f: &GpuFrame, out_w: u32, out_h: u32, fps: u32, keep: bool) -> Result<ID3D11Texture2D> {
         unsafe {
-            if !matches!(&self.src, Some((g, _, _)) if *g == f.generation) {
-                let mut t: Option<ID3D11Texture2D> = None;
-                self.dev.OpenSharedResource(HANDLE(f.handle as *mut _), &mut t)?;
-                let t = t.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
-                let km: IDXGIKeyedMutex = t.cast()?;
-                self.src = Some((f.generation, t, km));
-                self.vp = None;
-            }
+            self.open_src(f)?;
             let key = (f.generation, f.width, f.height, out_w, out_h);
             if !self.vp.as_ref().is_some_and(|v| v.key == key) {
                 self.vp = Some(self.make_vp(key, fps)?);
@@ -190,10 +184,33 @@ impl Converter {
                 ..Default::default()
             };
             let r = self.vctx.VideoProcessorBlt(&vp.vp, view, 0, &[stream]);
-            release(km, 0);
+            release(km, if keep { 1 } else { 0 });
             r?;
             Ok(tex.clone())
         }
+    }
+
+    /// 打开采集端的共享纹理（换了纹理才重新打开）
+    fn open_src(&mut self, f: &GpuFrame) -> Result<()> {
+        if !matches!(&self.src, Some((g, _, _)) if *g == f.generation) {
+            let mut t: Option<ID3D11Texture2D> = None;
+            unsafe { self.dev.OpenSharedResource(HANDLE(f.handle as *mut _), &mut t)? };
+            let t = t.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+            let km: IDXGIKeyedMutex = t.cast()?;
+            self.src = Some((f.generation, t, km));
+            self.vp = None;
+        }
+        Ok(())
+    }
+
+    /// 不处理这一帧，直接把共享纹理还给采集端（否则采集端拿不回来，之后的画面都会卡住）
+    pub fn give_back(&mut self, f: &GpuFrame) -> Result<()> {
+        self.open_src(f)?;
+        let (_, _, km) = self.src.as_ref().unwrap();
+        if acquire(km, 1, 100) {
+            release(km, 0);
+        }
+        Ok(())
     }
 
     unsafe fn make_vp(&self, key: (u32, u32, u32, u32, u32), fps: u32) -> Result<VpState> {

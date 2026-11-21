@@ -452,6 +452,8 @@ struct Viewer {
     tex: Option<egui::TextureHandle>,
     seq: u64,
     size: (usize, usize),
+    /// 看低画质层（流畅 360P）
+    low: bool,
 }
 
 impl App {
@@ -1258,9 +1260,9 @@ impl App {
                     }
                     ServerMsg::System { text } => s.chat.push(ChatLine::System(text)),
                     ServerMsg::Pong => {}
-                    ServerMsg::Watchers { ids } => {
+                    ServerMsg::Watchers { ids, low } => {
                         if let Some(l) = self.voice.current_link() {
-                            l.set_watchers(ids);
+                            l.set_watchers(ids, low);
                         }
                     }
                     ServerMsg::KeyframeRequest { .. } => {
@@ -1399,6 +1401,7 @@ impl App {
             udp: true,
             music: None,
             share_audio: false,
+            simulcast: sharing.is_some(),
         };
         let (_tx, events) = mpsc::channel();
         let mut s = Session {
@@ -1490,7 +1493,7 @@ impl App {
                 }
             }
             *view.frame.lock().unwrap() = Some(video::DecodedFrame { width: w, height: h, rgba, seq: 1 });
-            self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0) });
+            self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0), low: false });
             if kind == "fullscreen" {
                 self.fullscreen = Some(2); // 演示只画全屏界面，不真的切换窗口全屏
             }

@@ -60,8 +60,12 @@ struct User {
     sharing: Option<String>,
     /// 我正在观看谁的屏幕
     watching: HashSet<u32>,
-    /// 上次发给我的观看者名单（我是共享者时）
-    last_watchers: Vec<u32>,
+    /// 其中要低画质层的
+    watch_low: HashSet<u32>,
+    /// 我的屏幕共享有低画质层
+    simulcast: bool,
+    /// 上次发给我的观看者名单（我是共享者时）：全部、要低画质的
+    last_watchers: (Vec<u32>, Vec<u32>),
     /// 能解码的视频格式
     decoders: Vec<String>,
     /// 正在放伴奏的程序名
@@ -130,6 +134,7 @@ impl State {
                 udp: u.voice_udp,
                 music: u.music.clone(),
                 share_audio: u.sharing.is_some() && u.share_audio,
+                simulcast: u.sharing.is_some() && u.simulcast,
             })
             .collect();
         users.sort_by_key(|u| u.id);
@@ -199,21 +204,23 @@ impl State {
 
     /// 告诉每个共享者现在有谁在看（有变化才发）
     fn push_watchers(&mut self) {
-        let pairs: Vec<(u32, Option<u32>, HashSet<u32>)> =
-            self.users.iter().map(|(id, u)| (*id, u.channel, u.watching.clone())).collect();
+        let pairs: Vec<(u32, Option<u32>, HashSet<u32>, HashSet<u32>)> =
+            self.users.iter().map(|(id, u)| (*id, u.channel, u.watching.clone(), u.watch_low.clone())).collect();
         for (id, u) in self.users.iter_mut() {
-            let mut w: Vec<u32> = match (&u.sharing, u.channel) {
+            let mut w: Vec<(u32, bool)> = match (&u.sharing, u.channel) {
                 (Some(_), Some(ch)) => pairs
                     .iter()
-                    .filter(|(wid, wch, set)| wid != id && *wch == Some(ch) && set.contains(id))
-                    .map(|(wid, _, _)| *wid)
+                    .filter(|(wid, wch, set, _)| wid != id && *wch == Some(ch) && set.contains(id))
+                    .map(|(wid, _, _, low)| (*wid, u.simulcast && low.contains(id)))
                     .collect(),
                 _ => Vec::new(),
             };
             w.sort();
-            if w != u.last_watchers {
-                u.last_watchers = w.clone();
-                u.send(ServerMsg::Watchers { ids: w });
+            let ids: Vec<u32> = w.iter().map(|x| x.0).collect();
+            let low: Vec<u32> = w.iter().filter(|x| x.1).map(|x| x.0).collect();
+            if (&ids, &low) != (&u.last_watchers.0, &u.last_watchers.1) {
+                u.last_watchers = (ids.clone(), low.clone());
+                u.send(ServerMsg::Watchers { ids, low });
             }
         }
     }
@@ -338,14 +345,18 @@ impl State {
     fn forward_video(&mut self, from: u32, frag: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
         let Some(u) = self.users.get(&from) else { return Vec::new() };
         let (Some(ch), Some(_)) = (u.channel, &u.sharing) else { return Vec::new() };
-        if udp::read_video_frag(frag).is_none() {
-            return Vec::new();
-        }
+        let Some((f, _)) = udp::read_video_frag(frag) else { return Vec::new() };
+        // 有低画质层时按层转发：要低画质的只收低画质层，其他人只收原画
+        let layer_low = f.flags & udp::VIDEO_LOW != 0;
+        let simulcast = u.simulcast;
         let direct = u.direct_video.clone();
         let payload = udp::server_video(from, frag);
         let mut out = Vec::new();
         for (id, other) in self.users.iter_mut() {
             if other.channel != Some(ch) || !other.watching.contains(&from) || direct.contains(id) {
+                continue;
+            }
+            if layer_low != (simulcast && other.watch_low.contains(&from)) {
                 continue;
             }
             match (other.voice_udp, other.udp) {
@@ -756,7 +767,9 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 last_peers: Vec::new(),
                 sharing: None,
                 watching: HashSet::new(),
-                last_watchers: Vec::new(),
+                watch_low: HashSet::new(),
+                simulcast: false,
+                last_watchers: (Vec::new(), Vec::new()),
                 decoders: Vec::new(),
                 music: None,
                 share_audio: false,
@@ -1017,11 +1030,12 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::ShareStart { desc, audio } => {
+        ClientMsg::ShareStart { desc, audio, simulcast } => {
             let desc: String = desc.trim().chars().take(16).collect();
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.channel.is_some() {
                     u.share_audio = audio;
+                    u.simulcast = simulcast;
                     u.sharing = Some(if desc.is_empty() { "屏幕".into() } else { desc });
                     let name = u.name.clone();
                     st.broadcast_state();
@@ -1036,7 +1050,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::Watch { target, on } => {
+        ClientMsg::Watch { target, on, low } => {
             let ok = match (st.users.get(&uid), st.users.get(&target)) {
                 (Some(me), Some(t)) => t.sharing.is_some() && me.channel.is_some() && me.channel == t.channel,
                 _ => false,
@@ -1044,8 +1058,14 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             if let Some(u) = st.users.get_mut(&uid) {
                 if on && ok {
                     u.watching.insert(target);
+                    if low {
+                        u.watch_low.insert(target);
+                    } else {
+                        u.watch_low.remove(&target);
+                    }
                 } else {
                     u.watching.remove(&target);
+                    u.watch_low.remove(&target);
                 }
             }
         }

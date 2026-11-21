@@ -53,6 +53,11 @@ impl ShareConfig {
         c
     }
 
+    /// 低画质层：360P，帧率同原画
+    pub fn low_layer(&self) -> Self {
+        Self { height: 360, ..self.clone() }
+    }
+
     pub fn desc(&self) -> String {
         format!("{}p{}", self.height, self.fps)
     }
@@ -60,6 +65,8 @@ impl ShareConfig {
     /// 目标码率（bps）
     pub fn bitrate(&self) -> u32 {
         let kbps = match (self.height, self.fps >= 60) {
+            (h, false) if h <= 360 => 450,
+            (h, true) if h <= 360 => 650,
             (h, false) if h <= 480 => 900,
             (h, true) if h <= 480 => 1400,
             (h, false) if h <= 720 => 2000,
@@ -141,8 +148,9 @@ pub fn encoder_choices() -> Vec<(String, String)> {
     v
 }
 
-/// 按偏好和观看者能解的格式，决定用哪种格式、哪个编码器（None = openh264 软件编码）
-pub fn plan_encoder(pref: &str, allowed: &[Codec], hw: &[HwEncoderInfo]) -> (Codec, Option<HwEncoderInfo>) {
+/// 按偏好和观看者能解的格式，决定用哪种格式、哪个编码器（None = openh264 软件编码）。
+/// capture_vendor：画面所在显卡的厂商号。同一种格式有好几块显卡能编时优先用它（才能走显卡直通）
+pub fn plan_encoder(pref: &str, allowed: &[Codec], hw: &[HwEncoderInfo], capture_vendor: Option<u32>) -> (Codec, Option<HwEncoderInfo>) {
     if pref == "software" {
         return (Codec::H264, None);
     }
@@ -151,7 +159,9 @@ pub fn plan_encoder(pref: &str, allowed: &[Codec], hw: &[HwEncoderInfo]) -> (Cod
         if !allowed.contains(&codec) {
             continue;
         }
-        if let Some(e) = hw.iter().find(|e| e.codec == codec && vendor.is_none_or(|v| e.vendor == v)) {
+        let ok = |e: &&HwEncoderInfo| e.codec == codec && vendor.is_none_or(|v| e.vendor == v);
+        let same_gpu = hw.iter().filter(ok).find(|e| Some(e.vendor) == capture_vendor);
+        if let Some(e) = same_gpu.or_else(|| hw.iter().find(ok)) {
             return (codec, Some(e.clone()));
         }
     }
@@ -325,6 +335,7 @@ impl VideoEncoder {
         f: &crate::mf::gpu::GpuFrame,
         plan: &(Codec, Option<HwEncoderInfo>),
         force_key: bool,
+        keep: bool,
     ) -> Result<Vec<EncodedFrame>, String> {
         let (codec, Some(info)) = plan else { return Err("没有硬件编码器".into()) };
         let (dw, dh) = self.cfg.target_size(f.width as usize, f.height as usize);
@@ -342,7 +353,7 @@ impl VideoEncoder {
                 .map_err(|e| format!("{} 初始化失败：{e}", info.name))?;
             self.cur = Some((dw, dh, *codec, name, Backend::Hw(enc)));
         }
-        let tex = self.gpu.as_mut().unwrap().convert(f, dw as u32, dh as u32, self.cfg.fps).map_err(|e| format!("显卡缩放失败：{e}"))?;
+        let tex = self.gpu.as_mut().unwrap().convert(f, dw as u32, dh as u32, self.cfg.fps, keep).map_err(|e| format!("显卡缩放失败：{e}"))?;
         let Some((_, _, codec, _, Backend::Hw(enc))) = self.cur.as_mut() else { return Err("编码器状态不对".into()) };
         if force_key || fresh {
             enc.force_keyframe();
@@ -350,6 +361,20 @@ impl VideoEncoder {
         let codec = *codec;
         let pkts = enc.encode_texture(&tex).map_err(|e| format!("{} 编码失败：{e}", enc.name))?;
         Ok(pkts.into_iter().map(|(data, key)| EncodedFrame { data, key, width: dw, height: dh, codec }).collect())
+    }
+
+    /// 跳过一帧显卡画面：把共享纹理还给采集端
+    pub fn give_back(&mut self, f: &crate::mf::gpu::GpuFrame) {
+        if !self.gpu.as_ref().is_some_and(|g| g.luid() == f.luid) {
+            match crate::mf::gpu::Converter::new(f.luid) {
+                Ok(c) => {
+                    self.gpu = Some(c);
+                    self.cur = None;
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = self.gpu.as_mut().unwrap().give_back(f);
     }
 
     fn make_soft(cfg: &ShareConfig) -> Result<Encoder, String> {
@@ -448,6 +473,8 @@ pub struct ShareStats {
     pub pipeline: Mutex<String>,
     /// 当前码率占设定值的百分比（网络拥堵时自动降低）
     pub rate_pct: AtomicU32,
+    /// 看低画质层的人数
+    pub low_watchers: AtomicU32,
 }
 
 struct RawFrame {
@@ -629,7 +656,9 @@ fn encode_loop(
 ) {
     let pref = cfg.encoder.clone();
     let full_bps = cfg.bitrate();
+    let mut low_enc = VideoEncoder::new(cfg.low_layer());
     let mut enc = VideoEncoder::new(cfg);
+    let mut low_frame_no = 0u32;
     let mut gpu_broken = std::env::var_os("VOC_NO_GPU_PIPE").is_some();
     let mut cap_vendor: Option<u32> = None;
     let (mut scale, mut calm) = (1.0f32, 0u32);
@@ -655,46 +684,96 @@ fn encode_loop(
         }
         // 每 10 秒兜底一个关键帧
         let key = force_key.swap(false, Ordering::Relaxed) || last_key.elapsed() > Duration::from_secs(10);
-        // 选格式：所有观看者都能解的里面最省带宽的；硬件编码器出过错就退回软件编码
-        let caps: Vec<Vec<String>> = {
+        // 两层：原画给大多数人，360P 低画质层给选了「流畅」的人；哪层没人看就不编码
+        let (main_ids, low_ids) = (link.layer_watchers(false), link.layer_watchers(true));
+        let (want_main, want_low) = (!main_ids.is_empty(), !low_ids.is_empty());
+        stats.low_watchers.store(low_ids.len() as u32, Ordering::Relaxed);
+        // 选格式：这一层所有观看者都能解的里面最省带宽的；硬件编码器出过错就退回软件编码
+        let caps_of = |ids: &[u32]| -> Vec<Vec<String>> {
             let all = state.caps.lock().unwrap();
-            link.watcher_ids().iter().map(|id| all.get(id).cloned().unwrap_or_default()).collect()
+            ids.iter().map(|id| all.get(id).cloned().unwrap_or_default()).collect()
         };
-        let plan = plan_encoder(if hw_broken { "software" } else { &pref }, &common_decoders(&caps), hw_encoders());
+        let pref_now = if hw_broken { "software" } else { pref.as_str() };
+        let plan = plan_encoder(pref_now, &common_decoders(&caps_of(&main_ids)), hw_encoders(), cap_vendor);
+        // 两层都有人看时，低画质层尽量和原画用同一种格式（同一块显卡上混用 H.264 和 AV1 两个硬件编码器时，实测低画质层解不出来）
+        let low_allowed = common_decoders(&caps_of(&low_ids));
+        let plan_low = if want_main && low_allowed.contains(&plan.0) {
+            plan.clone()
+        } else {
+            plan_encoder(pref_now, &low_allowed, hw_encoders(), cap_vendor)
+        };
+        let used: Vec<&(Codec, Option<HwEncoderInfo>)> =
+            [(want_main, &plan), (want_low, &plan_low)].into_iter().filter(|x| x.0).map(|x| x.1).collect();
         // 显卡直通的条件：用硬件编码器，且编码器和画面在同一块显卡上（笔记本核显出画面、独显编码时不行）
-        let gpu_ok = !gpu_broken && plan.1.as_ref().is_some_and(|i| cap_vendor.is_none_or(|v| v == i.vendor));
+        let same_gpu = |vendor: Option<u32>| used.iter().all(|p| p.1.as_ref().is_some_and(|i| vendor.is_none_or(|v| v == i.vendor)));
+        let gpu_ok = !gpu_broken && same_gpu(cap_vendor);
         gpu_flag.store(gpu_ok, Ordering::Relaxed);
         let te = Instant::now();
-        let r = match frame {
+        let r: Result<Vec<(bool, EncodedFrame)>, String> = match frame {
             CapFrame::Gpu(g) => {
                 if cap_vendor.is_none() {
                     cap_vendor = crate::mf::gpu::vendor_of(g.luid);
-                    if !plan.1.as_ref().is_some_and(|i| Some(i.vendor) == cap_vendor) {
+                    if cap_vendor.is_none() || !same_gpu(cap_vendor) {
                         gpu_flag.store(false, Ordering::Relaxed);
+                        enc.give_back(&g);
                         continue; // 换成拷回内存，下一帧走 CPU 转换
                     }
                 }
                 if !gpu_ok {
+                    enc.give_back(&g);
                     continue;
                 }
-                match enc.encode_gpu(&g, &plan, key) {
-                    Ok(f) => {
-                        *stats.pipeline.lock().unwrap() = "显卡直通".into();
-                        Ok(f)
+                // 同一帧转两次时，第一次转完不把画面还给采集端（keep）
+                let mut out = Vec::new();
+                let mut err = None;
+                if want_main {
+                    match enc.encode_gpu(&g, &plan, key, want_low) {
+                        Ok(f) => out.extend(f.into_iter().map(|f| (false, f))),
+                        Err(e) => err = Some(e),
                     }
-                    Err(e) => {
+                }
+                if want_low {
+                    match low_enc.encode_gpu(&g, &plan_low, key, false) {
+                        Ok(f) => out.extend(f.into_iter().map(|f| (true, f))),
+                        Err(e) => err = err.or(Some(e)),
+                    }
+                }
+                match err {
+                    None => {
+                        *stats.pipeline.lock().unwrap() = "显卡直通".into();
+                        Ok(out)
+                    }
+                    Some(e) => {
                         // 显卡直通不行：这次共享改用 CPU 转换（硬件编码照用）
                         *stats.error.lock().unwrap() = Some(format!("显卡直通不可用（{e}），已改用 CPU 转换"));
                         gpu_broken = true;
                         gpu_flag.store(false, Ordering::Relaxed);
                         force_key.store(true, Ordering::Relaxed);
+                        enc.give_back(&g); // 可能停在两层之间，确保还给采集端
                         continue;
                     }
                 }
             }
             CapFrame::Cpu(raw) => {
                 *stats.pipeline.lock().unwrap() = "CPU 转换".into();
-                enc.encode(&raw.data, raw.w, raw.h, &plan, key)
+                let mut out = Vec::new();
+                let mut err = None;
+                if want_main {
+                    match enc.encode(&raw.data, raw.w, raw.h, &plan, key) {
+                        Ok(f) => out.extend(f.into_iter().map(|f| (false, f))),
+                        Err(e) => err = Some(e),
+                    }
+                }
+                if want_low {
+                    match low_enc.encode(&raw.data, raw.w, raw.h, &plan_low, key) {
+                        Ok(f) => out.extend(f.into_iter().map(|f| (true, f))),
+                        Err(e) => err = err.or(Some(e)),
+                    }
+                }
+                match err {
+                    None => Ok(out),
+                    Some(e) => Err(e),
+                }
             }
         };
         sec_enc += te.elapsed();
@@ -711,22 +790,38 @@ fn encode_loop(
         if frames.is_empty() {
             sec_skip += 1;
         }
-        if let Some(d) = enc.describe() {
+        let desc = match (want_main, want_low) {
+            (true, true) => enc.describe().map(|d| format!("{d} + 360P 低画质层")),
+            (false, true) => low_enc.describe().map(|d| format!("{d}（只有低画质层有人看）")),
+            _ => enc.describe(),
+        };
+        if let Some(d) = desc {
             *stats.encoder.lock().unwrap() = d;
         }
         let Some(e2e) = state.e2e.lock().unwrap().clone() else { continue };
-        for ef in frames {
+        for (low, ef) in frames {
             if ef.key {
                 last_key = Instant::now();
             }
             let sealed = e2e.lock().unwrap().encrypt_video(&with_dims(&ef));
-            let frags = udp::video_fragments(frame_no, udp::video_flags(ef.key, ef.codec.id()), &sealed);
-            frame_no = frame_no.wrapping_add(1);
-            link.send_video(&frags, &mut buf);
-            sec_frames += 1;
+            // 两层各自编帧号（接收端按帧号判断丢帧）
+            let mut flags = udp::video_flags(ef.key, ef.codec.id());
+            let no = if low {
+                flags |= udp::VIDEO_LOW;
+                &mut low_frame_no
+            } else {
+                &mut frame_no
+            };
+            let frags = udp::video_fragments(*no, flags, &sealed);
+            *no = no.wrapping_add(1);
+            link.send_video(&frags, &mut buf, low);
             sec_bytes += sealed.len();
-            stats.width.store(ef.width as u32, Ordering::Relaxed);
-            stats.height.store(ef.height as u32, Ordering::Relaxed);
+            // 帧率、分辨率按主要的那一层统计
+            if low != want_main {
+                sec_frames += 1;
+                stats.width.store(ef.width as u32, Ordering::Relaxed);
+                stats.height.store(ef.height as u32, Ordering::Relaxed);
+            }
         }
         if sec_start.elapsed() >= Duration::from_secs(1) {
             // 码率自适应
@@ -734,6 +829,7 @@ fn encode_loop(
             if (new_scale - scale).abs() > 0.01 {
                 scale = new_scale;
                 enc.set_rate_scale(scale);
+                low_enc.set_rate_scale(scale);
                 link.set_video_bps((full_bps as f32 * scale) as u32);
             }
             stats.rate_pct.store((scale * 100.0).round() as u32, Ordering::Relaxed);
@@ -794,6 +890,8 @@ pub struct View {
 }
 
 struct Stream {
+    /// 当前收到的画质层（flags 的 VIDEO_LOW 位）；换层时帧号重新开始
+    layer: u8,
     cur: Option<u32>,
     frags: Vec<Option<Vec<u8>>>,
     got: usize,
@@ -833,6 +931,7 @@ impl VideoRx {
         s.insert(
             from,
             Stream {
+                layer: 0,
                 cur: None,
                 frags: Vec::new(),
                 got: 0,
@@ -888,6 +987,14 @@ impl VideoRx {
 impl Stream {
     /// 加入分片；凑齐一帧时返回 (帧号, flags, 数据)
     fn add(&mut self, f: VideoFrag, data: &[u8]) -> Option<(u32, u8, Vec<u8>)> {
+        let layer = f.flags & udp::VIDEO_LOW;
+        if layer != self.layer {
+            // 切换了画质：另一层的帧号是独立的，从它的关键帧重新开始
+            self.layer = layer;
+            self.cur = None;
+            self.last_done = None;
+            self.need_key = true;
+        }
         match self.cur {
             Some(c) if f.frame == c => {}
             Some(c) if f.frame.wrapping_sub(c) > 0x8000_0000 => return None, // 旧帧的迟到分片
@@ -1078,6 +1185,43 @@ mod tests {
     }
 
     #[test]
+    fn layer_switch_restarts_from_keyframe() {
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let mut st = Stream {
+            layer: 0,
+            cur: None,
+            frags: Vec::new(),
+            got: 0,
+            flags: 0,
+            last_done: None,
+            need_key: true,
+            last_req: None,
+            dec_tx: tx,
+            view: Arc::new(View::default()),
+        };
+        let feed = |st: &mut Stream, frame: u32, flags: u8| {
+            let f = udp::video_fragments(frame, flags, b"x");
+            let (h, d) = udp::read_video_frag(&f[0]).unwrap();
+            if let Some((id, flags, _)) = st.add(h, d) {
+                if flags & udp::VIDEO_KEY != 0 {
+                    st.need_key = false;
+                }
+                st.last_done = Some(id);
+            }
+        };
+        // 原画：关键帧后连续的 P 帧不用再要关键帧
+        feed(&mut st, 100, udp::VIDEO_KEY);
+        feed(&mut st, 101, 0);
+        assert!(!st.need_key);
+        // 换到低画质层：帧号从 0 开始，必须等它的关键帧
+        feed(&mut st, 0, udp::VIDEO_LOW);
+        assert!(st.need_key);
+        feed(&mut st, 1, udp::VIDEO_LOW | udp::VIDEO_KEY);
+        feed(&mut st, 2, udp::VIDEO_LOW);
+        assert!(!st.need_key);
+    }
+
+    #[test]
     fn bgra_to_i420_colors() {
         // 纯白 → Y≈235，U=V≈128；纯黑 → Y≈16
         let white = vec![255u8; 4 * 4 * 4];
@@ -1132,18 +1276,22 @@ mod tests {
         let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // 所有观看者都能解 AV1 → AV1
         let all = common_decoders(&[v(&["av1", "hevc", "h264"]), v(&["av1", "hevc", "h264"])]);
-        assert_eq!(plan_encoder("auto", &all, &hw).0, Codec::Av1);
+        assert_eq!(plan_encoder("auto", &all, &hw, None).0, Codec::Av1);
         // 有人不能解 AV1 → HEVC；有旧版客户端（没上报）→ 只能 H.264
         let some = common_decoders(&[v(&["av1", "hevc", "h264"]), v(&["hevc", "h264"])]);
-        assert_eq!(plan_encoder("auto", &some, &hw).0, Codec::Hevc);
+        assert_eq!(plan_encoder("auto", &some, &hw, None).0, Codec::Hevc);
+        // 画面在 AMD 显卡上：同样是 HEVC，优先用 AMD 的（能走显卡直通）；格式优先级不变
+        assert_eq!(plan_encoder("auto", &some, &hw, Some(0x1002)).1.unwrap().name, "AMD HEVC");
+        assert_eq!(plan_encoder("auto", &some, &hw, Some(0x10de)).1.unwrap().name, "NV HEVC");
+        assert_eq!(plan_encoder("auto", &all, &hw, Some(0x1002)).1.unwrap().name, "NV AV1");
         let old = common_decoders(&[v(&["av1", "hevc", "h264"]), vec![]]);
         assert_eq!(old, vec![Codec::H264]);
-        assert_eq!(plan_encoder("auto", &old, &hw).1.unwrap().name, "AMD H264");
-        assert!(plan_encoder("vendor:10de", &old, &hw).1.is_none(), "NVIDIA has no H.264 here -> software");
+        assert_eq!(plan_encoder("auto", &old, &hw, None).1.unwrap().name, "AMD H264");
+        assert!(plan_encoder("vendor:10de", &old, &hw, Some(0x10de)).1.is_none(), "NVIDIA has no H.264 here -> software");
         // 指定 AMD：只用 AMD 的编码器
-        let (c, e) = plan_encoder("vendor:1002", &all, &hw);
+        let (c, e) = plan_encoder("vendor:1002", &all, &hw, Some(0x10de));
         assert_eq!((c, e.unwrap().name.as_str()), (Codec::Hevc, "AMD HEVC"));
-        assert_eq!(plan_encoder("software", &all, &hw), (Codec::H264, None));
+        assert_eq!(plan_encoder("software", &all, &hw, None), (Codec::H264, None));
         // 码率：AV1 比 H.264 省
         let cfg = ShareConfig { height: 1080, fps: 60, ..Default::default() };
         assert!(cfg.bitrate_for(Codec::Av1) < cfg.bitrate_for(Codec::Hevc));
@@ -1161,6 +1309,51 @@ mod tests {
         let mut rgba = Vec::new();
         nv12_to_rgba(&nv12, 4, 4, &mut rgba);
         assert!(rgba[0] > 230 && rgba[1] < 30 && rgba[2] < 30, "{:?}", &rgba[..4]);
+    }
+
+    /// 中途强制关键帧后，新来的观看者（新解码器）从这一帧开始能不能解（H.264 要带 SPS/PPS 的 IDR）
+    #[test]
+    #[ignore]
+    fn forced_keyframe_starts_fresh_decoder() {
+        let (sw, sh) = (1280, 720);
+        let nal_types = |d: &[u8]| -> Vec<u8> {
+            let mut v = Vec::new();
+            let mut i = 0;
+            while i + 3 < d.len() {
+                if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+                    v.push(d[i + 3] & 0x1f);
+                    i += 3;
+                }
+                i += 1;
+            }
+            v
+        };
+        let mut encs: Vec<(String, Codec, Option<HwEncoderInfo>)> =
+            hw_encoders().iter().filter(|i| i.codec == Codec::H264).map(|i| (i.name.clone(), i.codec, Some(i.clone()))).collect();
+        encs.push(("OpenH264".into(), Codec::H264, None));
+        for (name, codec, info) in encs {
+            let mut enc = VideoEncoder::new(ShareConfig { height: 720, fps: 30, ..Default::default() });
+            let plan = (codec, info);
+            let mut pkts = Vec::new();
+            for t in 0..40 {
+                pkts.extend(enc.encode(&test_frame(sw, sh, t), sw, sh, &plan, t == 0 || t == 20).unwrap());
+            }
+            let keys: Vec<(usize, Vec<u8>)> = pkts.iter().enumerate().filter(|(_, p)| p.key).map(|(i, p)| (i, nal_types(&p.data))).collect();
+            println!("{name}: keyframes (index, NAL types) {keys:?}");
+            // 从第二个关键帧开始喂给新解码器
+            let start = keys.get(1).map(|k| k.0).unwrap_or(usize::MAX);
+            let mut d = make_decoder(codec, false, 1280, 720).expect("decoder");
+            let mut got = 0;
+            for p in pkts.iter().skip(start) {
+                match &mut d {
+                    Dec::Mf(m) => got += m.decode(&p.data).map(|f| f.len()).unwrap_or(0),
+                    Dec::Open(o) => got += o.decode(&p.data).ok().flatten().is_some() as usize,
+                }
+            }
+            println!("{name}: fresh decoder from 2nd keyframe decoded {got} frames");
+            assert!(keys.len() >= 2 && keys[1].1.contains(&7) && keys[1].1.contains(&5), "{name}: forced keyframe must be IDR with SPS");
+            assert!(got > 0, "{name}: a new viewer must be able to start from a forced keyframe");
+        }
     }
 
     /// 真实显卡：每种硬件编码器编 → 系统解码器软解 / 硬解，画面尺寸正确（需要显卡，默认不跑）

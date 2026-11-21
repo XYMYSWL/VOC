@@ -397,6 +397,8 @@ pub struct Link {
     /// 正在看我屏幕的人（我在共享时）
     watchers: Mutex<Vec<u32>>,
     watchers_ver: AtomicU32,
+    /// 其中要低画质层的人
+    watchers_low: Mutex<Vec<u32>>,
     /// P2P 上行带宽预算（bps）
     budget_bps: AtomicU32,
     /// 正在共享的屏幕码率（bps），没在共享为 0
@@ -561,12 +563,22 @@ impl Link {
     }
 
     /// 服务器告知：现在谁在看我的屏幕
-    pub fn set_watchers(&self, ids: Vec<u32>) {
+    pub fn set_watchers(&self, ids: Vec<u32>, low: Vec<u32>) {
         let mut w = self.watchers.lock().unwrap();
-        if ids.iter().any(|i| !w.contains(i)) {
-            self.watchers_ver.fetch_add(1, Ordering::Relaxed); // 有新观看者：编码器会补一个关键帧
+        let mut wl = self.watchers_low.lock().unwrap();
+        // 有新观看者，或有人换了画质层：编码器会补一个关键帧
+        let fresh = ids.iter().any(|i| !w.contains(i) || low.contains(i) != wl.contains(i));
+        if fresh {
+            self.watchers_ver.fetch_add(1, Ordering::Relaxed);
         }
         *w = ids;
+        *wl = low;
+    }
+
+    /// 某一层的观看者：low = 低画质层，否则原画
+    pub fn layer_watchers(&self, low: bool) -> Vec<u32> {
+        let wl = self.watchers_low.lock().unwrap();
+        self.watchers.lock().unwrap().iter().copied().filter(|i| wl.contains(i) == low).collect()
     }
 
     pub fn watchers_version(&self) -> u32 {
@@ -577,17 +589,13 @@ impl Link {
         !self.watchers.lock().unwrap().is_empty()
     }
 
-    pub fn watcher_ids(&self) -> Vec<u32> {
-        self.watchers.lock().unwrap().clone()
-    }
-
     pub fn watcher_count(&self) -> usize {
         self.watchers.lock().unwrap().len()
     }
 
-    /// 发送一帧视频的全部分片：能 P2P 直连的观看者直接发，其余交给服务器中转
-    pub fn send_video(&self, frags: &[Vec<u8>], buf: &mut Vec<u8>) {
-        let watchers = self.watchers.lock().unwrap().clone();
+    /// 发送一帧视频的全部分片（low = 低画质层）：这一层能 P2P 直连的观看者直接发，其余交给服务器按层中转
+    pub fn send_video(&self, frags: &[Vec<u8>], buf: &mut Vec<u8>, low: bool) {
+        let watchers = self.layer_watchers(low);
         if watchers.is_empty() {
             return;
         }
@@ -1163,6 +1171,7 @@ pub fn connect(
         others: Mutex::new(Vec::new()),
         watchers: Mutex::new(Vec::new()),
         watchers_ver: AtomicU32::new(0),
+        watchers_low: Mutex::new(Vec::new()),
         budget_bps: AtomicU32::new(DEFAULT_BUDGET_BPS),
         video_bps: AtomicU32::new(0),
         alloc: Mutex::new((Vec::new(), Vec::new())),
@@ -1931,11 +1940,11 @@ mod tests {
         connect(sink.local_addr().unwrap(), &keys, 3, false, ea, tx, st.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
         let l = st.current_link().unwrap();
         l.udp_ok.store(true, Ordering::Relaxed);
-        l.set_watchers(vec![7]);
+        l.set_watchers(vec![7], vec![]);
         let frags: Vec<Vec<u8>> = (0..100).map(|_| vec![0u8; 1150]).collect();
         let mut buf = Vec::new();
         let t = Instant::now();
-        l.send_video(&frags, &mut buf);
+        l.send_video(&frags, &mut buf, false);
         let mut got = 0;
         let mut b = [0u8; 2048];
         while got < 100 {
@@ -2033,6 +2042,9 @@ mod tests {
 
     /// 真实屏幕采集 → 720p H.264 → 端到端加密 → 两个真实 Link P2P 直连 → 解码。
     /// 需要桌面环境，默认不跑：cargo test -p voc-client live_screen_share -- --ignored
+    /// VOC_LIVE_LOW=1：同时有人看原画（#99，走服务器）和低画质层（#7，直连），验证同一帧编两层；
+    /// 再加 VOC_LIVE_ONLY_LOW=1 只有低画质层；VOC_LIVE_99_CAPS=1 让 #99 也能解 AV1 / HEVC。
+    /// 注意：这里没有服务器帮忙转发「要关键帧」，H.264 的大关键帧被匀速队列丢掉时要等 10 秒的兜底关键帧
     #[test]
     #[ignore]
     fn live_screen_share_over_p2p() {
@@ -2071,10 +2083,27 @@ mod tests {
         let view = sb.video.watch(3, true).unwrap();
         // 观看者上报的解码能力（真实客户端由服务器转来）
         sa.caps.lock().unwrap().insert(7, crate::video::local_decoders().iter().map(|c| c.key().to_string()).collect());
-        la.set_watchers(vec![7]);
+        if std::env::var_os("VOC_LIVE_99_CAPS").is_some() {
+            sa.caps.lock().unwrap().insert(99, crate::video::local_decoders().iter().map(|c| c.key().to_string()).collect());
+        }
+        let low = std::env::var("VOC_LIVE_LOW").is_ok();
+        if std::env::var_os("VOC_LIVE_ONLY_LOW").is_some() {
+            la.set_watchers(vec![7], vec![7]);
+        } else if low {
+            la.set_watchers(vec![7, 99], vec![7]);
+        } else {
+            la.set_watchers(vec![7], vec![]);
+        }
         let h: u32 = std::env::var("VOC_LIVE_HEIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(720);
         let secs: u64 = std::env::var("VOC_LIVE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let sharer = Sharer::start(ShareConfig { height: h, fps: 60, encoder: std::env::var("VOC_LIVE_ENCODER").unwrap_or_else(|_| "auto".into()), ..Default::default() }, sa.clone()).unwrap();
+        // 开始共享后画面才计入直连分配，第一个关键帧走了（假的）服务器；分到直连后像真实观看者那样要一次关键帧
+        let t = Instant::now();
+        while !la.allocation().1.contains(&7) {
+            assert!(t.elapsed() < Duration::from_secs(5), "video never allocated to the direct path");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sharer.request_keyframe();
         let t = Instant::now();
         loop {
             if let Some(f) = view.frame.lock().unwrap().as_ref() {
@@ -2099,11 +2128,21 @@ mod tests {
                     let n = (f.rgba.len() / 4).max(1);
                     let avg = |c: usize| f.rgba.chunks(4).map(|p| p[c] as u64).sum::<u64>() / n as u64;
                     println!("平均颜色 R {} G {} B {}", avg(0), avg(1), avg(2));
-                    assert_eq!(f.height as u32, h);
+                    assert_eq!(f.height as u32, if low { 360 } else { h });
                     break;
                 }
             }
-            assert!(t.elapsed() < Duration::from_secs(15 + secs), "no video decoded via P2P");
+            assert!(
+                t.elapsed() < Duration::from_secs(15 + secs),
+                "no video decoded via P2P: capture fps {}, sender fps {}, kbps {}, encoder {:?}, pipeline {:?}, err {:?}, decoder {:?}",
+                sharer.stats.capture_fps.load(Ordering::Relaxed),
+                sharer.stats.fps.load(Ordering::Relaxed),
+                sharer.stats.kbps.load(Ordering::Relaxed),
+                sharer.stats.encoder.lock().unwrap(),
+                sharer.stats.pipeline.lock().unwrap(),
+                sharer.stats.error.lock().unwrap(),
+                view.decoder.lock().unwrap()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         drop(sharer);

@@ -77,21 +77,26 @@ pub enum ClientMsg {
         #[serde(default)]
         video: Vec<u32>,
     },
-    /// 开始屏幕共享（desc 例如 "1080p60"，显示给别人看；audio = 同时共享电脑声音）
+    /// 开始屏幕共享（desc 例如 "1080p60"，显示给别人看；audio = 同时共享电脑声音；
+    /// simulcast = 能同时发一路 360P 低画质层给想省流量的观看者）
     ShareStart {
         desc: String,
         #[serde(default)]
         audio: bool,
+        #[serde(default)]
+        simulcast: bool,
     },
     /// 开始 / 停止伴奏（name = 程序名，None = 停止）
     SetMusic {
         name: Option<String>,
     },
     ShareStop,
-    /// 开始 / 停止观看某人的屏幕
+    /// 开始 / 停止观看某人的屏幕；low = 要低画质层（共享者支持时）。观看中再发一次可以切换画质
     Watch {
         target: u32,
         on: bool,
+        #[serde(default)]
+        low: bool,
     },
     /// 观看者丢包后请求共享者发关键帧
     KeyframeRequest {
@@ -183,9 +188,11 @@ pub enum ServerMsg {
         /// 服务器收到的时间（Unix 毫秒）
         ts: u64,
     },
-    /// 发给共享者：现在谁在看你的屏幕
+    /// 发给共享者：现在谁在看你的屏幕；low = 其中要低画质层的人
     Watchers {
         ids: Vec<u32>,
+        #[serde(default)]
+        low: Vec<u32>,
     },
     /// 发给共享者：某观看者请求关键帧
     KeyframeRequest {
@@ -248,6 +255,9 @@ pub struct UserInfo {
     /// 屏幕共享带声音
     #[serde(default)]
     pub share_audio: bool,
+    /// 屏幕共享有低画质层可选
+    #[serde(default)]
+    pub simulcast: bool,
 }
 
 /// 服务器功能：私聊发图（FileTarget）

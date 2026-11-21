@@ -900,10 +900,12 @@ impl App {
             crate::app::queue_image(&jobs_tx, &ectx, move || crate::images::prepare_file(&path));
         }
         if let Some((id, on)) = watch_toggle {
-            s.send(ClientMsg::Watch { target: id, on });
+            // 低带宽模式下默认看低画质层
+            let low = on && self.cfg.low_bandwidth;
+            s.send(ClientMsg::Watch { target: id, on, low });
             if on {
                 if let Some(view) = self.voice.video.watch(id, true) {
-                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0) });
+                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low });
                 }
             } else {
                 self.views.remove(&id);
@@ -1475,7 +1477,11 @@ impl App {
             let eff = self.cfg.share.effective(self.cfg.low_bandwidth);
             match Sharer::start(eff.clone(), self.voice.clone()) {
                 Ok(sh) => {
-                    s.send(ClientMsg::ShareStart { desc: eff.desc(), audio: self.cfg.share_audio && crate::loopback::supported() });
+                    s.send(ClientMsg::ShareStart {
+                        desc: eff.desc(),
+                        audio: self.cfg.share_audio && crate::loopback::supported(),
+                        simulcast: true,
+                    });
                     self.sharer = Some(sh);
                     self.share_confirmed = false;
                     self.share_error = None;
@@ -1512,6 +1518,7 @@ impl App {
     fn ui_viewers(&mut self, ctx: &egui::Context) {
         let Screen::Main(s) = &mut self.screen else { return };
         let mut close = Vec::new();
+        let mut relayer: Vec<(u32, bool)> = Vec::new();
         let mut go_full: Option<u32> = None;
         let mut exit_full = false;
         let mixer = self.mixer.clone();
@@ -1593,6 +1600,14 @@ impl App {
                             th::pill(ui, dec, th::TEXT_DIM, th::BG_ELEVATED);
                         }
                         th::pill(ui, "🔒 端到端加密", th::GREEN, th::GREEN_SOFT);
+                        if user.is_some_and(|u| u.simulcast) {
+                            let before = v.low;
+                            ui.selectable_value(&mut v.low, false, "原画").on_hover_text(format!("按共享者设置的 {desc} 观看"));
+                            ui.selectable_value(&mut v.low, true, "流畅").on_hover_text("360P 低画质，省流量、网络差时更不容易卡");
+                            if v.low != before {
+                                relayer.push((*id, v.low));
+                            }
+                        }
                         if user.is_some_and(|u| u.share_audio) {
                             let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
                             let mut m = mixer.lock().unwrap();
@@ -1628,10 +1643,13 @@ impl App {
                 close.push(*id);
             }
         }
+        for (id, low) in relayer {
+            s.send(ClientMsg::Watch { target: id, on: true, low });
+        }
         for id in close {
             self.views.remove(&id);
             self.voice.video.watch(id, false);
-            s.send(ClientMsg::Watch { target: id, on: false });
+            s.send(ClientMsg::Watch { target: id, on: false, low: false });
         }
         if let Some(id) = go_full {
             self.fullscreen = Some(id);
