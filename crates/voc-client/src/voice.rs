@@ -416,6 +416,8 @@ pub struct Link {
     share_seq: AtomicU16,
     /// 画面包在匀速队列里过期被丢掉的次数（网络 / 上行太挤的信号，码率自适应用）
     pace_dropped: AtomicU32,
+    /// 路由器端口映射的结果（网络自检显示）
+    portmap: Mutex<crate::portmap::PortMapStatus>,
 }
 
 impl Link {
@@ -638,6 +640,11 @@ impl Link {
         if sent < targets.len() && self.udp_ok.load(Ordering::Relaxed) {
             self.send_server(kind, &udp::client_voice(seq, blob), buf);
         }
+    }
+
+    /// 路由器端口映射的结果
+    pub fn portmap_status(&self) -> crate::portmap::PortMapStatus {
+        self.portmap.lock().unwrap().clone()
     }
 
     /// 取走匀速队列的丢包计数
@@ -1128,6 +1135,7 @@ pub fn connect(
         music_seq: AtomicU16::new(0),
         share_seq: AtomicU16::new(0),
         pace_dropped: AtomicU32::new(0),
+        portmap: Mutex::new(crate::portmap::PortMapStatus::Trying),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1234,12 +1242,12 @@ fn spawn_pacer(link: Arc<Link>) {
     });
 }
 
-/// 请求家用路由器做 UDP 端口映射（UPnP IGD），成功后把映射出的公网地址加入 P2P 候选。
-/// 很多家用路由器默认开启 UPnP；拿到映射后，对方可以直接打进来，打洞成功率大幅提高。
-/// 路由器本身没有公网 IP（运营商级 NAT）时映射没有意义，会跳过。
+/// 让家用路由器做 UDP 端口映射：UPnP → PCP → NAT-PMP，哪个成功用哪个；成功后把公网地址加入 P2P 候选。
+/// 结果记在链路上（网络自检显示）；路由器本身没有公网 IP（运营商级 NAT）时映射没用，跳过。
 fn spawn_upnp(link: Arc<Link>, port: u16) {
-    let _ = std::thread::Builder::new().name("upnp".into()).spawn(move || {
-        use igd_next::{PortMappingProtocol, SearchOptions};
+    use crate::portmap::{self, PortMapStatus, LEASE_SECS};
+    let _ = std::thread::Builder::new().name("portmap".into()).spawn(move || {
+        let set = |s: PortMapStatus| *link.portmap.lock().unwrap() = s;
         let lan = link
             .local_addrs
             .lock()
@@ -1247,36 +1255,90 @@ fn spawn_upnp(link: Arc<Link>, port: u16) {
             .iter()
             .filter_map(|a| a.parse::<SocketAddr>().ok())
             .find(|a| a.is_ipv4());
-        let Some(SocketAddr::V4(lan)) = lan else { return };
-        let mut opts = SearchOptions::default();
-        opts.timeout = Some(Duration::from_secs(3));
-        let Ok(gw) = igd_next::search_gateway(opts) else { return };
-        let Ok(IpAddr::V4(ext_ip)) = gw.get_external_ip() else { return };
-        let o = ext_ip.octets();
-        let cgnat = o[0] == 100 && (64..128).contains(&o[1]);
-        if ext_ip.is_private() || ext_ip.is_loopback() || ext_ip.is_unspecified() || cgnat {
+        let Some(SocketAddr::V4(lan)) = lan else {
+            set(PortMapStatus::Unavailable);
+            return;
+        };
+        // 1. UPnP
+        enum Kind {
+            Upnp(igd_next::Gateway, SocketAddr),
+            Pcp(std::net::Ipv4Addr),
+            NatPmp(std::net::Ipv4Addr),
+        }
+        let mut got: Option<(Kind, std::net::Ipv4Addr, u16, &'static str)> = None;
+        {
+            use igd_next::{PortMappingProtocol, SearchOptions};
+            let mut opts = SearchOptions::default();
+            opts.timeout = Some(Duration::from_secs(3));
+            if let Ok(gw) = igd_next::search_gateway(opts) {
+                if let Ok(IpAddr::V4(ext_ip)) = gw.get_external_ip() {
+                    if portmap::is_carrier_or_private(ext_ip) {
+                        set(PortMapStatus::CarrierNat { method: "UPnP", router_external: ext_ip });
+                        return;
+                    }
+                    let local = SocketAddr::V4(lan);
+                    let ext_port = match gw.add_port(PortMappingProtocol::UDP, port, local, LEASE_SECS, "VOC") {
+                        Ok(()) => Some(port),
+                        Err(_) => gw.add_any_port(PortMappingProtocol::UDP, local, LEASE_SECS, "VOC").ok(),
+                    };
+                    if let Some(p) = ext_port {
+                        got = Some((Kind::Upnp(gw, local), ext_ip, p, "UPnP"));
+                    }
+                }
+            }
+        }
+        // 2. PCP、3. NAT-PMP（都发给默认网关）
+        if got.is_none() {
+            if let Some(gw) = portmap::gateway_for(*lan.ip()) {
+                if let Some((ip, p)) = portmap::pcp_map(gw, *lan.ip(), port, LEASE_SECS) {
+                    got = Some((Kind::Pcp(gw), ip, p, "PCP"));
+                } else if let Some((ip, p)) = portmap::natpmp_map(gw, port, LEASE_SECS) {
+                    got = Some((Kind::NatPmp(gw), ip, p, "NAT-PMP"));
+                }
+            }
+        }
+        let Some((kind, ext_ip, ext_port, method)) = got else {
+            set(PortMapStatus::Unavailable);
+            return;
+        };
+        if portmap::is_carrier_or_private(ext_ip) {
+            set(PortMapStatus::CarrierNat { method, router_external: ext_ip });
             return;
         }
-        let local = SocketAddr::V4(lan);
-        let lease = 3600;
-        let ext_port = match gw.add_port(PortMappingProtocol::UDP, port, local, lease, "VOC") {
-            Ok(()) => port,
-            Err(_) => match gw.add_any_port(PortMappingProtocol::UDP, local, lease, "VOC") {
-                Ok(p) => p,
-                Err(_) => return,
-            },
+        let external = SocketAddr::new(IpAddr::V4(ext_ip), ext_port);
+        set(PortMapStatus::Mapped { method, external });
+        link.add_local_candidate(external.to_string());
+        // 到一半有效期就续；断开时删除映射
+        let renew = || match &kind {
+            Kind::Upnp(gw, local) => {
+                let _ = gw.add_port(igd_next::PortMappingProtocol::UDP, ext_port, *local, LEASE_SECS, "VOC");
+            }
+            Kind::Pcp(gw) => {
+                let _ = portmap::pcp_map(*gw, *lan.ip(), port, LEASE_SECS);
+            }
+            Kind::NatPmp(gw) => {
+                let _ = portmap::natpmp_map(*gw, port, LEASE_SECS);
+            }
         };
-        link.add_local_candidate(SocketAddr::new(IpAddr::V4(ext_ip), ext_port).to_string());
-        // 续期；断开时删除映射
         let mut since = Instant::now();
         while !link.closed.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(500));
-            if since.elapsed() > Duration::from_secs(lease as u64 / 2) {
-                let _ = gw.add_port(PortMappingProtocol::UDP, ext_port, local, lease, "VOC");
+            if since.elapsed() > Duration::from_secs(LEASE_SECS as u64 / 2) {
+                renew();
                 since = Instant::now();
             }
         }
-        let _ = gw.remove_port(PortMappingProtocol::UDP, ext_port);
+        match &kind {
+            Kind::Upnp(gw, _) => {
+                let _ = gw.remove_port(igd_next::PortMappingProtocol::UDP, ext_port);
+            }
+            Kind::Pcp(gw) => {
+                let _ = portmap::pcp_map(*gw, *lan.ip(), port, 0);
+            }
+            Kind::NatPmp(gw) => {
+                let _ = portmap::natpmp_map(*gw, port, 0);
+            }
+        }
     });
 }
 
