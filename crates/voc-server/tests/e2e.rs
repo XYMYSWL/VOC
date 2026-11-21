@@ -28,23 +28,44 @@ impl Drop for Server {
     }
 }
 
+/// 一个 TCP 和 UDP 都空闲的本机端口（服务器两种都要监听）
+fn free_port() -> u16 {
+    loop {
+        let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = t.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
 impl Server {
+    /// 起一个测试服务器。端口每次现找（TCP 和 UDP 都空闲的），被别的程序抢先占用、服务器没起来就换一个重试
     fn start(offset: u16) -> Server {
-        let port = 41000 + (std::process::id() % 9000) as u16 + offset * 3;
         let codes = std::env::temp_dir().join(format!("voc-test-{}-{offset}.json", std::process::id()));
         let _ = std::fs::remove_file(&codes);
-        let child = Command::new(EXE)
-            .args(["--bind", &format!("127.0.0.1:{port}"), "--codes"])
-            .arg(&codes)
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
-        let t = Instant::now();
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(t.elapsed() < Duration::from_secs(5), "server did not start");
-            std::thread::sleep(Duration::from_millis(50));
+        for _ in 0..10 {
+            let port = free_port();
+            let mut child = Command::new(EXE)
+                .args(["--bind", &format!("127.0.0.1:{port}"), "--codes"])
+                .arg(&codes)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let t = Instant::now();
+            loop {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Server { child, port, codes };
+                }
+                if child.try_wait().ok().flatten().is_some() || t.elapsed() > Duration::from_secs(5) {
+                    let _ = child.kill();
+                    break; // 端口被占了：换一个
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
-        Server { child, port, codes }
+        panic!("server did not start");
     }
 
     fn admin(&self, args: &[&str]) -> String {
