@@ -1,8 +1,10 @@
 //! 屏幕共享接收端的帧重组缓冲：按帧号攒分片、乱序也能拼回去、缺片时请求补发（NACK）、
 //! 用冗余校验包（FEC）直接算回丢的那一片，然后严格按帧号顺序交出完整的帧。
 //!
-//! 共享者支持补发时，缺了某一帧会等一小会儿（约 3 个往返）；等不到才放弃这一帧，
+//! 冗余校验有两种：0.5.0 的异或校验（每组只能救一片）和 0.5.1 起的 Reed-Solomon（一组里收到任意 k 片就能还原）。
+//! 共享者支持补发时，缺了某一帧会等一小会儿（约 2 个往返）；等不到才放弃这一帧，
 //! 由上层改为请求关键帧（老办法）。共享者不支持补发时只容忍很短的乱序。
+//! 还统计原始丢包率（冗余和补发之前），每秒回报给共享者，决定加多少冗余。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,8 +23,15 @@ struct Partial {
     /// 0 = 一片都没收到（整帧丢了，或者还没到）
     count: u16,
     frags: Vec<Option<Vec<u8>>>,
+    /// 异或校验包：分片号 → 数据
     parity: HashMap<u16, Vec<u8>>,
+    /// Reed-Solomon 校验包：组的第一片 → (组信息, 各校验片)
+    rs: HashMap<usize, (udp::RsParity, Vec<Option<Vec<u8>>>)>,
     got: usize,
+    /// 直接收到的数据片（不算冗余恢复和补发）
+    direct: usize,
+    /// 已经算进丢包统计
+    counted: bool,
     flags: u8,
     first: Instant,
     last_nack: Option<Instant>,
@@ -31,18 +40,46 @@ struct Partial {
 
 impl Partial {
     fn new(now: Instant) -> Self {
-        Self { count: 0, frags: Vec::new(), parity: HashMap::new(), got: 0, flags: 0, first: now, last_nack: None, nacks: 0 }
+        Self {
+            count: 0,
+            frags: Vec::new(),
+            parity: HashMap::new(),
+            rs: HashMap::new(),
+            got: 0,
+            direct: 0,
+            counted: false,
+            flags: 0,
+            first: now,
+            last_nack: None,
+            nacks: 0,
+        }
     }
 
     fn complete(&self) -> bool {
         self.count > 0 && self.got == self.count as usize
     }
 
+    /// 要请求补发的分片。有 Reed-Solomon 校验的组只要「还差几片」那么多，不用把缺的全要回来
     fn missing(&self) -> Vec<u16> {
         if self.count == 0 {
             return vec![NACK_WHOLE];
         }
-        let m: Vec<u16> = (0..self.count).filter(|i| self.frags[*i as usize].is_none()).collect();
+        let mut m: Vec<u16> = Vec::new();
+        let mut i = 0usize;
+        let count = self.count as usize;
+        while i < count {
+            if let Some((p, sh)) = self.rs.values().find(|(p, _)| p.first == i) {
+                let have = (p.first..p.first + p.k).filter(|j| self.frags[*j].is_some()).count() + sh.iter().flatten().count();
+                let need = p.k.saturating_sub(have);
+                m.extend((p.first..p.first + p.k).filter(|j| self.frags[*j].is_none()).take(need).map(|j| j as u16));
+                i = p.first + p.k;
+            } else {
+                if self.frags[i].is_none() {
+                    m.push(i as u16);
+                }
+                i += 1;
+            }
+        }
         if m.len() > udp::NACK_MAX {
             vec![NACK_WHOLE]
         } else {
@@ -76,6 +113,45 @@ impl Partial {
             }
         }
     }
+
+    /// Reed-Solomon：一组里收到的片数够了就把缺的数据片全算回来
+    fn try_rs(&mut self) {
+        let count = self.count as usize;
+        let mut recovered = Vec::new();
+        for (p, sh) in self.rs.values() {
+            let range = p.first..p.first + p.k;
+            if range.clone().all(|j| self.frags[j].is_some()) {
+                continue;
+            }
+            let data: Vec<Option<&[u8]>> = range.clone().map(|j| self.frags[j].as_deref()).collect();
+            let parity: Vec<Option<&[u8]>> = sh.iter().map(|x| x.as_deref()).collect();
+            if let Some(all) = udp::rs_recover(count, p, &data, &parity) {
+                recovered.extend(range.zip(all));
+            }
+        }
+        for (i, d) in recovered {
+            if self.frags[i].is_none() {
+                self.frags[i] = Some(d);
+                self.got += 1;
+            }
+        }
+    }
+}
+
+/// 接收统计（累计）
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RxStats {
+    /// 用校验包恢复的片数
+    pub fec_recovered: u32,
+    /// 补发收回的片数
+    pub rtx_recovered: u32,
+    /// 请求补发的片数
+    pub nack_frags: u32,
+    /// 等不到、放弃的帧数
+    pub gaps: u32,
+    /// 原始数据片：应收 / 直接没收到（冗余和补发之前）
+    pub data_total: u64,
+    pub data_lost: u64,
 }
 
 /// 一次处理的结果
@@ -94,16 +170,27 @@ pub struct Assembler {
     next: Option<u32>,
     newest: u32,
     pending: HashMap<u32, Partial>,
-    /// 估计的补发往返时间（ms）
+    /// 估计的补发往返时间（ms，按实际补发回来的时间估计）
     rtt_ms: f32,
-    /// 统计：用校验包恢复的片数、补发收回的片数
-    pub fec_recovered: u32,
-    pub rtx_recovered: u32,
+    /// 线路往返时间的参考值（直连的 ping / 到服务器的 ping 推算），估计值不低于它
+    rtt_hint: f32,
+    pub stats: RxStats,
+    /// 这一段时间的原始丢包：(应收, 没收到)，回报给共享者后清零
+    window: (u64, u64),
 }
 
 impl Default for Assembler {
     fn default() -> Self {
-        Self { layer: 0, next: None, newest: 0, pending: HashMap::new(), rtt_ms: 100.0, fec_recovered: 0, rtx_recovered: 0 }
+        Self {
+            layer: 0,
+            next: None,
+            newest: 0,
+            pending: HashMap::new(),
+            rtt_ms: 100.0,
+            rtt_hint: 0.0,
+            stats: RxStats::default(),
+            window: (0, 0),
+        }
     }
 }
 
@@ -120,17 +207,46 @@ impl Assembler {
         }
     }
 
-    fn retry_after(&self) -> Duration {
-        Duration::from_millis((self.rtt_ms * 1.5).clamp(40.0, 400.0) as u64)
+    /// 线路往返时间的参考值（ms，0 = 不知道）
+    pub fn set_rtt_hint(&mut self, ms: u32) {
+        self.rtt_hint = ms as f32;
     }
 
-    /// 缺帧最多等多久就放弃（改为请求关键帧）
+    /// 当前用的往返时间估计（ms）
+    pub fn rtt(&self) -> f32 {
+        self.rtt_ms.max(self.rtt_hint)
+    }
+
+    fn retry_after(&self) -> Duration {
+        Duration::from_millis((self.rtt() * 1.2 + 20.0).clamp(40.0, 600.0) as u64)
+    }
+
+    /// 缺帧最多等多久就放弃（改为请求关键帧）：约 2 个往返，补发只当兜底
     fn give_up_after(&self, rtx: bool) -> Duration {
         if rtx {
-            Duration::from_millis((self.rtt_ms * 3.0 + 60.0).clamp(150.0, 800.0) as u64)
+            Duration::from_millis((self.rtt() * 2.0 + 100.0).clamp(150.0, 1200.0) as u64)
         } else {
             NO_RTX_WAIT
         }
+    }
+
+    /// 一帧处理完（交出或放弃）时计入丢包统计
+    fn account(stats: &mut RxStats, window: &mut (u64, u64), p: &mut Partial) {
+        if p.counted || p.count == 0 {
+            return;
+        }
+        p.counted = true;
+        let (total, lost) = (p.count as u64, (p.count as usize - p.direct.min(p.count as usize)) as u64);
+        stats.data_total += total;
+        stats.data_lost += lost;
+        window.0 += total;
+        window.1 += lost;
+    }
+
+    /// 取走这一段时间的原始丢包率（千分之几）；样本太少返回 None
+    pub fn take_loss(&mut self) -> Option<u16> {
+        let (total, lost) = std::mem::take(&mut self.window);
+        (total >= 20).then(|| (lost * 1000 / total).min(1000) as u16)
     }
 
     /// 加入一个分片；返回是否发生了断档（换层 / 落后太多）
@@ -172,35 +288,49 @@ impl Assembler {
             }
             p.flags = f.flags & !0; // 所有分片 flags 相同
             let before = p.got;
-            if f.is_parity() {
+            if f.is_rs_parity() {
+                if let Some((info, sh)) = udp::read_rs_parity(&f, data) {
+                    let e = p.rs.entry(info.first).or_insert_with(|| (info, vec![None; info.m]));
+                    if e.0 == (udp::RsParity { j: e.0.j, ..info }) && info.j < e.1.len() && e.1[info.j].is_none() {
+                        e.1[info.j] = Some(sh.to_vec());
+                    }
+                }
+            } else if f.is_parity() {
                 p.parity.entry(f.idx).or_insert_with(|| data.to_vec());
             } else if p.frags[f.idx as usize].is_none() {
                 p.frags[f.idx as usize] = Some(data.to_vec());
                 p.got += 1;
+                if p.last_nack.is_none() {
+                    p.direct += 1;
+                }
             }
-            let direct = p.got - before;
-            p.try_fec();
-            self.fec_recovered += (p.got - before - direct) as u32;
+            let arrived = p.got - before;
+            if !p.complete() {
+                p.try_fec();
+                p.try_rs();
+            }
+            self.stats.fec_recovered += (p.got - before - arrived) as u32;
             // 补发请求发出后收到的缺片：估计往返时间
-            p.last_nack.filter(|_| direct > 0).map(|t| now.duration_since(t))
+            p.last_nack.filter(|_| arrived > 0).map(|t| now.duration_since(t))
         };
         if let Some(d) = rtt_sample {
-            self.rtx_recovered += 1;
+            self.stats.rtx_recovered += 1;
             self.rtt_ms = self.rtt_ms * 0.8 + d.as_secs_f32() * 1000.0 * 0.2;
         }
         gap
     }
 
     /// 交出能交的帧、放弃等不到的帧、列出要请求补发的。
-    /// want_key = 上层正在等关键帧：后面有完整关键帧的话直接跳过去。rtx = 共享者支持补发
-    pub fn poll(&mut self, now: Instant, want_key: bool, rtx: bool) -> Output {
+    /// restart = 上层正在等能重新开始的帧（flags 里有这些位的：关键帧，或者能用的恢复帧），0 = 没在等：
+    /// 后面有完整的这种帧就直接跳过去。rtx = 共享者支持补发
+    pub fn poll(&mut self, now: Instant, restart: u8, rtx: bool) -> Output {
         let mut out = Output::default();
         let Some(mut next) = self.next else { return out };
-        if want_key {
+        if restart != 0 {
             let span = self.newest.wrapping_sub(next);
             if let Some(k) = (0..=span)
                 .map(|d| next.wrapping_add(d))
-                .find(|n| self.pending.get(n).is_some_and(|p| p.complete() && p.flags & udp::VIDEO_KEY != 0))
+                .find(|n| self.pending.get(n).is_some_and(|p| p.complete() && p.flags & restart != 0))
             {
                 while next != k {
                     self.pending.remove(&next);
@@ -212,7 +342,8 @@ impl Assembler {
         loop {
             let Some(p) = self.pending.get(&next) else { break };
             if p.complete() {
-                let p = self.pending.remove(&next).unwrap();
+                let mut p = self.pending.remove(&next).unwrap();
+                Self::account(&mut self.stats, &mut self.window, &mut p);
                 out.frames.push((next, p.flags, p.frags.into_iter().flatten().flatten().collect()));
                 next = next.wrapping_add(1);
                 continue;
@@ -221,7 +352,10 @@ impl Assembler {
             let behind = next != self.newest || now.duration_since(p.first) > give_up * 2;
             let exhausted = p.nacks >= MAX_NACKS && p.last_nack.is_some_and(|t| now.duration_since(t) > self.retry_after());
             if behind && (now.duration_since(p.first) > give_up || exhausted) {
-                self.pending.remove(&next);
+                if let Some(mut p) = self.pending.remove(&next) {
+                    Self::account(&mut self.stats, &mut self.window, &mut p);
+                }
+                self.stats.gaps += 1;
                 next = next.wrapping_add(1);
                 out.gap = true;
                 continue;
@@ -249,9 +383,14 @@ impl Assembler {
                     if p.last_nack.is_some_and(|t| now.duration_since(t) < retry) {
                         continue;
                     }
+                    let miss = p.missing();
+                    if miss.is_empty() {
+                        continue;
+                    }
                     p.last_nack = Some(now);
                     p.nacks += 1;
-                    out.nacks.push((n, p.missing()));
+                    self.stats.nack_frags += miss.len() as u32;
+                    out.nacks.push((n, miss));
                 }
             }
         }
@@ -286,7 +425,7 @@ mod tests {
         for p in f0.iter().rev().chain(f2.iter()).chain(f1.iter()) {
             feed(&mut a, p, t);
         }
-        let o = a.poll(t, true, true);
+        let o = a.poll(t, VIDEO_KEY, true);
         assert_eq!(o.frames.iter().map(|f| f.0).collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!((&o.frames[0].2, &o.frames[1].2, &o.frames[2].2), (&d0, &d1, &d2));
         assert!(!o.gap && o.nacks.is_empty());
@@ -304,16 +443,16 @@ mod tests {
             }
         }
         feed(&mut a, &f1[0], t);
-        let o = a.poll(t, true, true);
+        let o = a.poll(t, VIDEO_KEY, true);
         assert!(o.frames.is_empty());
         assert_eq!(o.nacks, vec![(0, vec![2])]);
         // 马上再 poll 不重复请求
-        assert!(a.poll(t + Duration::from_millis(5), true, true).nacks.is_empty());
+        assert!(a.poll(t + Duration::from_millis(5), VIDEO_KEY, true).nacks.is_empty());
         // 补发到了：两帧按顺序出来，往返时间估计向 60 ms 靠
         feed(&mut a, &f0[2], t + Duration::from_millis(60));
-        let o = a.poll(t + Duration::from_millis(60), true, true);
+        let o = a.poll(t + Duration::from_millis(60), VIDEO_KEY, true);
         assert_eq!(o.frames.iter().map(|f| f.0).collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(a.rtx_recovered, 1);
+        assert_eq!(a.stats.rtx_recovered, 1);
         assert!(a.rtt_ms < 100.0);
     }
 
@@ -324,15 +463,15 @@ mod tests {
         for p in frame(0, true, 100).1 {
             feed(&mut a, &p, t);
         }
-        assert_eq!(a.poll(t, true, true).frames.len(), 1);
+        assert_eq!(a.poll(t, VIDEO_KEY, true).frames.len(), 1);
         // 帧 1 整个丢了，帧 2 到了
         for p in frame(2, false, 100).1 {
             feed(&mut a, &p, t);
         }
-        let o = a.poll(t, false, true);
+        let o = a.poll(t, 0, true);
         assert_eq!(o.nacks, vec![(1, vec![NACK_WHOLE])]);
         // 一直没补到：超时放弃，报告断档，帧 2 照样交出（上层会因为断档丢掉它、等关键帧）
-        let o = a.poll(t + Duration::from_secs(1), false, true);
+        let o = a.poll(t + Duration::from_secs(1), 0, true);
         assert!(o.gap);
         assert_eq!(o.frames.iter().map(|f| f.0).collect::<Vec<_>>(), vec![2]);
     }
@@ -352,11 +491,70 @@ mod tests {
         for p in &par {
             feed(&mut a, p, t);
         }
-        let o = a.poll(t, true, true);
+        let o = a.poll(t, VIDEO_KEY, true);
         assert_eq!(o.frames.len(), 1);
         assert_eq!(o.frames[0].2, data);
-        assert_eq!(a.fec_recovered, 2);
+        assert_eq!(a.stats.fec_recovered, 2);
         assert!(o.nacks.is_empty());
+    }
+
+    /// Reed-Solomon：30% 丢包、100% 冗余时整帧当场还原，不用补发；补发只要「还差几片」
+    #[test]
+    fn rs_recovers_heavy_loss_and_nacks_only_whats_needed() {
+        let mut a = Assembler::default();
+        let t = Instant::now();
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2246822519) >> 11) as u8).collect();
+        let frags = video_fragments(0, VIDEO_KEY, &data);
+        let par = voc_proto::udp::rs_parities(0, VIDEO_KEY, &data, 1.0);
+        let n = frags.len();
+        // 每 10 个包丢 3 个
+        for (i, p) in frags.iter().chain(par.iter()).enumerate() {
+            if i % 10 >= 3 {
+                feed(&mut a, p, t);
+            }
+        }
+        let o = a.poll(t + Duration::from_millis(1), VIDEO_KEY, true);
+        assert_eq!(o.frames.len(), 1, "recovered without retransmission");
+        assert_eq!(o.frames[0].2, data);
+        assert!(o.nacks.is_empty());
+        assert!(a.stats.fec_recovered > 0);
+        // 丢包统计：数据片原始丢失约 30%
+        let loss = a.take_loss().unwrap();
+        assert!((250..=350).contains(&loss), "loss {loss}");
+        assert_eq!(a.stats.data_total, n as u64);
+
+        // 第二帧：丢得太多，冗余救不回来 → 补发只要还差的那几片
+        let frags = video_fragments(1, 0, &data);
+        let par = voc_proto::udp::rs_parities(1, 0, &data, 0.2);
+        for (i, p) in frags.iter().enumerate() {
+            if i % 2 == 0 {
+                feed(&mut a, p, t);
+            }
+        }
+        for p in &par {
+            feed(&mut a, p, t);
+        }
+        let o = a.poll(t + Duration::from_millis(50), 0, true);
+        assert!(o.frames.is_empty());
+        let need = n - n.div_ceil(2) - par.len();
+        assert_eq!(o.nacks, vec![(1, (0..n).filter(|i| i % 2 == 1).take(need).map(|i| i as u16).collect::<Vec<_>>())]);
+        // 补发到了：整帧还原
+        for i in (0..n).filter(|i| i % 2 == 1).take(need) {
+            feed(&mut a, &frags[i], t + Duration::from_millis(80));
+        }
+        let o = a.poll(t + Duration::from_millis(80), 0, true);
+        assert_eq!(o.frames.len(), 1);
+        assert_eq!(o.frames[0].2, data);
+    }
+
+    #[test]
+    fn rtt_hint_stretches_waits() {
+        let mut a = Assembler::default();
+        a.set_rtt_hint(400);
+        assert!(a.give_up_after(true) >= Duration::from_millis(900));
+        assert!(a.retry_after() >= Duration::from_millis(480));
+        a.set_rtt_hint(0);
+        assert_eq!(a.rtt(), 100.0);
     }
 
     #[test]
@@ -366,13 +564,13 @@ mod tests {
         for p in frame(0, true, 100).1 {
             feed(&mut a, &p, t);
         }
-        let _ = a.poll(t, true, false);
+        let _ = a.poll(t, VIDEO_KEY, false);
         let (_, f1) = frame(1, false, 3000);
         feed(&mut a, &f1[0], t); // 帧 1 缺片
         for p in frame(2, false, 100).1 {
             feed(&mut a, &p, t);
         }
-        let o = a.poll(t + Duration::from_millis(40), false, false);
+        let o = a.poll(t + Duration::from_millis(40), 0, false);
         assert!(o.gap && o.nacks.is_empty());
         assert_eq!(o.frames.iter().map(|f| f.0).collect::<Vec<_>>(), vec![2]);
     }
@@ -386,7 +584,7 @@ mod tests {
         for p in frame(1, true, 100).1 {
             feed(&mut a, &p, t);
         }
-        let o = a.poll(t, true, true);
+        let o = a.poll(t, VIDEO_KEY, true);
         assert_eq!(o.frames.iter().map(|f| f.0).collect::<Vec<_>>(), vec![1]);
     }
 
@@ -397,11 +595,11 @@ mod tests {
         for p in frame(0, true, 100).1 {
             feed(&mut a, &p, t);
         }
-        let _ = a.poll(t, true, true);
+        let _ = a.poll(t, VIDEO_KEY, true);
         let low = video_fragments(500, VIDEO_KEY | VIDEO_LOW, b"x");
         let (f, d) = read_video_frag(&low[0]).unwrap();
         assert!(a.add(f, d, t), "layer switch is a gap");
-        assert_eq!(a.poll(t, true, true).frames.len(), 1);
+        assert_eq!(a.poll(t, VIDEO_KEY, true).frames.len(), 1);
         let far = video_fragments(5000, VIDEO_LOW, b"y");
         let (f, d) = read_video_frag(&far[0]).unwrap();
         assert!(a.add(f, d, t), "far jump is a gap");
@@ -416,7 +614,7 @@ mod tests {
                 feed(&mut a, &p, t);
             }
         }
-        let o = a.poll(t, true, true);
+        let o = a.poll(t, VIDEO_KEY, true);
         assert_eq!(o.frames.iter().map(|f| f.0).collect::<Vec<_>>(), vec![u32::MAX - 1, u32::MAX, 0, 1]);
     }
 }

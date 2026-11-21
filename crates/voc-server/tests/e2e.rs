@@ -600,11 +600,11 @@ fn screen_share_watch_relay_and_keyframes() {
     b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 3);
 
     // 不在共享时不能观看
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
-    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false, rtx: false });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
+    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false, rtx: false, bps: 0 });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.as_deref() == Some("720p30")));
     // 之前那次 Watch 无效，alice 此时没有观看者；现在正式观看
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
     let w = a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if !ids.is_empty()));
     assert!(matches!(w, ServerMsg::Watchers { ids, .. } if ids == vec![b.id]));
 
@@ -657,10 +657,10 @@ fn simulcast_layers_routed_by_viewer_choice() {
     }
     let aid = a.id;
     b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 3);
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: true, rtx: false });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: true, rtx: false, bps: 0 });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.simulcast));
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
-    c.send(ClientMsg::Watch { target: aid, on: true, low: true, route: 0 });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
+    c.send(ClientMsg::Watch { target: aid, on: true, low: true, route: 0, cursor: false });
     let (bid, cid) = (b.id, c.id);
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, low, .. } if ids.len() == 2 && low == &vec![cid]));
 
@@ -676,17 +676,17 @@ fn simulcast_layers_routed_by_viewer_choice() {
     assert!(c.udp_recv().is_none(), "carol must not get the main layer");
 
     // carol 换回原画
-    c.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
+    c.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, low, .. } if ids.len() == 2 && low.is_empty()));
     a.udp_send(udp::VIDEO, &main[0]);
     assert!(c.udp_recv().is_some() && b.udp_recv().is_some());
 
     // 共享者不支持分层（旧客户端）：要低画质也照收原画
     a.send(ClientMsg::ShareStop);
-    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false, rtx: false });
+    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: false, rtx: false, bps: 0 });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.as_deref() == Some("720p30") && !x.simulcast));
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
-    c.send(ClientMsg::Watch { target: aid, on: true, low: true, route: 0 });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
+    c.send(ClientMsg::Watch { target: aid, on: true, low: true, route: 0, cursor: false });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, low, .. } if ids == &vec![bid, cid] && low.is_empty()));
     a.udp_send(udp::VIDEO, &main[0]);
     assert!(c.udp_recv().is_some(), "old sharer: low-quality viewer still gets the only layer");
@@ -706,9 +706,9 @@ fn video_nack_served_from_cache_or_forwarded() {
     }
     let (aid, bid) = (a.id, b.id);
     b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 3);
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false, rtx: true });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false, rtx: true, bps: 0 });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.rtx));
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if ids == &vec![bid]));
 
     let data: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
@@ -818,14 +818,14 @@ fn viewer_route_choice_reaches_sharer() {
     }
     let aid = a.id;
     b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 3);
-    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: true, rtx: false });
+    a.send(ClientMsg::ShareStart { desc: "720p30".into(), audio: false, simulcast: true, rtx: false, bps: 0 });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.is_some()));
     let (bid, cid) = (b.id, c.id);
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 1 });
-    c.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 2 });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 1, cursor: false });
+    c.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 2, cursor: false });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, direct, server, .. } if ids.len() == 2 && direct == &vec![bid] && server == &vec![cid]));
     // 改回自动
-    c.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
+    c.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, server, .. } if ids.len() == 2 && server.is_empty()));
 }
 
@@ -899,9 +899,9 @@ fn voice_and_video_direct_lists_are_independent() {
     }
     let (aid, bid) = (a.id, b.id);
     a.wait_for(|m| matches!(m, ServerMsg::Peers { peers } if peers.iter().any(|p| p.id == bid)));
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false, rtx: false });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false, rtx: false, bps: 0 });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.is_some()));
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if ids == &vec![bid]));
     let frag = udp::video_fragments(0, udp::VIDEO_KEY, b"frame").remove(0);
     let sync = |a: &mut Client| {
@@ -954,10 +954,10 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
     b.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
     r.send(ClientMsg::DirectPeers { ids: vec![ia, ib], video: vec![] });
-    a.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![] });
-    b.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![] });
+    a.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![], video_relay_bps: 0 });
+    b.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![], video_relay_bps: 0 });
     // carol 顺带报了一个不在频道里的 id，服务器应忽略
-    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib), stat(999)], relay_slots: 4, via_server: vec![] });
+    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib), stat(999)], relay_slots: 4, via_server: vec![], video_relay_bps: 0 });
 
     // 经 carol：20 + 20 + 4 = 44 ms；经服务器：150 + 150 = 300 ms
     let want = vec![
@@ -976,7 +976,7 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     assert!(r.udp_recv().is_none());
 
     // carol 关掉中继（名额 0）→ 路线撤销，服务器恢复转发给 bob
-    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib)], relay_slots: 0, via_server: vec![] });
+    r.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ia), stat(ib)], relay_slots: 0, via_server: vec![], video_relay_bps: 0 });
     for x in [&mut a, &mut b, &mut r] {
         x.wait_for(|m| matches!(m, ServerMsg::Relays { routes } if routes.is_empty()));
     }
@@ -986,6 +986,71 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     assert_eq!(udp::read_server_voice(&d).unwrap().0, ia);
 }
 
+
+/// 观看者互相转发画面：共享者 alice 直连发给 carol，bob 和 carol 直连稳定 → 服务器安排 carol 转给 bob，
+/// 不再替 alice 转画面给 bob；carol 不看了 → 路线撤销，服务器恢复转发
+#[test]
+fn viewer_video_relay_is_planned() {
+    use voc_proto::{PeerStat, RelayRoute};
+    let srv = Server::start(18);
+    let codes = srv.gen_codes(3);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap(); // 共享者
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap(); // 打不通 alice
+    let mut r = Client::connect(srv.port, &codes[2], "carol").unwrap(); // 直连 alice、也直连 bob
+    for x in [&mut a, &mut b, &mut r] {
+        x.enable_udp();
+        x.send(ClientMsg::P2pEnable { local_addrs: vec![], nat: None });
+        x.send(ClientMsg::JoinChannel { channel_id: 1 });
+    }
+    for x in [&mut a, &mut b, &mut r] {
+        x.wait_for(|m| matches!(m, ServerMsg::Peers { peers } if peers.len() == 2));
+    }
+    let (ia, ib, ir) = (a.id, b.id, r.id);
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: false, simulcast: false, rtx: true, bps: 6_000_000 });
+    b.wait_state(|u| u.iter().any(|x| x.id == ia && x.sharing.is_some()));
+    for x in [&mut b, &mut r] {
+        x.send(ClientMsg::Watch { target: ia, on: true, low: false, route: 0, cursor: true });
+    }
+    a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if ids.len() == 2));
+    let stat = |id: u32| PeerStat { id, rtt: 20, loss: 0, jitter: 2 };
+    a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![ir] });
+    b.send(ClientMsg::LinkStats { server_rtt: 80, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![], video_relay_bps: 0 });
+    // carol 上行不够：不安排
+    r.send(ClientMsg::LinkStats { server_rtt: 80, peers: vec![stat(ia), stat(ib)], relay_slots: 4, via_server: vec![], video_relay_bps: 3_000_000 });
+    std::thread::sleep(Duration::from_millis(1500));
+    // carol 上行够了
+    r.send(ClientMsg::LinkStats { server_rtt: 80, peers: vec![stat(ia), stat(ib)], relay_slots: 4, via_server: vec![], video_relay_bps: 20_000_000 });
+    let want = vec![RelayRoute { from: ia, to: ib, via: ir, ms: 0, server_ms: 0 }];
+    for x in [&mut a, &mut b, &mut r] {
+        x.wait_for(|m| matches!(m, ServerMsg::VideoRelays { routes } if *routes == want));
+    }
+    // 服务器不再替 alice 把画面转给 bob（carol 是直连，也不转）
+    let frag = udp::video_fragments(0, udp::VIDEO_KEY, b"x");
+    a.udp_send(udp::VIDEO, &frag[0]);
+    assert!(b.udp_recv().is_none(), "relayed viewer gets the video from carol, not the server");
+
+    // carol 不看了：撤销，服务器恢复转发
+    r.send(ClientMsg::Watch { target: ia, on: false, low: false, route: 0, cursor: false });
+    a.wait_for(|m| matches!(m, ServerMsg::VideoRelays { routes } if routes.is_empty()));
+    a.udp_send(udp::VIDEO, &frag[0]);
+    assert_eq!(b.udp_recv().map(|x| x.0), Some(udp::VIDEO));
+}
+
+/// 运行状态：服务器每 5 秒写状态文件，`voc-server status` 能读出在线人数、频道、探测端口
+#[test]
+fn status_command_shows_running_state() {
+    let srv = Server::start(19);
+    let codes = srv.gen_codes(1);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    a.send(ClientMsg::JoinChannel { channel_id: 1 });
+    std::thread::sleep(Duration::from_millis(6000));
+    let out = Command::new(EXE).args(["status", "--codes"]).arg(&srv.codes).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("在线 1 人"), "{text}");
+    assert!(text.contains("alice"), "{text}");
+    assert!(text.contains("NAT 探测"), "{text}");
+    assert!(text.contains("画面"), "{text}");
+}
 
 /// 图片分块：只转给同频道的其他人，带上发送者；别的频道收不到；同时最多传 2 张
 #[test]
@@ -1094,9 +1159,9 @@ fn music_and_share_audio_forwarding() {
     assert!(b.udp_recv().is_none(), "music after stop is dropped");
 
     // 屏幕共享带声音：只有观看者收到
-    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: true, simulcast: false, rtx: false });
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: true, simulcast: false, rtx: false, bps: 0 });
     b.wait_state(|u| u.iter().any(|x| x.id == aid && x.share_audio));
-    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0 });
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
     b.send(ClientMsg::Ping);
     b.wait_for(|m| matches!(m, ServerMsg::Pong));
     a.udp_send(udp::SHARE_AUDIO, &udp::client_voice(1, &frame()));

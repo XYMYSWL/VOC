@@ -8,7 +8,11 @@
 #
 # 环境变量：
 #   VOC_VERSION=v0.2.1      安装指定版本（默认最新版）
-#   VOC_TARBALL_URL=...     从镜像地址下载安装包（仍用 GitHub 公布的 SHA-256 校验）
+#   VOC_TARBALL_URL=...     从指定地址下载安装包（仍用 GitHub 公布的 SHA-256 校验）
+#
+# 直连 GitHub 下载失败时自动改走国内加速镜像（ghfast.top、gh-proxy.org、gh-proxy.com）。
+# 服务器连不上 GitHub 时，脚本本身也可以经镜像下载：
+#   curl -fsSL https://ghfast.top/https://github.com/XYMYSWL/VOC/releases/latest/download/get.sh | sudo bash
 #
 # 装好后也可以直接用 `sudo voc upgrade` 升级。
 
@@ -67,15 +71,29 @@ SHA="$(printf '%s' "$META" | tr ',{}' '\n\n\n' | awk -v a="$ASSET" -F'"' '
     $2 == "digest" && n == a && $4 ~ /^sha256:/ { sub(/^sha256:/, "", $4); print $4; exit }' || true)"
 
 info "下载 VOC 服务器 ${TAG:-$VERSION}"
-fetch "$URL" "$TMP/$ASSET" || die "下载失败：$URL
+MIRRORS="https://ghfast.top/ https://gh-proxy.org/ https://gh-proxy.com/"
+if ! fetch "$URL" "$TMP/$ASSET"; then
+    ok=0
+    # 没指定下载地址时，直连失败就依次试国内加速镜像（镜像只负责传文件，下面照样按 GitHub 公布的 SHA-256 校验）
+    if [ -z "${VOC_TARBALL_URL:-}" ]; then
+        for m in $MIRRORS; do
+            info "直连 GitHub 下载失败，改从镜像下载：$m"
+            if fetch "$m$URL" "$TMP/$ASSET"; then
+                ok=1
+                break
+            fi
+        done
+    fi
+    [ "$ok" -eq 1 ] || die "下载失败：$URL
   服务器访问不了 GitHub 时，可以在自己电脑上下载 $ASSET 传到服务器，解压后运行 sudo bash install.sh"
+fi
 
 if [ -n "$SHA" ] && command -v sha256sum >/dev/null 2>&1; then
     GOT="$(sha256sum "$TMP/$ASSET" | cut -d' ' -f1)"
     [ "$GOT" = "$SHA" ] || die "安装包校验失败（SHA-256 不一致），已停止。请稍后重试。"
     info "SHA-256 校验通过"
 else
-    info "跳过 SHA-256 校验（没取到 GitHub 公布的校验值）"
+    info "跳过 SHA-256 校验（没取到 GitHub 公布的校验值；服务器连不上 GitHub 接口时会这样）"
 fi
 
 tar -xzf "$TMP/$ASSET" -C "$TMP"

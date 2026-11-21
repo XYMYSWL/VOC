@@ -65,6 +65,9 @@ struct Persisted {
     last_channel: HashMap<String, u32>,
     /// 观看屏幕共享时用显卡硬解
     hw_decode: bool,
+    /// 0.5.1 起默认硬解：老配置里的「软解」迁移一次（老配置没有这个字段 → false → 迁移）
+    #[serde(default)]
+    hw_decode_migrated: bool,
     /// 启动时检查更新
     auto_update: bool,
     /// 中国大陆加速更新：经国内 GitHub 镜像下载
@@ -117,7 +120,8 @@ impl Default for Persisted {
             low_bandwidth: false,
             routes: HashMap::new(),
             last_channel: HashMap::new(),
-            hw_decode: false,
+            hw_decode: true,
+            hw_decode_migrated: true,
             auto_update: true,
             update_accel: false,
             sfx: true,
@@ -554,6 +558,11 @@ impl App {
         settings.output_volume.set(cfg.output_volume);
         let mixer = Arc::new(Mutex::new(Mixer::default()));
         let voice = Arc::new(VoiceState::default());
+        // 0.5.1 起观看默认用显卡解码（出错会自动退回软解）；老配置里默认的「软解」改一次
+        if !cfg.hw_decode_migrated {
+            cfg.hw_decode = true;
+            cfg.hw_decode_migrated = true;
+        }
         video::HW_DECODE.store(cfg.hw_decode, Ordering::Relaxed);
         voice.video.set_ctx(cc.egui_ctx.clone()); // 收到新视频帧时唤醒界面
         let (frames_tx, frames_rx) = mpsc::sync_channel(100);
@@ -861,10 +870,13 @@ impl App {
             let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
             cfg.fps = env("VOC_TEST_FPS").unwrap_or(cfg.fps);
             cfg.quality = env("VOC_TEST_QUALITY").map(|q| q as u8).unwrap_or(cfg.quality);
+            // VOC_TEST_SKIP_STATIC=0/1、VOC_TEST_AUTO_RES=0/1
+            cfg.skip_static = env("VOC_TEST_SKIP_STATIC").map(|v| v != 0).unwrap_or(cfg.skip_static);
+            cfg.auto_res = env("VOC_TEST_AUTO_RES").map(|v| v != 0).unwrap_or(cfg.auto_res);
             let rtx = env("VOC_TEST_RTX") != Some(0);
             match Sharer::start(cfg.clone(), self.voice.clone()) {
                 Ok(sh) => {
-                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true, rtx });
+                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true, rtx, bps: cfg.bitrate() });
                     self.sharer = Some(sh);
                 }
                 Err(e) => eprintln!("VOC_TEST_SHARE 失败：{e}"),
@@ -878,7 +890,7 @@ impl App {
                     Ok("server") => 2,
                     _ => 0,
                 };
-                s.send(ClientMsg::Watch { target: id, on: true, low, route });
+                s.send(ClientMsg::Watch { target: id, on: true, low, route, cursor: true });
                 if let Some(view) = self.voice.video.watch(id, true) {
                     self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route });
                 }
@@ -905,8 +917,14 @@ impl App {
         if let Some(sh) = &self.sharer {
             let st = &sh.stats;
             line += &format!(
-                "| 共享 冗余 {} 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
-                st.fec_k.load(Ordering::Relaxed),
+                "| 共享 鼠标单独发 {} 恢复帧 {} 变化区域 {} 占 {}‰ 冗余 {} 静止跳过 {} 降到 {} 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
+                st.cursor_separate.load(Ordering::Relaxed),
+                st.ltr_recovers.load(Ordering::Relaxed),
+                st.dirty_last.load(Ordering::Relaxed),
+                st.dirty_area.load(Ordering::Relaxed),
+                st.fec_pct.load(Ordering::Relaxed),
+                st.static_skipped.load(Ordering::Relaxed),
+                st.auto_height.load(Ordering::Relaxed),
                 st.capture_fps.load(Ordering::Relaxed),
                 st.fps.load(Ordering::Relaxed),
                 st.kbps.load(Ordering::Relaxed),
@@ -921,11 +939,12 @@ impl App {
             let f = v.view.frame.lock().unwrap();
             let (w, h, seq) = f.as_ref().map(|f| (f.width, f.height, f.seq)).unwrap_or((0, 0, 0));
             line += &format!(
-                "| 看 #{id} {w}x{h} 已解 {seq} 帧 {} fps 解码器 {:?} 线路 {:?} 恢复(校验,补发) {:?} ",
+                "| 看 #{id} {w}x{h} 已解 {seq} 帧 {} fps 解码器 {:?} 线路 {:?} 鼠标 {:?} 恢复(校验,补发,放弃,要关键帧,往返,恢复帧) {:?} ",
                 v.view.fps.load(Ordering::Relaxed),
                 v.view.decoder.lock().unwrap(),
                 self.voice.video_direct(*id).map(|d| if d { "直连" } else { "服务器" }),
-                self.voice.video.recovery_stats(*id)
+                v.view.cursor.lock().unwrap().map(|c| (c.0, c.1, c.2, c.3, c.4.elapsed().as_millis())),
+                self.voice.video.rx_stats(*id).map(|(s, k, rtt)| (s.fec_recovered, s.rtx_recovered, s.gaps, k, rtt, self.voice.video.recovered_count(*id)))
             );
         }
         use std::io::Write;
@@ -1011,9 +1030,15 @@ impl App {
                             st.fps.load(Ordering::Relaxed),
                             st.kbps.load(Ordering::Relaxed),
                             st.rate_pct.load(Ordering::Relaxed),
-                            match st.fec_k.load(Ordering::Relaxed) {
+                            match st.fec_pct.load(Ordering::Relaxed) {
                                 0 => "无".to_string(),
-                                k => format!("每 {k} 片 1 个"),
+                                p => format!(
+                                    "{p}%（观看者原始丢包最高 {:.1}%，两条路同时发 {} 人，累计补发 {} 片，恢复帧 {} 帧）",
+                                    st.viewer_loss.load(Ordering::Relaxed) as f32 / 10.0,
+                                    st.dual_viewers.load(Ordering::Relaxed),
+                                    st.resent_total.load(Ordering::Relaxed),
+                                    st.ltr_recovers.load(Ordering::Relaxed)
+                                ),
                             },
                             st.encoder.lock().unwrap(),
                             st.pipeline.lock().unwrap(),
@@ -1024,13 +1049,42 @@ impl App {
                     }
                 }
                 let _ = writeln!(d, "伴奏：{}", if self.music.is_some() { "正在放" } else { "没放" });
+                let loss = self.voice.current_link().map(|l| l.voice_path_loss()).unwrap_or(0);
+                let _ = writeln!(
+                    d,
+                    "语音抗丢包：{}（发出方向线路丢包约 {loss}%）",
+
+                    if self.voice.dred_active.load(Ordering::Relaxed) { "DRED 深度冗余" } else { "带内 FEC" }
+                );
                 let _ = writeln!(d, "在看别人的共享：{} 路", self.views.len());
-                for id in self.views.keys() {
-                    if let Some((fec, rtx)) = self.voice.video.recovery_stats(*id) {
-                        let rtx_on = self.voice.rtx_sharers.lock().unwrap().contains(id);
+                if let Some(l) = self.voice.current_link() {
+                    let (relaying, relayed) = l.video_relay_info();
+                    if !relaying.is_empty() || !relayed.is_empty() {
                         let _ = writeln!(
                             d,
-                            "  看 #{id}：校验包恢复 {fec} 片 · 补发收回 {rtx} 片 · 对方{}补发",
+                            "画面转发：我帮人转 {} 路（{}）· 经别人转给我 {} 路（{}）",
+                            relaying.len(),
+                            relaying.iter().map(|r| format!("#{}→#{}", r.from, r.to)).collect::<Vec<_>>().join(" "),
+                            relayed.len(),
+                            relayed.iter().map(|r| format!("#{} 经 #{}", r.from, r.via)).collect::<Vec<_>>().join(" ")
+                        );
+                    }
+                }
+                for id in self.views.keys() {
+                    if let Some((st, keys, rtt)) = self.voice.video.rx_stats(*id) {
+                        let rtx_on = self.voice.rtx_sharers.lock().unwrap().contains(id);
+                        let loss = if st.data_total > 0 { st.data_lost as f64 * 100.0 / st.data_total as f64 } else { 0.0 };
+                        let _ = writeln!(
+                            d,
+                            "  看 #{id}：原始丢包 {loss:.1}%（{}/{} 片）· 校验包恢复 {} 片 · 请求补发 {} 片、收回 {} 片 · 放弃 {} 帧 · 要关键帧 {} 次 · 靠恢复帧接上 {} 次 · 往返约 {rtt} ms · 对方{}补发",
+                            st.data_lost,
+                            st.data_total,
+                            st.fec_recovered,
+                            st.nack_frags,
+                            st.rtx_recovered,
+                            st.gaps,
+                            keys,
+                            self.voice.video.recovered_count(*id),
                             if rtx_on { "支持" } else { "不支持（旧版本）" }
                         );
                     }
@@ -1131,6 +1185,13 @@ impl App {
         let _ = writeln!(d, "硬件编码器：{}", if enc.is_empty() { "无".into() } else { enc.join("、") });
         let dec: Vec<&str> = video::local_decoders().iter().map(|c| c.key()).collect();
         let _ = writeln!(d, "可解码：{} · 解码方式 {}", dec.join(" / "), if self.cfg.hw_decode { "硬解" } else { "软解" });
+        // 最近的运行日志（不含聊天、授权码、密钥、IP）
+        let log = crate::applog::tail(40);
+        if !log.is_empty() {
+            let _ = writeln!(d, "
+[最近日志]
+{log}");
+        }
         d
     }
 
@@ -1144,6 +1205,7 @@ impl App {
         let dropped = self.poll_network();
         self.flush_notes();
         if let Some(d) = dropped {
+            crate::applog::log(format!("和服务器断开：{}", d.reason));
             if d.retry && !self.demo.active {
                 self.begin_reconnect(d.reason);
             } else {
@@ -1499,6 +1561,7 @@ impl App {
                     ServerMsg::Welcome { user_id, udp_port, server_name, features, probe_port } => {
                         s.user_id = user_id;
                         self.voice.server_rtx.store(features.iter().any(|f| f == voc_proto::FEATURE_VIDEO_RTX), Ordering::Relaxed);
+                        crate::applog::log(format!("登录成功：服务器「{server_name}」，功能 {features:?}，NAT 探测端口 {}", if probe_port > 0 { "有" } else { "没有" }));
                         s.features = features;
                         s.server_name = server_name;
                         let Some(conn) = &s.conn else { continue };
@@ -1639,10 +1702,21 @@ impl App {
                     }
                     ServerMsg::System { text } => s.chat.push(ChatLine::System(text)),
                     ServerMsg::Pong => {}
-                    ServerMsg::Watchers { ids, low, direct, server } => {
+                    ServerMsg::Watchers { ids, low, direct, server, cursor } => {
                         if let Some(l) = self.voice.current_link() {
                             l.set_watchers(ids, low);
                             l.set_watcher_routes(direct, server);
+                            l.set_watchers_cursor(cursor);
+                        }
+                    }
+                    ServerMsg::VideoLtr { by, ack, recover } => {
+                        if let Some(l) = self.voice.current_link() {
+                            l.on_video_ltr(by, ack, recover);
+                        }
+                    }
+                    ServerMsg::VideoReport { by, loss, rtt } => {
+                        if let Some(l) = self.voice.current_link() {
+                            l.on_video_report(by, loss, rtt);
                         }
                     }
                     ServerMsg::KeyframeRequest { .. } => {
@@ -1658,6 +1732,11 @@ impl App {
                     ServerMsg::Relays { routes } => {
                         if let Some(l) = self.voice.current_link() {
                             l.set_relays(routes);
+                        }
+                    }
+                    ServerMsg::VideoRelays { routes } => {
+                        if let Some(l) = self.voice.current_link() {
+                            l.set_video_relays(routes);
                         }
                     }
                     ServerMsg::Directory { entries } => {

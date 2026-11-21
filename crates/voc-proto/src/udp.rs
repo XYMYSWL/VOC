@@ -7,7 +7,8 @@
 //! - VOICE 服务器→客户端：`from_id u32 | seq u16 | 语音帧`
 //! - VIDEO 客户端→服务器：`frame u32 | idx u16 | count u16 | flags u8 | 分片数据`（一帧加密后的视频切成多片）
 //! - VIDEO 服务器→客户端（及 P2P 直连）：`from_id u32 |` 同上
-//!   分片号 idx ≥ count 的是冗余校验包（FEC，见 [`fec_parities`]），旧版本会把它当坏包丢掉
+//!   分片号 idx ≥ count 的是冗余校验包：count ≤ idx < 2·count 是 0.5.0 的异或校验（[`fec_parities`]），
+//!   idx ≥ 2·count 是 0.5.1 起的 Reed-Solomon 校验（[`rs_parities`]，0.5.0 的客户端和服务器会当坏包丢掉，不会误用）
 //! - NACK（观看者→服务器 / P2P 直连给共享者）：`target u32 | layer u8 | frame u32 | n u16 | idx u16 × n`，
 //!   请求补发某一帧缺的分片；idx = [`NACK_WHOLE`] 表示整帧都没收到。
 //!   服务器→共享者时开头的 u32 换成请求者编号
@@ -22,6 +23,31 @@ pub const MUSIC: u8 = 5;
 pub const SHARE_AUDIO: u8 = 6;
 /// 视频补发请求
 pub const NACK: u8 = 7;
+/// 屏幕共享的鼠标位置和形状（发给观看者）。格式同 VOICE，内容见 [`cursor_payload`]
+pub const CURSOR: u8 = 8;
+
+/// 鼠标：x、y 是在共享画面里的位置（0–65535 对应左到右 / 上到下），shape 见 CURSOR_*，visible = 显示着
+pub fn cursor_payload(x: u16, y: u16, shape: u8, visible: bool) -> [u8; 6] {
+    let mut v = [0u8; 6];
+    v[..2].copy_from_slice(&x.to_le_bytes());
+    v[2..4].copy_from_slice(&y.to_le_bytes());
+    v[4] = shape;
+    v[5] = visible as u8;
+    v
+}
+
+pub fn read_cursor(b: &[u8]) -> Option<(u16, u16, u8, bool)> {
+    (b.len() >= 6).then(|| (u16::from_le_bytes([b[0], b[1]]), u16::from_le_bytes([b[2], b[3]]), b[4], b[5] != 0))
+}
+
+pub const CURSOR_ARROW: u8 = 0;
+pub const CURSOR_IBEAM: u8 = 1;
+pub const CURSOR_HAND: u8 = 2;
+pub const CURSOR_CROSS: u8 = 3;
+pub const CURSOR_WAIT: u8 = 4;
+pub const CURSOR_SIZE_WE: u8 = 5;
+pub const CURSOR_SIZE_NS: u8 = 6;
+pub const CURSOR_SIZE_ALL: u8 = 7;
 /// NACK 里表示「整帧都没收到」
 pub const NACK_WHOLE: u16 = 0xFFFF;
 /// 一个 NACK 最多请求多少个分片
@@ -32,6 +58,10 @@ pub const VIDEO_FRAG: usize = 1080;
 /// 视频分片 flags：bit0 = 关键帧，bit1-2 = 编码格式（0 H.264，1 HEVC，2 AV1），bit3 = 低画质层（360P）
 pub const VIDEO_KEY: u8 = 1;
 pub const VIDEO_LOW: u8 = 8;
+/// 这一帧被编码器存成长期参考帧（观看者解码成功后回确认）
+pub const VIDEO_LTR: u8 = 16;
+/// 恢复帧：只参考所有观看者都确认过的长期参考帧，丢过帧的观看者从这里接着解，不用等关键帧
+pub const VIDEO_RECOVER: u8 = 32;
 pub const CODEC_H264: u8 = 0;
 pub const CODEC_HEVC: u8 = 1;
 pub const CODEC_AV1: u8 = 2;
@@ -121,8 +151,8 @@ pub fn read_video_frag(b: &[u8]) -> Option<(VideoFrag, &[u8])> {
         count: u16::from_le_bytes([b[6], b[7]]),
         flags: b[8],
     };
-    // idx ≥ count 是冗余校验包（最多 count 个）
-    (f.count > 0 && (f.idx as u32) < f.count as u32 * 2).then_some((f, &b[VIDEO_HDR..]))
+    // idx ≥ count 是冗余校验包：异或校验最多 count 个，Reed-Solomon 校验在 2·count 之后、最多 2·count 个
+    (f.count > 0 && (f.idx as u32) < f.count as u32 * 4).then_some((f, &b[VIDEO_HDR..]))
 }
 
 impl VideoFrag {
@@ -130,6 +160,147 @@ impl VideoFrag {
     pub fn is_parity(&self) -> bool {
         self.idx >= self.count
     }
+
+    /// Reed-Solomon 校验包（0.5.1 起）
+    pub fn is_rs_parity(&self) -> bool {
+        self.idx as u32 >= self.count as u32 * 2
+    }
+}
+
+/// Reed-Solomon：每组最多多少个数据分片（GF(2^8) 一组数据 + 校验最多 255 片）
+pub const RS_GROUP: usize = 64;
+/// 校验片数最多是数据片数的多少倍
+pub const RS_MAX_RATIO: f32 = 1.5;
+const RS_HDR: usize = 11;
+
+/// 一帧的数据分片怎么分组：[(第一片, 片数)]，尽量平均
+pub fn rs_groups(count: usize) -> Vec<(usize, usize)> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let g = count.div_ceil(RS_GROUP);
+    let (base, extra) = (count / g, count % g);
+    let mut first = 0;
+    (0..g)
+        .map(|i| {
+            let k = base + usize::from(i < extra);
+            let r = (first, k);
+            first += k;
+            r
+        })
+        .collect()
+}
+
+/// 一组 k 片数据配多少片校验
+pub fn rs_parity_count(k: usize, ratio: f32) -> usize {
+    if ratio <= 0.0 || k == 0 {
+        return 0;
+    }
+    ((k as f32 * ratio.min(RS_MAX_RATIO) - 1e-3).ceil() as usize).clamp(1, 255 - k)
+}
+
+fn rs_shard(c: &[u8]) -> Vec<u8> {
+    let mut v = c.to_vec();
+    v.resize(VIDEO_FRAG, 0);
+    v
+}
+
+/// Reed-Solomon 校验包：每组 k 片数据配 m 片校验（m = k × ratio），一组里收到任意 k 片就能还原整组。
+/// 校验包分片号从 2·count 起，数据 = `版本 1 u8 | 组的第一片 u16 | 组片数 k u16 | 第几片校验 j u8 | 校验片数 m u8 | 整帧长度 u32 | 校验数据（VIDEO_FRAG 字节）`
+pub fn rs_parities(frame: u32, flags: u8, data: &[u8], ratio: f32) -> Vec<Vec<u8>> {
+    use reed_solomon_erasure::galois_8::ReedSolomon;
+    let chunks = frame_chunks(data);
+    let count = chunks.len();
+    let mut out = Vec::new();
+    let mut idx = count * 2;
+    for (first, k) in rs_groups(count) {
+        let m = rs_parity_count(k, ratio);
+        if m == 0 {
+            continue;
+        }
+        let Ok(rs) = ReedSolomon::new(k, m) else { continue };
+        let mut shards: Vec<Vec<u8>> = chunks[first..first + k].iter().map(|c| rs_shard(c)).collect();
+        shards.extend((0..m).map(|_| vec![0u8; VIDEO_FRAG]));
+        if rs.encode(&mut shards).is_err() {
+            continue;
+        }
+        for (j, sh) in shards[k..].iter().enumerate() {
+            if idx > u16::MAX as usize {
+                return out;
+            }
+            let mut v = Vec::with_capacity(VIDEO_HDR + RS_HDR + VIDEO_FRAG);
+            v.extend_from_slice(&frame.to_le_bytes());
+            v.extend_from_slice(&(idx as u16).to_le_bytes());
+            v.extend_from_slice(&(count as u16).to_le_bytes());
+            v.push(flags);
+            v.push(1);
+            v.extend_from_slice(&(first as u16).to_le_bytes());
+            v.extend_from_slice(&(k as u16).to_le_bytes());
+            v.push(j as u8);
+            v.push(m as u8);
+            v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            v.extend_from_slice(sh);
+            out.push(v);
+            idx += 1;
+        }
+    }
+    out
+}
+
+/// 解析出的 Reed-Solomon 校验包
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RsParity {
+    pub first: usize,
+    pub k: usize,
+    pub j: usize,
+    pub m: usize,
+    pub total_len: usize,
+}
+
+pub fn read_rs_parity<'a>(f: &VideoFrag, d: &'a [u8]) -> Option<(RsParity, &'a [u8])> {
+    if !f.is_rs_parity() || d.len() != RS_HDR + VIDEO_FRAG || d[0] != 1 {
+        return None;
+    }
+    let p = RsParity {
+        first: u16::from_le_bytes([d[1], d[2]]) as usize,
+        k: u16::from_le_bytes([d[3], d[4]]) as usize,
+        j: d[5] as usize,
+        m: d[6] as usize,
+        total_len: u32::from_le_bytes(d[7..11].try_into().ok()?) as usize,
+    };
+    let count = f.count as usize;
+    let ok = p.k > 0 && p.m > 0 && p.j < p.m && p.k + p.m <= 255 && p.first + p.k <= count
+        && p.total_len <= count * VIDEO_FRAG && p.total_len + VIDEO_FRAG > count * VIDEO_FRAG;
+    ok.then_some((p, &d[RS_HDR..]))
+}
+
+/// 用一组里收到的数据片和校验片还原缺的数据片。data 长度 = k（按组内顺序），parity 长度 = m。
+/// 收到的总片数 ≥ k 才能还原；返回整组 k 片数据（已按真实长度截断）
+pub fn rs_recover(count: usize, p: &RsParity, data: &[Option<&[u8]>], parity: &[Option<&[u8]>]) -> Option<Vec<Vec<u8>>> {
+    use reed_solomon_erasure::galois_8::ReedSolomon;
+    if data.len() != p.k || parity.len() != p.m {
+        return None;
+    }
+    let have = data.iter().chain(parity.iter()).filter(|x| x.is_some()).count();
+    if have < p.k {
+        return None;
+    }
+    let rs = ReedSolomon::new(p.k, p.m).ok()?;
+    let mut shards: Vec<Option<Vec<u8>>> = data.iter().map(|d| d.map(rs_shard)).chain(parity.iter().map(|x| x.map(|x| x.to_vec()))).collect();
+    rs.reconstruct_data(&mut shards).ok()?;
+    let last_len = p.total_len - (count - 1) * VIDEO_FRAG;
+    Some(
+        shards
+            .into_iter()
+            .take(p.k)
+            .enumerate()
+            .map(|(i, sh)| {
+                let mut v = sh.unwrap_or_default();
+                v.truncate(if p.first + i == count - 1 { last_len } else { VIDEO_FRAG });
+                v
+            })
+            .collect(),
+    )
 }
 
 fn frame_chunks(data: &[u8]) -> Vec<&[u8]> {
@@ -326,8 +497,67 @@ mod tests {
         }
         // 超出范围的校验包号不认
         let mut bad = par[0].clone();
-        bad[4..6].copy_from_slice(&16u16.to_le_bytes());
+        bad[4..6].copy_from_slice(&32u16.to_le_bytes());
         assert!(read_video_frag(&bad).is_none());
+    }
+
+    #[test]
+    fn rs_recovers_up_to_m_lost_per_group() {
+        // 150 片：分成 3 组（50 片一组），每组配 50 × 0.6 = 30 片校验
+        let data: Vec<u8> = (0..(VIDEO_FRAG * 149 + 333) as u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let frags = video_fragments(9, VIDEO_KEY, &data);
+        let count = frags.len();
+        assert_eq!(count, 150);
+        assert_eq!(rs_groups(count), vec![(0, 50), (50, 50), (100, 50)]);
+        let par = rs_parities(9, VIDEO_KEY, &data, 0.6);
+        assert_eq!(par.len(), 90);
+        let chunks: Vec<&[u8]> = frags.iter().map(|f| read_video_frag(f).unwrap().1).collect();
+        let parsed: Vec<(RsParity, &[u8])> = par
+            .iter()
+            .map(|p| {
+                let (f, d) = read_video_frag(p).unwrap();
+                assert!(f.is_parity() && f.is_rs_parity() && f.idx as usize >= 2 * count);
+                assert!(fec_group(&f, d).is_none(), "must not be mistaken for xor parity");
+                read_rs_parity(&f, d).unwrap()
+            })
+            .collect();
+        // 每组丢 30 片（包括最后一片短的），正好能还原
+        for (gi, (first, k)) in rs_groups(count).into_iter().enumerate() {
+            let ps: Vec<&(RsParity, &[u8])> = parsed.iter().filter(|(p, _)| p.first == first).collect();
+            let info = ps[0].0;
+            assert_eq!((info.k, info.m, info.total_len), (k, 30, data.len()));
+            let lost = |i: usize| (i * 7 + gi) % 5 < 2 && i < 75; // 丢一部分数据片
+            let data_in: Vec<Option<&[u8]>> = (0..k).map(|i| (!lost(i)).then_some(chunks[first + i])).collect();
+            let lost_n = data_in.iter().filter(|d| d.is_none()).count();
+            let mut parity_in: Vec<Option<&[u8]>> = vec![None; 30];
+            for (p, d) in &ps {
+                parity_in[p.j] = Some(*d);
+            }
+            // 再丢掉一些校验片，让总丢失正好 30
+            for j in 0..(30 - lost_n.min(30)) {
+                if lost_n + j < 30 {
+                    parity_in[j] = None;
+                }
+            }
+            let back = rs_recover(count, &info, &data_in, &parity_in).expect("recoverable");
+            for i in 0..k {
+                assert_eq!(back[i], chunks[first + i], "group {gi} shard {i}");
+            }
+            // 再多丢一片就还原不了
+            let mut fewer = parity_in.clone();
+            if let Some(x) = fewer.iter_mut().find(|x| x.is_some()) {
+                *x = None;
+            }
+            assert!(rs_recover(count, &info, &data_in, &fewer).is_none());
+        }
+        // 不加校验
+        assert!(rs_parities(9, 0, &data, 0.0).is_empty());
+        // 小帧：1 片数据，至少 1 片校验
+        let small = rs_parities(1, 0, b"abc", 0.1);
+        assert_eq!(small.len(), 1);
+        let (f, d) = read_video_frag(&small[0]).unwrap();
+        let (p, sh) = read_rs_parity(&f, d).unwrap();
+        assert_eq!(rs_recover(1, &p, &[None], &[Some(sh)]).unwrap(), vec![b"abc".to_vec()]);
     }
 
     #[test]

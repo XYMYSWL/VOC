@@ -236,6 +236,22 @@ enum Input<'a> {
     Tex(&'a ID3D11Texture2D),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RateMode {
+    Cbr,
+    PeakVbr,
+    Quality,
+}
+
+/// 码率控制方式（默认见下；测试时 VOC_TEST_RC=cbr / vbr / quality 切换）
+pub fn rate_mode() -> RateMode {
+    match std::env::var("VOC_TEST_RC").as_deref() {
+        Ok("vbr") => RateMode::PeakVbr,
+        Ok("quality") => RateMode::Quality,
+        _ => RateMode::Cbr,
+    }
+}
+
 pub struct HwEncoder {
     mft: IMFTransform,
     events: IMFMediaEventGenerator,
@@ -248,6 +264,8 @@ pub struct HwEncoder {
     pub name: String,
     /// 编码器接受了「逐行刷新」（画面按条带逐帧刷新，不再定期发整张关键帧）
     pub intra_refresh: bool,
+    /// 编码器接受了长期参考帧（2 个槽）
+    pub ltr: bool,
     _d3d: Option<(IMFDXGIDeviceManager, ID3D11Device)>,
 }
 
@@ -285,11 +303,22 @@ impl HwEncoder {
         Self::open(info, width, height, fps, bitrate, Some((mgr, dev)))
     }
 
-    /// 运行中调整码率（网络拥堵时降低）
+    /// 运行中调整码率（网络拥堵时降低）；可变码率时调的是上限
     pub fn set_bitrate(&self, bitrate: u32) {
         if let Some(api) = &self.codec_api {
             unsafe {
-                let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate));
+                match rate_mode() {
+                    RateMode::Cbr => {
+                        let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate));
+                    }
+                    RateMode::PeakVbr => {
+                        let _ = api.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from(bitrate / 2));
+                        let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &VARIANT::from(bitrate));
+                    }
+                    RateMode::Quality => {
+                        let _ = api.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &VARIANT::from(bitrate));
+                    }
+                }
             }
         }
     }
@@ -312,8 +341,25 @@ impl HwEncoder {
                     let _ = api.SetValue(g, &v);
                 };
                 set(&CODECAPI_AVLowLatencyMode, VARIANT::from(true));
-                set(&CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
-                set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
+                // 码率控制（VOC_TEST_RC 可切换做对比）：cbr = 固定码率；vbr = 峰值受限可变码率（平均一半、峰值封顶）；
+                // quality = 画质优先、码率封顶
+                match rate_mode() {
+                    RateMode::Cbr => {
+                        set(&CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32));
+                        set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
+                    }
+                    RateMode::PeakVbr => {
+                        set(&CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32));
+                        set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate / 2));
+                        set(&CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(bitrate));
+                    }
+                    RateMode::Quality => {
+                        set(&CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32));
+                        set(&CODECAPI_AVEncCommonQuality, VARIANT::from(70u32));
+                        set(&CODECAPI_AVEncCommonMaxBitRate, VARIANT::from(bitrate));
+                        set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
+                    }
+                }
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps * 10));
             }
@@ -326,6 +372,13 @@ impl HwEncoder {
                 });
             if let (true, Some(api)) = (intra_refresh, &codec_api) {
                 let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(fps * 60));
+            }
+            // 长期参考帧：2 个槽（低 16 位 = 槽数，高 16 位 = 信任模式 1）。开了以后关键帧只由我们按需强制，
+            // 编码器自己不要定期插 IDR（IDR 会清掉长期参考帧，观看者那边对不上）
+            let ltr = std::env::var_os("VOC_NO_LTR").is_none()
+                && codec_api.as_ref().is_some_and(|api| api.SetValue(&CODECAPI_AVEncVideoLTRBufferControl, &VARIANT::from(0x0001_0002u32)).is_ok());
+            if let (true, Some(api)) = (ltr, &codec_api) {
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(fps * 600));
             }
 
             // 先设输出类型，再设输入类型（编码器的要求）
@@ -352,7 +405,32 @@ impl HwEncoder {
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             let events: IMFMediaEventGenerator = mft.cast()?;
-            Ok(Self { mft, events, codec_api, width, height, fps, frame_no: 0, need_input: 0, name: info.name.clone(), intra_refresh, _d3d: d3d })
+            Ok(Self { mft, events, codec_api, width, height, fps, frame_no: 0, need_input: 0, name: info.name.clone(), intra_refresh, ltr, _d3d: d3d })
+        }
+    }
+
+    /// 编码器声明支持某个 ICodecAPI 参数（实测用）
+    #[allow(dead_code)]
+    pub fn supports(&self, g: &GUID) -> bool {
+        self.codec_api.as_ref().is_some_and(|api| unsafe { api.IsSupported(g).is_ok() })
+    }
+
+    /// 试着设置某个参数（实测用）：Ok = 编码器接受
+    #[allow(dead_code)]
+    pub fn try_set(&self, g: &GUID, v: u32) -> bool {
+        self.codec_api.as_ref().is_some_and(|api| unsafe { api.SetValue(g, &VARIANT::from(v)).is_ok() })
+    }
+
+    /// 下一帧：mark = 存进第几个长期参考槽；use_slot = 只参考这个槽里的长期参考帧（恢复帧）
+    pub fn set_ltr(&self, mark: Option<u8>, use_slot: Option<u8>) {
+        let Some(api) = &self.codec_api else { return };
+        unsafe {
+            if let Some(m) = mark {
+                let _ = api.SetValue(&CODECAPI_AVEncVideoMarkLTRFrame, &VARIANT::from(m as u32));
+            }
+            if let Some(u) = use_slot {
+                let _ = api.SetValue(&CODECAPI_AVEncVideoUseLTRFrame, &VARIANT::from(1u32 << u));
+            }
         }
     }
 

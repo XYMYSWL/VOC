@@ -1062,7 +1062,7 @@ impl App {
         if let Some((id, on)) = watch_toggle {
             // 低带宽模式下默认看低画质层
             let low = on && self.cfg.low_bandwidth;
-            s.send(ClientMsg::Watch { target: id, on, low, route: 0 });
+            s.send(ClientMsg::Watch { target: id, on, low, route: 0, cursor: true });
             if on {
                 if let Some(view) = self.voice.video.watch(id, true) {
                     self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route: 0 });
@@ -1465,7 +1465,7 @@ impl App {
                     ui.checkbox(&mut self.cfg.auto_update, "启动时自动检查更新");
                     if ui
                         .checkbox(&mut self.cfg.update_accel, "中国大陆加速更新")
-                        .on_hover_text("连不上 GitHub 或下载很慢时打开：安装包改从国内的 GitHub 加速镜像下载（一个不行自动换下一个）。\n版本号和 SHA-256 仍从 GitHub 官方取，下载的文件对不上就丢掉，镜像改不了安装包。")
+                        .on_hover_text("打开后一键更新优先从国内的 GitHub 加速镜像下载（一个不行自动换下一个），在中国大陆更快。\n不打开也会在连不上 GitHub 时自动改走镜像。\n版本号和 SHA-256 仍从 GitHub 官方取，下载的文件对不上就丢掉，镜像改不了安装包。")
                         .changed()
                     {
                         self.updater.accel.store(self.cfg.update_accel, Ordering::Relaxed);
@@ -1490,11 +1490,9 @@ impl App {
                                 } else {
                                     ui.hyperlink_to(RichText::new(format!("发现新版本 v{version}，点此下载")).color(th::ACCENT_HOVER), url);
                                 }
-                                if self.cfg.update_accel {
-                                    let asset = if crate::update::is_packaged() { crate::update::SETUP_ASSET } else { crate::update::PORTABLE_ASSET };
-                                    ui.hyperlink_to(RichText::new("国内加速下载").size(12.0), crate::update::accel_link(asset))
-                                        .on_hover_text("经国内 GitHub 加速镜像下载（第三方镜像，手动下载时不会自动核对 SHA-256）");
-                                }
+                                let asset = if crate::update::is_packaged() { crate::update::SETUP_ASSET } else { crate::update::PORTABLE_ASSET };
+                                ui.hyperlink_to(RichText::new("国内加速下载").size(12.0), crate::update::accel_link(asset))
+                                    .on_hover_text("经国内 GitHub 加速镜像下载（第三方镜像，手动下载时不会自动核对 SHA-256）");
                             }
                             crate::update::UpdateState::Downloading { percent, .. } => {
                                 ui.add(egui::ProgressBar::new(percent as f32 / 100.0).desired_width(160.0).show_percentage());
@@ -1504,9 +1502,7 @@ impl App {
                             }
                             crate::update::UpdateState::Failed(e) => {
                                 ui.label(RichText::new(e).size(12.0).color(th::RED));
-                                if !self.cfg.update_accel {
-                                    ui.label(RichText::new("在中国大陆连不上 GitHub？勾上上面的「中国大陆加速更新」再试").size(11.5).color(th::TEXT_DIM));
-                                }
+                                ui.label(RichText::new("GitHub 和国内镜像都没连上，可以稍后再试").size(11.5).color(th::TEXT_DIM));
                             }
                         }
                     });
@@ -1613,12 +1609,16 @@ impl App {
                             ui.end_row();
                             ui.label(RichText::new("码率").color(th::TEXT_DIM));
                             let mbps = st.kbps.load(Ordering::Relaxed) as f32 / 1000.0;
-                            let fec = match st.fec_k.load(Ordering::Relaxed) {
+                            let skipped = st.static_skipped.load(Ordering::Relaxed);
+                            let auto_h = st.auto_height.load(Ordering::Relaxed);
+                            let fec = match st.fec_pct.load(Ordering::Relaxed) {
                                 0 => String::new(),
-                                k => format!(" · 有丢包，已加冗余（每 {k} 片 1 个）"),
+                                p => format!(" · 有丢包，已加 {p}% 冗余"),
                             };
                             let pct = st.rate_pct.load(Ordering::Relaxed);
-                            if pct < 100 && st.low_watchers.load(Ordering::Relaxed) > 0 {
+                            if auto_h > 0 {
+                                ui.label(RichText::new(format!("{mbps:.1} Mbps · 网络拥堵，已自动降到 {auto_h}P{fec}")).color(th::YELLOW));
+                            } else if pct < 100 && st.low_watchers.load(Ordering::Relaxed) > 0 {
                                 ui.label(RichText::new(format!("{mbps:.1} Mbps · 流畅层已自动降到 {pct}%{fec}")).color(th::YELLOW));
                             } else if fec.is_empty() {
                                 ui.label(format!("{mbps:.1} Mbps"));
@@ -1626,6 +1626,11 @@ impl App {
                                 ui.label(RichText::new(format!("{mbps:.1} Mbps{fec}")).color(th::YELLOW));
                             }
                             ui.end_row();
+                            if skipped > 0 {
+                                ui.label(RichText::new("省流量").color(th::TEXT_DIM));
+                                ui.label(format!("画面变化小，每秒少发 {skipped} 帧"));
+                                ui.end_row();
+                            }
                             ui.label(RichText::new("编码").color(th::TEXT_DIM));
                             ui.label(format!("{} · {} ms/帧", st.encoder.lock().unwrap(), st.encode_ms.load(Ordering::Relaxed)));
                             ui.end_row();
@@ -1673,6 +1678,11 @@ impl App {
                 let q: Vec<(u8, &str)> = video::QUALITIES.iter().enumerate().map(|(i, q)| (i as u8, q.0)).collect();
                 th::segmented(ui, &mut self.cfg.share.quality, &q);
                 ui.add_space(6.0);
+                ui.checkbox(&mut self.cfg.share.skip_static, "画面变化小时少发（省流量）")
+                    .on_hover_text("画面只有一小块在变（时钟、打字、鼠标移动）时最多每秒发 10 帧，完全不动时每秒 1 帧；大范围变化（游戏、视频）照常满帧。\n看网页、文档、游戏菜单时能省不少带宽，代价是这时鼠标移动看起来没那么顺。\n需要较新的 Windows 11（能报告屏幕哪里变了），不支持时这个开关不起作用。");
+                ui.checkbox(&mut self.cfg.share.auto_res, "网络差时自动降低分辨率")
+                    .on_hover_text("网络拥堵时自动把分辨率从 1080P 降到 900P、720P、540P，码率跟着降，比硬压码率清楚；网络好了自动升回来。\n打开后选「原画」的人也会跟着变。");
+                ui.add_space(6.0);
                 th::section(ui, "编码器");
                 let choices = video::encoder_choices();
                 let cur = choices.iter().find(|c| c.0 == self.cfg.share.encoder).map(|c| c.1.clone()).unwrap_or_else(|| choices[0].1.clone());
@@ -1715,13 +1725,17 @@ impl App {
                         audio: self.cfg.share_audio && crate::loopback::supported(),
                         simulcast: true,
                         rtx: true,
+                        bps: eff.bitrate(),
                     });
                     self.sharer = Some(sh);
                     self.share_confirmed = false;
                     self.share_error = None;
                     self.show_share = false;
                 }
-                Err(e) => self.share_error = Some(e),
+                Err(e) => {
+                    crate::applog::log(format!("屏幕共享开不了：{e}"));
+                    self.share_error = Some(e);
+                }
             }
         }
         if !open {
@@ -1788,6 +1802,7 @@ impl App {
                         let scale = (rect.width() / w).min(rect.height() / h);
                         let img = egui::Rect::from_center_size(rect.center(), Vec2::new(w * scale, h * scale));
                         ui.painter().image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        draw_remote_cursor(ui.painter(), img, &v.view);
                     }
                     if resp.double_clicked() {
                         exit_full = true;
@@ -1905,6 +1920,7 @@ impl App {
                                 let r = ui.add(
                                     egui::Image::new(egui::load::SizedTexture::new(t.id(), Vec2::new(w * scale, h * scale))).sense(Sense::click()),
                                 );
+                                draw_remote_cursor(ui.painter(), r.rect, &v.view);
                                 if r.double_clicked() {
                                     go_full = Some(*id);
                                 }
@@ -1920,12 +1936,12 @@ impl App {
             }
         }
         for (id, low, route) in relayer {
-            s.send(ClientMsg::Watch { target: id, on: true, low, route });
+            s.send(ClientMsg::Watch { target: id, on: true, low, route, cursor: true });
         }
         for id in close {
             self.views.remove(&id);
             self.voice.video.watch(id, false);
-            s.send(ClientMsg::Watch { target: id, on: false, low: false, route: 0 });
+            s.send(ClientMsg::Watch { target: id, on: false, low: false, route: 0, cursor: false });
         }
         if let Some(id) = go_full {
             self.fullscreen = Some(id);
@@ -2148,5 +2164,51 @@ impl eframe::App for App {
             }
         }
         eframe::set_value(storage, eframe::APP_KEY, &self.cfg);
+    }
+}
+
+/// 在观看画面上画共享者单独发来的鼠标（0.6 秒没收到就不画：共享者那边把鼠标画进画面了）
+fn draw_remote_cursor(p: &egui::Painter, img: egui::Rect, view: &crate::video::View) {
+    use voc_proto::udp::*;
+    let Some((x, y, shape, visible, at)) = *view.cursor.lock().unwrap() else { return };
+    if !visible || at.elapsed() > std::time::Duration::from_millis(600) {
+        return;
+    }
+    let pos = img.min + Vec2::new(x * img.width(), y * img.height());
+    let k = (img.height() / 1080.0).clamp(0.6, 1.6); // 按画面大小缩放
+    let black = Stroke::new(1.2 * k, Color32::BLACK);
+    let white = Stroke::new(2.4 * k, Color32::WHITE);
+    let line = |a: egui::Pos2, b: egui::Pos2| {
+        p.line_segment([a, b], white);
+        p.line_segment([a, b], black);
+    };
+    match shape {
+        CURSOR_IBEAM => {
+            let h = 9.0 * k;
+            line(pos + Vec2::new(0.0, -h), pos + Vec2::new(0.0, h));
+            line(pos + Vec2::new(-3.0 * k, -h), pos + Vec2::new(3.0 * k, -h));
+            line(pos + Vec2::new(-3.0 * k, h), pos + Vec2::new(3.0 * k, h));
+        }
+        CURSOR_CROSS | CURSOR_SIZE_ALL => {
+            let h = 8.0 * k;
+            line(pos + Vec2::new(-h, 0.0), pos + Vec2::new(h, 0.0));
+            line(pos + Vec2::new(0.0, -h), pos + Vec2::new(0.0, h));
+        }
+        CURSOR_SIZE_WE => line(pos + Vec2::new(-9.0 * k, 0.0), pos + Vec2::new(9.0 * k, 0.0)),
+        CURSOR_SIZE_NS => line(pos + Vec2::new(0.0, -9.0 * k), pos + Vec2::new(0.0, 9.0 * k)),
+        CURSOR_WAIT => {
+            p.circle_stroke(pos, 7.0 * k, white);
+            p.circle_stroke(pos, 7.0 * k, black);
+        }
+        _ => {
+            // 箭头（手型也画箭头，再加个小圆点）
+            let pts = [(0.0, 0.0), (0.0, 17.0), (4.5, 13.0), (8.0, 20.0), (10.5, 19.0), (7.0, 12.0), (12.5, 12.0)];
+            let poly: Vec<egui::Pos2> = pts.iter().map(|(a, b)| pos + Vec2::new(*a * k, *b * k)).collect();
+            p.add(egui::Shape::convex_polygon(poly.clone(), Color32::WHITE, Stroke::NONE));
+            p.add(egui::Shape::closed_line(poly, Stroke::new(1.2 * k, Color32::BLACK)));
+            if shape == CURSOR_HAND {
+                p.circle_filled(pos + Vec2::new(14.0 * k, 4.0 * k), 3.0 * k, Color32::from_rgb(80, 160, 255));
+            }
+        }
     }
 }

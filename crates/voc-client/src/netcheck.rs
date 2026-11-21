@@ -25,6 +25,21 @@ pub struct Snapshot {
     pub failed: usize,
     /// 用服务器的 NAT 探测端口测出的 NAT 类型（服务器没开探测端口时为 None，退回按端口粗略判断）
     pub nat: Option<voc_proto::NatInfo>,
+    /// 服务器的 NAT 探测端口通不通
+    pub probe: ProbeState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProbeState {
+    /// 服务器没开（或版本较旧）
+    #[default]
+    NotOffered,
+    /// 还在等回复
+    Waiting,
+    /// 通：(端口)
+    Ok(u16),
+    /// 发了没回：(端口)
+    NoReply(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +151,17 @@ pub fn analyze(s: &Snapshot) -> Report {
     let no_nat = s.public.is_some_and(|p| s.lan.iter().any(|l| l.ip() == p.ip().to_canonical()));
     let port_changed = s.public.is_some_and(|p| p.port() != s.local_port);
     let symmetric = s.nat.is_some_and(|n| matches!(n.kind, voc_proto::NAT_SYM_PREDICTABLE | voc_proto::NAT_SYM_RANDOM));
+    match s.probe {
+        ProbeState::Ok(p) => item(Level::Good, "NAT 探测端口", format!("通（UDP {p}）")),
+        ProbeState::NoReply(p) => item(
+            Level::Warn,
+            "NAT 探测端口",
+            format!("不通（UDP {p}）：多半是云服务器的安全组没放行这个 UDP 端口，NAT 类型只能粗略判断"),
+        ),
+        ProbeState::Waiting => item(Level::Pending, "NAT 探测端口", "检测中…".into()),
+        ProbeState::NotOffered if s.ever_pong => item(Level::Info, "NAT 探测端口", "服务器没开（或版本较旧）".into()),
+        ProbeState::NotOffered => {}
+    }
     if let Some(n) = s.nat {
         match n.kind {
             voc_proto::NAT_OPEN => item(Level::Good, "NAT", "没有（本机直接有公网地址）".into()),
@@ -242,7 +268,18 @@ mod tests {
             punching: 0,
             failed: 0,
             nat: None,
+            probe: ProbeState::Ok(7879),
         }
+    }
+
+    #[test]
+    fn probe_port_status() {
+        let mut s = base();
+        assert_eq!(level(&analyze(&s), "NAT 探测端口"), Level::Good);
+        s.probe = ProbeState::NoReply(7879);
+        let r = analyze(&s);
+        assert_eq!(level(&r, "NAT 探测端口"), Level::Warn);
+        assert!(r.items.iter().any(|i| i.value.contains("安全组")));
     }
 
     #[test]

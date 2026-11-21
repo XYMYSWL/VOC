@@ -90,7 +90,9 @@ impl CaptureSide {
             let km: IDXGIKeyedMutex = t.cast()?;
             let handle = unsafe { t.cast::<IDXGIResource>()?.GetSharedHandle()? };
             self.tex = Some((t, km, handle.0 as usize, desc.Width, desc.Height));
-            self.generation = self.generation.wrapping_add(1);
+            // 全局递增：截屏会话重开（例如换成不带鼠标）后新纹理的编号不会和旧的重复，编码端才知道要重新打开
+            static NEXT_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+            self.generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let (t, km, handle, w, h) = self.tex.as_ref().unwrap();
         if !acquire(km, 0, 0) {

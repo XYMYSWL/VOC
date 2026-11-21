@@ -36,12 +36,32 @@ pub struct ShareConfig {
     pub encoder: String,
     /// 画质（码率档位）：0 标准 / 1 高 / 2 极高
     pub quality: u8,
+    /// 画面不动时少发（按系统报告的屏幕变化区域判断，至少每秒仍发一帧）
+    pub skip_static: bool,
+    /// 网络差时自动降分辨率（原画层也会跟着降）
+    pub auto_res: bool,
 }
 
 impl Default for ShareConfig {
     fn default() -> Self {
-        Self { height: 720, fps: 30, monitor: 0, encoder: "auto".into(), quality: 1 }
+        Self { height: 720, fps: 30, monitor: 0, encoder: "auto".into(), quality: 1, skip_static: true, auto_res: false }
     }
+}
+
+/// 自动降分辨率：按码率比例选高度（1080 → 900 → 720 → 540，不超过设定值）
+pub fn res_for_scale(full: u32, scale: f32) -> u32 {
+    let mut steps = vec![full];
+    steps.extend([900, 720, 540].into_iter().filter(|h| *h < full));
+    let i = if scale >= 0.85 {
+        0
+    } else if scale >= 0.6 {
+        1
+    } else if scale >= 0.42 {
+        2
+    } else {
+        3
+    };
+    steps[i.min(steps.len() - 1)]
 }
 
 /// 画质档位：(名字, 码率倍数)。1080P 60 帧约 5.5 / 12 / 25 Mbps
@@ -313,6 +333,13 @@ pub struct VideoEncoder {
     gpu: Option<crate::mf::gpu::Converter>,
     /// 码率比例（网络拥堵时降低，0.3–1.0）
     rate_scale: f32,
+    /// 自动降分辨率时的实际高度（None = 按设定）
+    height: Option<u32>,
+    /// 下一帧的长期参考帧安排；已经送进编码器、还没出来的帧的安排（硬件编码器可能晚一帧出）
+    ltr_next: LtrTag,
+    ltr_inflight: std::collections::VecDeque<LtrTag>,
+    /// 编码器重建过几次（重建后长期参考帧全没了）
+    ltr_epoch: u32,
 }
 
 pub struct EncodedFrame {
@@ -321,11 +348,75 @@ pub struct EncodedFrame {
     pub width: usize,
     pub height: usize,
     pub codec: Codec,
+    /// 这一帧存进了第几个长期参考槽
+    pub ltr_mark: Option<u8>,
+    /// 恢复帧（只参考长期参考帧）
+    pub recover: bool,
+}
+
+/// 下一帧的长期参考帧安排
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LtrTag {
+    pub mark: Option<u8>,
+    pub use_slot: Option<u8>,
 }
 
 impl VideoEncoder {
     pub fn new(cfg: ShareConfig) -> Self {
-        Self { cfg, cur: None, yuv: Vec::new(), nv12: Vec::new(), gpu: None, rate_scale: 1.0 }
+        Self {
+            cfg,
+            cur: None,
+            yuv: Vec::new(),
+            nv12: Vec::new(),
+            gpu: None,
+            rate_scale: 1.0,
+            height: None,
+            ltr_next: LtrTag::default(),
+            ltr_inflight: Default::default(),
+            ltr_epoch: 0,
+        }
+    }
+
+    /// 当前编码器支持长期参考帧
+    pub fn ltr_supported(&self) -> bool {
+        matches!(&self.cur, Some((_, _, _, _, Backend::Hw(e))) if e.ltr)
+    }
+
+    /// 编码器重建过几次（变了就说明长期参考帧全没了）
+    pub fn ltr_epoch(&self) -> u32 {
+        self.ltr_epoch
+    }
+
+    /// 安排下一帧的长期参考帧
+    pub fn set_ltr(&mut self, tag: LtrTag) {
+        self.ltr_next = tag;
+    }
+
+    /// 硬件编码前：把这一帧的长期参考帧安排交给编码器，记下来等输出时对上
+    fn apply_ltr(ltr_next: &mut LtrTag, inflight: &mut std::collections::VecDeque<LtrTag>, enc: &HwEncoder) {
+        let tag = std::mem::take(ltr_next);
+        if enc.ltr {
+            enc.set_ltr(tag.mark, tag.use_slot);
+        }
+        inflight.push_back(if enc.ltr { tag } else { LtrTag::default() });
+    }
+
+    fn tag_outputs(inflight: &mut std::collections::VecDeque<LtrTag>, pkts: Vec<(Vec<u8>, bool)>, dw: usize, dh: usize, codec: Codec) -> Vec<EncodedFrame> {
+        pkts.into_iter()
+            .map(|(data, key)| {
+                let t = inflight.pop_front().unwrap_or_default();
+                EncodedFrame { data, key, width: dw, height: dh, codec, ltr_mark: t.mark, recover: t.use_slot.is_some() && !key }
+            })
+            .collect()
+    }
+
+    /// 临时改编码高度（自动降分辨率）。下一帧按新尺寸重建编码器，从关键帧开始
+    pub fn set_height(&mut self, h: u32) {
+        self.height = (h != self.cfg.height).then_some(h);
+    }
+
+    fn target_size(&self, sw: usize, sh: usize) -> (usize, usize) {
+        ShareConfig { height: self.height.unwrap_or(self.cfg.height), ..self.cfg.clone() }.target_size(sw, sh)
     }
 
     /// 调整码率比例（硬件编码器即时生效；openh264 不支持中途改，保持原码率）
@@ -345,7 +436,7 @@ impl VideoEncoder {
         keep: bool,
     ) -> Result<Vec<EncodedFrame>, String> {
         let (codec, Some(info)) = plan else { return Err("没有硬件编码器".into()) };
-        let (dw, dh) = self.cfg.target_size(f.width as usize, f.height as usize);
+        let (dw, dh) = self.target_size(f.width as usize, f.height as usize);
         if !self.gpu.as_ref().is_some_and(|g| g.luid() == f.luid) {
             self.gpu = Some(crate::mf::gpu::Converter::new(f.luid).map_err(|e| format!("显卡设备创建失败：{e}"))?);
             self.cur = None;
@@ -359,6 +450,8 @@ impl VideoEncoder {
             let enc = HwEncoder::new_on_device(info, dw as u32, dh as u32, self.cfg.fps, bitrate, g.mgr.clone(), g.dev.clone())
                 .map_err(|e| format!("{} 初始化失败：{e}", info.name))?;
             self.cur = Some((dw, dh, *codec, name, Backend::Hw(enc)));
+            self.ltr_epoch += 1;
+            self.ltr_inflight.clear();
         }
         let tex = self.gpu.as_mut().unwrap().convert(f, dw as u32, dh as u32, self.cfg.fps, keep).map_err(|e| format!("显卡缩放失败：{e}"))?;
         let Some((_, _, codec, _, Backend::Hw(enc))) = self.cur.as_mut() else { return Err("编码器状态不对".into()) };
@@ -366,8 +459,9 @@ impl VideoEncoder {
             enc.force_keyframe();
         }
         let codec = *codec;
+        Self::apply_ltr(&mut self.ltr_next, &mut self.ltr_inflight, enc);
         let pkts = enc.encode_texture(&tex).map_err(|e| format!("{} 编码失败：{e}", enc.name))?;
-        Ok(pkts.into_iter().map(|(data, key)| EncodedFrame { data, key, width: dw, height: dh, codec }).collect())
+        Ok(Self::tag_outputs(&mut self.ltr_inflight, pkts, dw, dh, codec))
     }
 
     /// 跳过一帧显卡画面：把共享纹理还给采集端
@@ -416,7 +510,7 @@ impl VideoEncoder {
         plan: &(Codec, Option<HwEncoderInfo>),
         force_key: bool,
     ) -> Result<Vec<EncodedFrame>, String> {
-        let (dw, dh) = self.cfg.target_size(sw, sh);
+        let (dw, dh) = self.target_size(sw, sh);
         let (codec, hw) = plan;
         let name = hw.as_ref().map(|h| h.name.clone()).unwrap_or_else(|| "OpenH264（CPU）".into());
         let fresh = !matches!(&self.cur, Some((w, h, c, n, _)) if *w == dw && *h == dh && c == codec && *n == name);
@@ -433,6 +527,8 @@ impl VideoEncoder {
                 None => Backend::Soft(Self::make_soft(&self.cfg)?),
             };
             self.cur = Some((dw, dh, *codec, name, backend));
+            self.ltr_epoch += 1;
+            self.ltr_inflight.clear();
         }
         bgra_to_i420(bgra, sw, sh, dw, dh, &mut self.yuv);
         let (_, _, codec, _, backend) = self.cur.as_mut().unwrap();
@@ -449,15 +545,25 @@ impl VideoEncoder {
                 if data.is_empty() || matches!(ft, FrameType::Skip | FrameType::Invalid) {
                     return Ok(Vec::new());
                 }
-                Ok(vec![EncodedFrame { data, key: matches!(ft, FrameType::IDR | FrameType::I), width: dw, height: dh, codec }])
+                self.ltr_next = LtrTag::default();
+                Ok(vec![EncodedFrame {
+                    data,
+                    key: matches!(ft, FrameType::IDR | FrameType::I),
+                    width: dw,
+                    height: dh,
+                    codec,
+                    ltr_mark: None,
+                    recover: false,
+                }])
             }
             Backend::Hw(enc) => {
                 if force_key || fresh {
                     enc.force_keyframe();
                 }
                 i420_to_nv12(&self.yuv, dw, dh, &mut self.nv12);
+                Self::apply_ltr(&mut self.ltr_next, &mut self.ltr_inflight, enc);
                 let pkts = enc.encode(&self.nv12).map_err(|e| format!("{} 编码失败：{e}", enc.name))?;
-                Ok(pkts.into_iter().map(|(data, key)| EncodedFrame { data, key, width: dw, height: dh, codec }).collect())
+                Ok(Self::tag_outputs(&mut self.ltr_inflight, pkts, dw, dh, codec))
             }
         }
     }
@@ -485,8 +591,24 @@ pub struct ShareStats {
     pub pipeline: Mutex<String>,
     /// 当前码率占设定值的百分比（网络拥堵时自动降低）
     pub rate_pct: AtomicU32,
-    /// 冗余校验包：每几片一个，0 = 没加
-    pub fec_k: AtomicU32,
+    /// 冗余校验包：校验片占数据片的百分比（原画层），0 = 没加
+    pub fec_pct: AtomicU32,
+    /// 两条路同时发（直连 + 经服务器）的观看者人数
+    pub dual_viewers: AtomicU32,
+    /// 发了几帧恢复帧（代替关键帧）
+    pub ltr_recovers: AtomicU32,
+    /// 鼠标单独发（截屏不带鼠标）
+    pub cursor_separate: AtomicBool,
+    /// 被请求补发的分片累计、观看者回报的最大原始丢包率（千分之几）
+    pub resent_total: AtomicU32,
+    pub viewer_loss: AtomicU32,
+    /// 每秒因为画面没变而没发的帧数
+    pub static_skipped: AtomicU32,
+    /// 调试：最近一帧系统报告的变化区域数（-1 = 取不到）、面积占比（千分之几）
+    pub dirty_last: std::sync::atomic::AtomicI32,
+    pub dirty_area: AtomicU32,
+    /// 自动降分辨率后的高度（0 = 没降）
+    pub auto_height: AtomicU32,
     /// 看低画质层的人数
     pub low_watchers: AtomicU32,
 }
@@ -505,6 +627,9 @@ enum CapFrame {
 
 struct CapFlags {
     tx: SyncSender<CapFrame>,
+    /// 画面不动时少发；有人要关键帧时不跳
+    skip_static: bool,
+    force_key: Arc<AtomicBool>,
     /// 走显卡直通（编码线程判断不能用时关掉，之后改拷回内存）
     gpu: Arc<AtomicBool>,
     stats: Arc<ShareStats>,
@@ -518,6 +643,25 @@ struct CapHandler {
     sec: (Instant, u32),
     scratch: Vec<u8>,
     side: crate::mf::gpu::CaptureSide,
+    /// 系统确实在报告变化区域（报告过非空的才信「没变化」）
+    dirty_works: bool,
+    /// 上次真正发出一帧的时间
+    last_sent: Option<Instant>,
+    skipped: u32,
+}
+
+/// 变化面积小于这个比例（千分之几）算「变化很小」（时钟、托盘图标、光标、打字）
+const SMALL_CHANGE_PERMILLE: u32 = 20;
+
+/// 这一帧能不能跳过（系统确实会报告变化区域、没人在等关键帧时）：
+/// 完全没变 → 至少每秒发一帧；变化很小 → 最多每秒 10 帧；大范围变化 → 照常发
+fn can_skip_static(dirty: Option<(usize, u32)>, dirty_works: bool, since_sent: Option<Duration>, want_key: bool) -> bool {
+    let (Some((n, area)), true, false, Some(since)) = (dirty, dirty_works, want_key, since_sent) else { return false };
+    if n == 0 {
+        since < Duration::from_secs(1)
+    } else {
+        area < SMALL_CHANGE_PERMILLE && since < Duration::from_millis(100)
+    }
 }
 
 impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
@@ -525,7 +669,16 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self { flags: ctx.flags, last: None, sec: (Instant::now(), 0), scratch: Vec::new(), side: Default::default() })
+        Ok(Self {
+            flags: ctx.flags,
+            last: None,
+            sec: (Instant::now(), 0),
+            scratch: Vec::new(),
+            side: Default::default(),
+            dirty_works: false,
+            last_sent: None,
+            skipped: 0,
+        })
     }
 
     fn on_frame_arrived(
@@ -546,8 +699,29 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
         if self.sec.0.elapsed() >= Duration::from_secs(1) {
             let fps = (self.sec.1 as f64 / self.sec.0.elapsed().as_secs_f64()).round() as u32;
             self.flags.stats.capture_fps.store(fps, Ordering::Relaxed);
+            self.flags.stats.static_skipped.store(self.skipped, Ordering::Relaxed);
             self.sec = (Instant::now(), 0);
+            self.skipped = 0;
         }
+        // 画面不动时少发：系统报告这一帧没有变化区域就跳过
+        if self.flags.skip_static {
+            let total = (frame.width() as i64 * frame.height() as i64).max(1);
+            let dirty = frame.dirty_regions().ok().map(|r| {
+                let area: i64 = r.iter().map(|x| x.width as i64 * x.height as i64).sum();
+                (r.len(), (area * 1000 / total).min(1000) as u32)
+            });
+            self.flags.stats.dirty_last.store(dirty.map(|d| d.0 as i32).unwrap_or(-1), Ordering::Relaxed);
+            self.flags.stats.dirty_area.store(dirty.map(|d| d.1).unwrap_or(0), Ordering::Relaxed);
+            if dirty.is_some_and(|d| d.0 > 0) {
+                self.dirty_works = true;
+            }
+            let since = self.last_sent.map(|t| t.elapsed());
+            if can_skip_static(dirty, self.dirty_works, since, self.flags.force_key.load(Ordering::Relaxed)) {
+                self.skipped += 1;
+                return Ok(());
+            }
+        }
+        self.last_sent = Some(Instant::now());
         // 显卡直通：只在显卡内部拷一份，画面不回内存
         if self.flags.gpu.load(Ordering::Relaxed) {
             match self.side.copy(frame.device(), frame.device_context(), frame.as_raw_texture()) {
@@ -578,6 +752,182 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
     }
 }
 
+/// 屏幕采集的参数（换「带不带鼠标」时用同样的参数重开）
+struct CaptureCfg {
+    monitor_index: usize,
+    interval: Duration,
+    flags: CapFlags,
+}
+
+type CapControl = windows_capture::capture::CaptureControl<CapHandler, Box<dyn std::error::Error + Send + Sync>>;
+
+impl CaptureCfg {
+    /// 开始采集；返回 (控制, 「变化区域」能不能用)。「画面变化小时少发」要系统报告变化区域，旧版 Windows 不支持时改回普通采集
+    fn start(&self, with_cursor: bool) -> Result<(CapControl, bool), String> {
+        let r = self.start_with(with_cursor, self.flags.skip_static);
+        match r {
+            Ok(c) => Ok((c, self.flags.skip_static)),
+            Err(_) if self.flags.skip_static => self.start_with(with_cursor, false).map(|c| (c, false)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn start_with(&self, with_cursor: bool, skip: bool) -> Result<CapControl, String> {
+        use windows_capture::capture::GraphicsCaptureApiHandler;
+        use windows_capture::settings::*;
+        let monitor = windows_capture::monitor::Monitor::from_index(self.monitor_index + 1)
+            .or_else(|_| windows_capture::monitor::Monitor::primary())
+            .map_err(|e| format!("找不到显示器：{e}"))?;
+        let f = &self.flags;
+        let settings = Settings::new(
+            monitor,
+            if with_cursor { CursorCaptureSettings::WithCursor } else { CursorCaptureSettings::WithoutCursor },
+            DrawBorderSettings::WithoutBorder,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Custom(self.interval.mul_f32(0.9)),
+            if skip { DirtyRegionSettings::ReportOnly } else { DirtyRegionSettings::Default },
+            ColorFormat::Bgra8,
+            CapFlags {
+                tx: f.tx.clone(),
+                skip_static: skip,
+                force_key: f.force_key.clone(),
+                gpu: f.gpu.clone(),
+                stats: f.stats.clone(),
+                stop: f.stop.clone(),
+                interval: f.interval,
+            },
+        );
+        CapHandler::start_free_threaded(settings).map_err(|e| e.to_string())
+    }
+}
+
+/// 观看者都会自己画鼠标时换成不带鼠标的截屏（鼠标单独发，画面卡、少发帧时鼠标也顺）；有人不会画就换回带鼠标的
+fn capture_manager(cap: CaptureCfg, mut ctl: CapControl, skip_ok: bool, stop: Arc<AtomicBool>, now: Arc<AtomicBool>, want: Arc<AtomicBool>) {
+    let mut cap = cap;
+    cap.flags.skip_static = skip_ok;
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        if stop.load(Ordering::Relaxed) {
+            let _ = ctl.stop();
+            return;
+        }
+        let w = want.load(Ordering::Relaxed);
+        if w == now.load(Ordering::Relaxed) {
+            continue;
+        }
+        let _ = ctl.stop();
+        match cap.start_with(w, cap.flags.skip_static) {
+            Ok(c) => {
+                ctl = c;
+                now.store(w, Ordering::Relaxed);
+                cap.flags.stats.cursor_separate.store(!w, Ordering::Relaxed);
+                cap.flags.force_key.store(true, Ordering::Relaxed);
+            }
+            Err(_) => match cap.start_with(!w, cap.flags.skip_static) {
+                Ok(c) => {
+                    ctl = c; // 换不过去就保持原样
+                    want.store(!w, Ordering::Relaxed);
+                }
+                Err(_) => return,
+            },
+        }
+    }
+}
+
+/// 共享的显示器在桌面上的位置（物理像素）
+#[cfg(windows)]
+fn monitor_rect(device: &str) -> Option<(i32, i32, i32, i32)> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+    struct Ctx {
+        name: String,
+        out: Option<(i32, i32, i32, i32)>,
+    }
+    unsafe extern "system" fn cb(m: HMONITOR, _: HDC, _: *mut RECT, l: LPARAM) -> BOOL {
+        let ctx = unsafe { &mut *(l.0 as *mut Ctx) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(m, &mut info as *mut _ as *mut MONITORINFO) }.as_bool() {
+            let len = info.szDevice.iter().position(|c| *c == 0).unwrap_or(info.szDevice.len());
+            if String::from_utf16_lossy(&info.szDevice[..len]) == ctx.name {
+                let r = info.monitorInfo.rcMonitor;
+                ctx.out = Some((r.left, r.top, r.right - r.left, r.bottom - r.top));
+                return BOOL(0);
+            }
+        }
+        BOOL(1)
+    }
+    let mut ctx = Ctx { name: device.to_string(), out: None };
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut ctx as *mut Ctx as isize));
+    }
+    ctx.out
+}
+
+/// 当前鼠标：(x, y 桌面物理像素, 形状, 显示着)
+#[cfg(windows)]
+fn cursor_now() -> Option<(i32, i32, u8, bool)> {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut ci) }.ok()?;
+    let visible = ci.flags.0 & CURSOR_SHOWING.0 != 0;
+    let shape = {
+        let is = |id: windows::core::PCWSTR| unsafe { LoadCursorW(None, id) }.is_ok_and(|h| h.0 == ci.hCursor.0);
+        if is(IDC_IBEAM) {
+            udp::CURSOR_IBEAM
+        } else if is(IDC_HAND) {
+            udp::CURSOR_HAND
+        } else if is(IDC_CROSS) {
+            udp::CURSOR_CROSS
+        } else if is(IDC_WAIT) || is(IDC_APPSTARTING) {
+            udp::CURSOR_WAIT
+        } else if is(IDC_SIZEWE) {
+            udp::CURSOR_SIZE_WE
+        } else if is(IDC_SIZENS) {
+            udp::CURSOR_SIZE_NS
+        } else if is(IDC_SIZEALL) {
+            udp::CURSOR_SIZE_ALL
+        } else {
+            udp::CURSOR_ARROW
+        }
+    };
+    Some((ci.ptScreenPos.x, ci.ptScreenPos.y, shape, visible))
+}
+
+/// 截屏不带鼠标时，每 16 ms 看一次鼠标，有变化就发给观看者（没变化也每 250 ms 发一次，观看端据此知道还在）
+fn cursor_loop(device: String, state: Arc<VoiceState>, stop: Arc<AtomicBool>, in_video: Arc<AtomicBool>) {
+    let mut rect = monitor_rect(&device);
+    let (mut last, mut last_sent, mut rect_at) = (None, Instant::now(), Instant::now());
+    let mut buf = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(16));
+        if in_video.load(Ordering::Relaxed) {
+            continue;
+        }
+        if rect_at.elapsed() > Duration::from_secs(5) {
+            rect = monitor_rect(&device); // 改了分辨率 / 显示器排列
+            rect_at = Instant::now();
+        }
+        let (Some((rx, ry, rw, rh)), Some((x, y, shape, vis)), Some(link)) = (rect, cursor_now(), state.current_link()) else { continue };
+        if !link.has_watchers() {
+            continue;
+        }
+        let inside = x >= rx && y >= ry && x < rx + rw && y < ry + rh;
+        let nx = (((x - rx).clamp(0, rw) as f32 / rw.max(1) as f32) * 65535.0) as u16;
+        let ny = (((y - ry).clamp(0, rh) as f32 / rh.max(1) as f32) * 65535.0) as u16;
+        let now = (nx, ny, shape, vis && inside);
+        if Some(now) == last && last_sent.elapsed() < Duration::from_millis(250) {
+            continue;
+        }
+        last = Some(now);
+        last_sent = Instant::now();
+        let Some(e2e) = state.e2e.lock().unwrap().clone() else { continue };
+        let blob = e2e.lock().unwrap().encrypt_stream(voc_proto::e2e::STREAM_CURSOR, &udp::cursor_payload(nx, ny, shape, now.3));
+        link.send_stream(udp::CURSOR, &blob, &mut buf);
+    }
+}
+
 pub struct Sharer {
     pub cfg: ShareConfig,
     state: Arc<VoiceState>,
@@ -590,8 +940,6 @@ pub struct Sharer {
 
 impl Sharer {
     pub fn start(cfg: ShareConfig, state: Arc<VoiceState>) -> Result<Self, String> {
-        use windows_capture::capture::GraphicsCaptureApiHandler;
-        use windows_capture::settings::*;
         let monitor = windows_capture::monitor::Monitor::from_index(cfg.monitor + 1)
             .or_else(|_| windows_capture::monitor::Monitor::primary())
             .map_err(|e| format!("找不到显示器：{e}"))?;
@@ -602,26 +950,37 @@ impl Sharer {
         let gpu = Arc::new(AtomicBool::new(std::env::var_os("VOC_NO_GPU_PIPE").is_none()));
         let key_requests = Arc::new(AtomicU32::new(0));
         let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
-        let settings = Settings::new(
-            monitor,
-            CursorCaptureSettings::WithCursor,
-            DrawBorderSettings::WithoutBorder,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Custom(interval.mul_f32(0.9)),
-            DirtyRegionSettings::Default,
-            ColorFormat::Bgra8,
-            CapFlags { tx, gpu: gpu.clone(), stats: stats.clone(), stop: stop.clone(), interval },
-        );
-        CapHandler::start_free_threaded(settings).map_err(|e| format!("屏幕采集启动失败：{e}"))?;
+        let device = monitor.device_name().unwrap_or_default();
+        let cap = CaptureCfg {
+            monitor_index: cfg.monitor,
+            interval,
+            flags: CapFlags { tx, skip_static: cfg.skip_static, force_key: force_key.clone(), gpu: gpu.clone(), stats: stats.clone(), stop: stop.clone(), interval },
+        };
+        // 一开始把鼠标画进画面；观看者全都会自己画鼠标时换成不带鼠标的截屏、单独发鼠标位置
+        let (ctl, skip_ok) = cap.start(true).map_err(|e| format!("屏幕采集启动失败：{e}"))?;
+        let cursor_in_video = Arc::new(AtomicBool::new(true));
+        let want_cursor_in_video = Arc::new(AtomicBool::new(true));
+        {
+            let (stop, now, want) = (stop.clone(), cursor_in_video.clone(), want_cursor_in_video.clone());
+            std::thread::Builder::new()
+                .name("capture-mgr".into())
+                .spawn(move || capture_manager(cap, ctl, skip_ok, stop, now, want))
+                .map_err(|e| e.to_string())?;
+        }
+        {
+            let (stop, now, st) = (stop.clone(), cursor_in_video.clone(), state.clone());
+            let _ = std::thread::Builder::new().name("cursor".into()).spawn(move || cursor_loop(device, st, stop, now));
+        }
 
         // 画面码率计入 P2P 上行预算
         if let Some(l) = state.current_link() {
             l.set_video_bps(cfg.bitrate());
         }
         let (st, fk, sp, stx, c2, kr) = (state.clone(), force_key.clone(), stop.clone(), stats.clone(), cfg.clone(), key_requests.clone());
+        let wc = want_cursor_in_video.clone();
         std::thread::Builder::new()
             .name("video-encode".into())
-            .spawn(move || encode_loop(c2, rx, st, fk, sp, stx, gpu, kr))
+            .spawn(move || encode_loop(c2, rx, st, fk, sp, stx, gpu, kr, wc))
             .map_err(|e| e.to_string())?;
         Ok(Self { cfg, state, stop, force_key, key_requests, stats })
     }
@@ -641,28 +1000,99 @@ impl Drop for Sharer {
     }
 }
 
-/// 冗余校验包的比例：每秒按「被请求补发的分片 / 发出的分片」估计丢包率。
-/// 丢包 ≥ 3% 每 5 片加 1 个校验包，≥ 0.3% 每 10 片加 1 个；没丢包 10 秒后关掉。返回 (k, 剩余保持秒数)
-pub fn fec_level(k: usize, hold: u32, sent: u32, nacked: u32) -> (usize, u32) {
-    if sent < 50 {
-        return (k, hold); // 这一秒发得太少，不好判断
-    }
-    let loss = nacked as f32 / sent as f32;
-    let want = if loss >= 0.03 {
-        5
-    } else if loss >= 0.003 {
-        10
-    } else {
-        0
-    };
-    if want > 0 && (k == 0 || want <= k) {
-        (want, 10)
-    } else if hold > 0 {
-        (k, hold - 1)
-    } else {
-        (want, 0)
+/// Reed-Solomon 冗余比例（校验片 / 数据片），按观看者回报的原始丢包率（千分之几，最近 5 秒最大值）：
+/// 不到 0.5% 不加；30% 丢包时 1.2 倍（一组 k 片数据配 1.2k 片校验，收到任意 k 片就能还原）
+pub fn fec_ratio(loss_permille: u16) -> f32 {
+    match loss_permille {
+        0..5 => 0.0,
+        5..30 => 0.15,
+        30..80 => 0.35,
+        80..150 => 0.6,
+        150..250 => 0.9,
+        _ => 1.2,
     }
 }
+
+/// 关键帧的冗余更高（丢了要等下一张关键帧，代价大）：至少 10%，最多 1.5 倍
+pub fn key_fec_ratio(r: f32) -> f32 {
+    (r * 1.5).clamp(0.1, voc_proto::udp::RS_MAX_RATIO)
+}
+
+/// 长期参考帧（只用于原画层）：两个槽轮流存，观看者解码成功后确认。
+/// 有人丢了帧就发一帧只参考「所有观看者都确认过的那个槽」的恢复帧，代替整张关键帧
+struct LtrState {
+    epoch: u32,
+    /// 两个槽里各存的是哪一帧
+    slots: [Option<u32>; 2],
+    /// 每个观看者确认过的长期参考帧（只留最近几个）
+    acks: HashMap<u32, Vec<u32>>,
+    last_mark: Instant,
+    last_recover: Instant,
+    /// 统计：发了几帧恢复帧
+    recovers: u32,
+}
+
+/// 多久存一个新的长期参考帧
+const LTR_MARK_EVERY: Duration = Duration::from_secs(1);
+/// 恢复帧最快多久发一次
+const LTR_RECOVER_GAP: Duration = Duration::from_millis(250);
+
+impl LtrState {
+    fn new() -> Self {
+        let past = Instant::now() - Duration::from_secs(10);
+        Self { epoch: u32::MAX, slots: [None; 2], acks: HashMap::new(), last_mark: past, last_recover: past, recovers: 0 }
+    }
+
+    fn reset(&mut self, epoch: u32) {
+        self.epoch = epoch;
+        self.slots = [None; 2];
+        self.acks.clear();
+    }
+
+    fn ack(&mut self, by: u32, frame: u32) {
+        let v = self.acks.entry(by).or_default();
+        if !v.contains(&frame) {
+            v.push(frame);
+            if v.len() > 8 {
+                v.remove(0);
+            }
+        }
+    }
+
+    /// 能用长期参考帧的观看者（确认过的）
+    fn capable(&self, ids: &[u32]) -> Vec<u32> {
+        ids.iter().copied().filter(|i| self.acks.contains_key(i)).collect()
+    }
+
+    /// 所有能用的观看者都确认过的槽（取最新的那个）
+    fn common_slot(&self, cap: &[u32]) -> Option<u8> {
+        if cap.is_empty() {
+            return None;
+        }
+        (0..2u8)
+            .filter_map(|s| self.slots[s as usize].map(|f| (s, f)))
+            .filter(|(_, f)| cap.iter().all(|i| self.acks.get(i).is_some_and(|v| v.contains(f))))
+            .max_by_key(|(_, f)| *f)
+            .map(|(s, _)| s)
+    }
+
+    /// 存新长期参考帧用哪个槽：不能覆盖大家都确认过的那个
+    fn free_slot(&self, cap: &[u32]) -> u8 {
+        match self.common_slot(cap) {
+            Some(s) => 1 - s,
+            None => match self.slots {
+                [None, _] => 0,
+                [_, None] => 1,
+                [Some(a), Some(b)] => u8::from(b < a),
+            },
+        }
+    }
+}
+
+/// 观看者原始丢包率 ≥ 这个值（千分之几）且是直连的：画面直连和经服务器两条路同时发
+pub const DUAL_PATH_LOSS: u16 = 100;
+/// 观看者请求的关键帧，最快这么久发一张（新观看者加入不受限）
+const KEY_REQUEST_GAP: Duration = Duration::from_millis(500);
 
 /// 码率自适应：每秒看一次。观看者频繁要关键帧（≥2 次 / 秒）或匀速队列丢包 → 降到 70%（最低 30%）；
 /// 连续 4 秒正常 → 每秒回升 10%，直到设定值
@@ -690,11 +1120,14 @@ fn encode_loop(
     stats: Arc<ShareStats>,
     gpu_flag: Arc<AtomicBool>,
     key_requests: Arc<AtomicU32>,
+    want_cursor_in_video: Arc<AtomicBool>,
 ) {
     let pref = cfg.encoder.clone();
     let (main_bps, low_bps) = (cfg.bitrate(), cfg.low_layer().bitrate());
+    let (cfg_auto_res, cfg_height) = (cfg.auto_res, cfg.height);
     // 冗余校验包：按观看者请求补发的比例（≈丢包率）决定每几片加一个校验包，0 = 不加
-    let (mut fec_k, mut fec_hold) = (0usize, 0u32);
+    let (mut fec_main, mut fec_low) = (0.0f32, 0.0f32);
+    let mut ltr = LtrState::new();
     let mut low_enc = VideoEncoder::new(cfg.low_layer());
     let mut enc = VideoEncoder::new(cfg);
     let mut low_frame_no = 0u32;
@@ -728,17 +1161,61 @@ fn encode_loop(
             skip(&mut enc, &frame);
             continue; // 没人看就不编码，省 CPU 和流量
         }
+        let mut new_watcher = false;
         if ver != last_watchers {
             last_watchers = ver;
-            force_key.store(true, Ordering::Relaxed); // 有新观看者，马上给关键帧
+            new_watcher = true; // 有新观看者，马上给关键帧
         }
+        // 观看者要的关键帧最快 0.5 秒一张（高延迟时请求会一直来，连发大关键帧只会把线路挤满）；
         // 每 10 秒兜底一个关键帧（编码器开了逐行刷新时 60 秒）
         let periodic = Duration::from_secs(if enc.intra_refresh() { 60 } else { 10 });
-        let key = force_key.swap(false, Ordering::Relaxed) || last_key.elapsed() > periodic;
+        let requested = force_key.load(Ordering::Relaxed) && last_key.elapsed() >= KEY_REQUEST_GAP;
+        if new_watcher || requested {
+            force_key.store(false, Ordering::Relaxed);
+        }
+        let key = new_watcher || requested || last_key.elapsed() > periodic;
         // 两层：原画给大多数人，360P 低画质层给选了「流畅」的人；哪层没人看就不编码
         let (main_ids, low_ids) = (link.layer_watchers(false), link.layer_watchers(true));
         let (want_main, want_low) = (!main_ids.is_empty(), !low_ids.is_empty());
         stats.low_watchers.store(low_ids.len() as u32, Ordering::Relaxed);
+        // 长期参考帧（原画层、编码器支持时）：关键帧存进槽 0；定期存新的；有人丢帧就发恢复帧
+        if want_main && enc.ltr_supported() {
+            if enc.ltr_epoch() != ltr.epoch {
+                ltr.reset(enc.ltr_epoch());
+            }
+            for (by, f) in link.take_ltr_acks() {
+                ltr.ack(by, f);
+            }
+            let cap = ltr.capable(&main_ids);
+            let mut tag = LtrTag::default();
+            if key {
+                tag.mark = Some(0);
+            } else if link.take_ltr_recover() {
+                match ltr.common_slot(&cap) {
+                    Some(s) if ltr.last_recover.elapsed() >= LTR_RECOVER_GAP => {
+                        tag.use_slot = Some(s);
+                        ltr.last_recover = Instant::now();
+                        ltr.recovers += 1;
+                    }
+                    Some(_) => link.keep_ltr_recover(),
+                    None => force_key.store(true, Ordering::Relaxed), // 没有大家都确认过的：只能发关键帧
+                }
+            }
+            if tag.use_slot.is_none() && tag.mark.is_none() && ltr.last_mark.elapsed() >= LTR_MARK_EVERY {
+                tag.mark = Some(ltr.free_slot(&cap));
+            }
+            if tag.mark.is_some() {
+                ltr.last_mark = Instant::now();
+            }
+            enc.set_ltr(tag);
+            stats.ltr_recovers.store(ltr.recovers, Ordering::Relaxed);
+        } else {
+            // 不用长期参考帧时，恢复请求当关键帧请求
+            if link.take_ltr_recover() {
+                force_key.store(true, Ordering::Relaxed);
+            }
+            let _ = link.take_ltr_acks();
+        }
         // 选格式：这一层所有观看者都能解的里面最省带宽的；硬件编码器出过错就退回软件编码
         let caps_of = |ids: &[u32]| -> Vec<Vec<String>> {
             let all = state.caps.lock().unwrap();
@@ -797,6 +1274,7 @@ fn encode_loop(
                     Some(e) => {
                         // 显卡直通不行：这次共享改用 CPU 转换（硬件编码照用）
                         *stats.error.lock().unwrap() = Some(format!("显卡直通不可用（{e}），已改用 CPU 转换"));
+                        crate::applog::log(format!("屏幕共享：显卡直通不可用（{e}），改用 CPU 转换"));
                         gpu_broken = true;
                         gpu_flag.store(false, Ordering::Relaxed);
                         force_key.store(true, Ordering::Relaxed);
@@ -833,6 +1311,7 @@ fn encode_loop(
             Ok(f) => f,
             Err(e) => {
                 *stats.error.lock().unwrap() = Some(format!("{e}，已改用 CPU 编码"));
+                crate::applog::log(format!("屏幕共享：{e}，改用 CPU 编码"));
                 hw_broken = true;
                 force_key.store(true, Ordering::Relaxed);
                 continue;
@@ -857,6 +1336,18 @@ fn encode_loop(
             let sealed = e2e.lock().unwrap().encrypt_video(&with_dims(&ef));
             // 两层各自编帧号（接收端按帧号判断丢帧）
             let mut flags = udp::video_flags(ef.key, ef.codec.id());
+            if !low {
+                if ef.key {
+                    ltr.slots = [None; 2];
+                }
+                if let Some(s) = ef.ltr_mark.filter(|s| *s < 2) {
+                    ltr.slots[s as usize] = Some(frame_no);
+                    flags |= udp::VIDEO_LTR;
+                }
+                if ef.recover {
+                    flags |= udp::VIDEO_RECOVER;
+                }
+            }
             let no = if low {
                 flags |= udp::VIDEO_LOW;
                 &mut low_frame_no
@@ -864,8 +1355,10 @@ fn encode_loop(
                 &mut frame_no
             };
             let mut frags = udp::video_fragments(*no, flags, &sealed);
-            if fec_k > 0 {
-                frags.extend(udp::fec_parities(*no, flags, &sealed, fec_k));
+            let r = if low { fec_low } else { fec_main };
+            let r = if ef.key { key_fec_ratio(r) } else { r };
+            if r > 0.0 {
+                frags.extend(udp::rs_parities(*no, flags, &sealed, r));
             }
             *no = no.wrapping_add(1);
             link.send_video(&frags, &mut buf, low);
@@ -878,16 +1371,36 @@ fn encode_loop(
             }
         }
         if sec_start.elapsed() >= Duration::from_secs(1) {
-            // 码率自适应：只调「流畅」层；「原画」层固定按设定码率（选原画的人要的就是清楚，网络扛不住的自己切流畅）
-            let new_scale = adapt_rate(scale, &mut calm, key_requests.swap(0, Ordering::Relaxed), link.take_pace_drops());
+            // 码率自适应：默认只调「流畅」层，「原画」层固定按设定码率（选原画的人要的就是清楚，网络扛不住的自己切流畅）。
+            // 用户打开「网络差时自动降分辨率」后，原画层也跟着调：码率按比例降，分辨率按档位降
+            let (sent, nacked) = link.take_video_loss();
+            // 补发比例 ≥ 5% 也算拥堵
+            let lossy = sent >= 50 && nacked as f32 / sent as f32 >= 0.05;
+            let keys = key_requests.swap(0, Ordering::Relaxed) + if lossy { 2 } else { 0 };
+            let new_scale = adapt_rate(scale, &mut calm, keys, link.take_pace_drops());
             if (new_scale - scale).abs() > 0.01 {
                 scale = new_scale;
                 low_enc.set_rate_scale(scale);
+                if cfg_auto_res {
+                    enc.set_rate_scale(scale);
+                }
             }
-            link.set_video_bps(if want_main { main_bps } else { 0 } + if want_low { (low_bps as f32 * scale) as u32 } else { 0 });
-            let (sent, nacked) = link.take_video_loss();
-            (fec_k, fec_hold) = fec_level(fec_k, fec_hold, sent, nacked);
-            stats.fec_k.store(fec_k as u32, Ordering::Relaxed);
+            if cfg_auto_res {
+                let h = res_for_scale(cfg_height, scale);
+                enc.set_height(h);
+                stats.auto_height.store(if h < cfg_height { h } else { 0 }, Ordering::Relaxed);
+            }
+            let main_now = if cfg_auto_res { (main_bps as f32 * scale) as u32 } else { main_bps };
+            link.set_video_bps(if want_main { main_now } else { 0 } + if want_low { (low_bps as f32 * scale) as u32 } else { 0 });
+            // 观看者都会自己画鼠标：截屏不带鼠标、单独发；有人不会（旧版本）就画进画面
+            want_cursor_in_video.store(!link.all_watchers_draw_cursor(), Ordering::Relaxed);
+            // 冗余比例按各层观看者回报的丢包率；丢包很高的直连观看者两条路同时发
+            let (loss_main, loss_low) = (link.layer_loss(false), link.layer_loss(true));
+            (fec_main, fec_low) = (fec_ratio(loss_main), fec_ratio(loss_low));
+            stats.fec_pct.store((fec_main * 100.0).round() as u32, Ordering::Relaxed);
+            stats.viewer_loss.store(loss_main.max(loss_low) as u32, Ordering::Relaxed);
+            stats.dual_viewers.store(link.update_dual_video(DUAL_PATH_LOSS) as u32, Ordering::Relaxed);
+            stats.resent_total.fetch_add(nacked, Ordering::Relaxed);
             stats.rate_pct.store((scale * 100.0).round() as u32, Ordering::Relaxed);
             let secs = sec_start.elapsed().as_secs_f64();
             stats.fps.store((sec_frames as f64 / secs).round() as u32, Ordering::Relaxed);
@@ -943,6 +1456,8 @@ pub struct View {
     decode_failed: AtomicBool,
     /// 当前解码方式，例如 "AV1 硬解"
     pub decoder: Mutex<String>,
+    /// 共享者单独发来的鼠标：(x, y 0–1, 形状, 显示着, 收到时间)
+    pub cursor: Mutex<Option<(f32, f32, u8, bool, Instant)>>,
 }
 
 struct Stream {
@@ -950,6 +1465,15 @@ struct Stream {
     asm: crate::vrecv::Assembler,
     need_key: bool,
     last_req: Option<Instant>,
+    /// 请求过几次关键帧（统计）
+    key_requests: u32,
+    /// 确认过共享者的长期参考帧（之后丢了帧可以要恢复帧，不用等关键帧）；这一轮已经要过几次恢复帧
+    ltr_ok: bool,
+    recover_reqs: u32,
+    /// 统计：靠恢复帧接上的次数
+    recovered: u32,
+    /// 上次回报丢包率的时间
+    last_report: Instant,
     dec_tx: SyncSender<(u8, Vec<u8>)>,
     view: Arc<View>,
 }
@@ -961,6 +1485,21 @@ pub struct RxActions {
     pub keyframes: Vec<u32>,
     /// 要请求补发：(共享者, 画质层, 帧号, 缺的分片号)
     pub nacks: Vec<(u32, u8, u32, Vec<u16>)>,
+    /// 回报给共享者的原始丢包率：(共享者, 千分之几, 往返估计 ms)
+    pub reports: Vec<(u32, u16, u32)>,
+    /// 解码成功的长期参考帧：(共享者, 帧号)
+    pub ltr_acks: Vec<(u32, u32)>,
+    /// 请求恢复帧（代替关键帧）的共享者
+    pub recovers: Vec<u32>,
+}
+
+/// 处理某个共享者的画面时需要的外部信息
+#[derive(Default, Debug, Clone, Copy)]
+pub struct SenderInfo {
+    /// 他支持补发
+    pub rtx: bool,
+    /// 线路往返时间参考（ms，0 = 不知道）
+    pub rtt_hint: u32,
 }
 
 #[derive(Default)]
@@ -988,7 +1527,21 @@ impl VideoRx {
         let (tx, rx) = mpsc::sync_channel::<(u8, Vec<u8>)>(64);
         let (v, ctx) = (view.clone(), self.ctx.lock().unwrap().clone());
         std::thread::Builder::new().name("video-decode".into()).spawn(move || decode_loop(rx, v, ctx)).ok()?;
-        s.insert(from, Stream { asm: Default::default(), need_key: true, last_req: None, dec_tx: tx, view: view.clone() });
+        s.insert(
+            from,
+            Stream {
+                asm: Default::default(),
+                need_key: true,
+                last_req: None,
+                key_requests: 0,
+                ltr_ok: false,
+                recover_reqs: 0,
+                recovered: 0,
+                last_report: Instant::now(),
+                dec_tx: tx,
+                view: view.clone(),
+            },
+        );
         Some(view)
     }
 
@@ -1000,7 +1553,7 @@ impl VideoRx {
     pub fn on_packet(
         &self,
         payload: &[u8],
-        rtx: impl Fn(u32) -> bool,
+        info: impl Fn(u32) -> SenderInfo,
         mut decrypt: impl FnMut(u32, &[u8]) -> Option<Vec<u8>>,
     ) -> RxActions {
         let mut acts = RxActions::default();
@@ -1011,23 +1564,39 @@ impl VideoRx {
         if s.asm.add(f, data, now) {
             s.need_key = true;
         }
-        s.pump(from, now, rtx(from), &mut decrypt, &mut acts);
+        s.pump(from, now, info(from), &mut decrypt, &mut acts);
         acts
     }
 
     /// 定时检查（没有新包时也要发现尾巴丢片、超时放弃）
-    pub fn tick(&self, rtx: impl Fn(u32) -> bool, mut decrypt: impl FnMut(u32, &[u8]) -> Option<Vec<u8>>) -> RxActions {
+    pub fn tick(&self, info: impl Fn(u32) -> SenderInfo, mut decrypt: impl FnMut(u32, &[u8]) -> Option<Vec<u8>>) -> RxActions {
         let mut acts = RxActions::default();
         let now = Instant::now();
         for (from, s) in self.streams.lock().unwrap().iter_mut() {
-            s.pump(*from, now, rtx(*from), &mut decrypt, &mut acts);
+            s.pump(*from, now, info(*from), &mut decrypt, &mut acts);
         }
         acts
     }
 
     /// 统计：(校验包恢复的片数, 补发收回的片数)
-    pub fn recovery_stats(&self, from: u32) -> Option<(u32, u32)> {
-        self.streams.lock().unwrap().get(&from).map(|s| (s.asm.fec_recovered, s.asm.rtx_recovered))
+    /// 收某人画面的统计：(累计统计, 请求关键帧次数, 当前往返估计 ms)
+    pub fn rx_stats(&self, from: u32) -> Option<(crate::vrecv::RxStats, u32, u32)> {
+        self.streams.lock().unwrap().get(&from).map(|s| (s.asm.stats, s.key_requests, s.asm.rtt() as u32))
+    }
+
+    /// 收到共享者的鼠标位置
+    pub fn set_cursor(&self, from: u32, x: u16, y: u16, shape: u8, visible: bool) {
+        if let Some(s) = self.streams.lock().unwrap().get(&from) {
+            *s.view.cursor.lock().unwrap() = Some((x as f32 / 65535.0, y as f32 / 65535.0, shape, visible, Instant::now()));
+            if let Some(c) = &*self.ctx.lock().unwrap() {
+                c.request_repaint();
+            }
+        }
+    }
+
+    /// 靠恢复帧（长期参考帧）接上的次数
+    pub fn recovered_count(&self, from: u32) -> u32 {
+        self.streams.lock().unwrap().get(&from).map(|s| s.recovered).unwrap_or(0)
     }
 }
 
@@ -1036,38 +1605,70 @@ impl Stream {
         &mut self,
         from: u32,
         now: Instant,
-        rtx: bool,
+        info: SenderInfo,
         decrypt: &mut impl FnMut(u32, &[u8]) -> Option<Vec<u8>>,
         acts: &mut RxActions,
     ) {
+        let rtx = info.rtx;
+        self.asm.set_rtt_hint(info.rtt_hint);
         if self.view.decode_failed.swap(false, Ordering::Relaxed) {
             self.need_key = true;
         }
-        let out = self.asm.poll(now, self.need_key, rtx);
+        let before_layer = self.asm.layer();
+        // 断档后能接着解的：关键帧；确认过长期参考帧的话，恢复帧也行
+        let restart = if self.need_key { VIDEO_KEY | if self.ltr_ok { udp::VIDEO_RECOVER } else { 0 } } else { 0 };
+        let out = self.asm.poll(now, restart, rtx);
         if out.gap {
             self.need_key = true; // 中间丢了帧，之后的非关键帧解不对
         }
-        for (_, flags, blob) in out.frames {
+        if self.asm.layer() != before_layer {
+            self.ltr_ok = false; // 换了画质层：长期参考帧是另一层的
+        }
+        for (frame_id, flags, blob) in out.frames {
             let key = flags & VIDEO_KEY != 0;
+            let recover = flags & udp::VIDEO_RECOVER != 0 && self.ltr_ok;
             match decrypt(from, &blob) {
-                Some(bits) if key || !self.need_key => {
-                    if key {
+                Some(bits) if key || recover || !self.need_key => {
+                    if (key || recover) && self.need_key {
                         self.need_key = false;
+                        self.recover_reqs = 0;
+                        if recover && !key {
+                            self.recovered += 1;
+                        }
                     }
                     if self.dec_tx.try_send((udp::flags_codec(flags), bits)).is_err() {
                         self.need_key = true; // 解码跟不上，丢帧后要从关键帧重新开始
+                    } else if flags & udp::VIDEO_LTR != 0 {
+                        // 长期参考帧解了：告诉共享者，以后丢帧可以从它恢复
+                        self.ltr_ok = true;
+                        acts.ltr_acks.push((from, frame_id));
                     }
                 }
-                Some(_) => {} // 等关键帧
+                Some(_) => {} // 等关键帧 / 恢复帧
                 None => self.need_key = true,
             }
         }
         let layer = self.asm.layer();
         acts.nacks.extend(out.nacks.into_iter().map(|(frame, idxs)| (from, layer, frame, idxs)));
-        // 需要关键帧时，最多每 300 ms 请求一次
-        if self.need_key && self.last_req.is_none_or(|t| now.duration_since(t) > Duration::from_millis(300)) {
+        // 需要关键帧时按往返时间限速请求（至少 300 ms 一次；高延迟时更慢，免得共享者连发大关键帧把线路挤满）
+        let gap = Duration::from_millis((self.asm.rtt() * 2.0 + 100.0).max(300.0) as u64);
+        if self.need_key && self.last_req.is_none_or(|t| now.duration_since(t) > gap) {
             self.last_req = Some(now);
-            acts.keyframes.push(from);
+            // 确认过长期参考帧：先要恢复帧（只有关键帧的零头大小）；要了 3 次还没接上再要关键帧
+            if self.ltr_ok && self.recover_reqs < 3 {
+                self.recover_reqs += 1;
+                acts.recovers.push(from);
+            } else {
+                self.key_requests += 1;
+                acts.keyframes.push(from);
+            }
+        }
+        // 每秒回报一次原始丢包率（共享者据此调冗余）
+        if now.duration_since(self.last_report) >= Duration::from_secs(1) {
+            self.last_report = now;
+            if let Some(loss) = self.asm.take_loss() {
+                acts.reports.push((from, loss, self.asm.rtt() as u32));
+            }
         }
     }
 }
@@ -1097,6 +1698,9 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
     let mut dec: Option<(Codec, bool, (u32, u32), Dec)> = None;
     let (mut sec_start, mut sec_frames) = (Instant::now(), 0u32);
     let mut spare: Vec<u8> = Vec::new();
+    // 硬解连续出错这么多次：这一路改用软解（有的显卡驱动对某些码流解不了）
+    const HW_FAIL_LIMIT: u32 = 5;
+    let (mut hw_fails, mut hw_broken) = (0u32, false);
     while let Ok(first) = rx.recv() {
         // 必须每帧都解码（P 帧依赖前一帧），但积压时只把最新一帧转成 RGBA 显示
         let mut batch = vec![first];
@@ -1105,7 +1709,7 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
         for (i, (cid, bits)) in batch.iter().enumerate() {
             let codec = Codec::from_id(*cid);
             let Some((w0, h0, bits)) = split_dims(codec, bits) else { continue };
-            let hw = HW_DECODE.load(Ordering::Relaxed);
+            let hw = HW_DECODE.load(Ordering::Relaxed) && !hw_broken;
             // 格式 / 尺寸 / 软硬解设置变了就换解码器（H.264 不带尺寸，尺寸恒为 0）
             if !matches!(&dec, Some((c, h, dims, _)) if *c == codec && *h == hw && *dims == (w0, h0)) {
                 dec = make_decoder(codec, hw, w0, h0).map(|d| (codec, hw, (w0, h0), d));
@@ -1142,11 +1746,23 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
                 },
                 Dec::Mf(m) => match m.decode(bits) {
                     Ok(frames) => {
+                        if !frames.is_empty() {
+                            hw_fails = 0;
+                        }
                         if let (true, Some(f)) = (show, frames.last()) {
                             publish(f.width, f.height, &mut |buf| nv12_to_rgba(&f.data, f.width, f.height, buf));
                         }
                     }
-                    Err(_) => view.decode_failed.store(true, Ordering::Relaxed),
+                    Err(_) => {
+                        view.decode_failed.store(true, Ordering::Relaxed);
+                        if m.hardware {
+                            hw_fails += 1;
+                            if hw_fails >= HW_FAIL_LIMIT && !hw_broken {
+                                hw_broken = true; // 下一帧起换成软解
+                                crate::applog::log(format!("观看：{} 硬解连续出错，改用软解", codec.label()));
+                            }
+                        }
+                    }
                 },
             }
         }
@@ -1217,7 +1833,7 @@ mod tests {
                 frags.pop(); // 第 4 帧丢一片 → 之后要等关键帧
             }
             for f in frags {
-                key_requests += rx.on_packet(&udp::server_video(7, &f), |_| false, |from, b| rk.decrypt_video(from, b)).keyframes.len();
+                key_requests += rx.on_packet(&udp::server_video(7, &f), |_| SenderInfo::default(), |from, b| rk.decrypt_video(from, b)).keyframes.len();
             }
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -1227,7 +1843,7 @@ mod tests {
         assert_eq!(fr.rgba.len(), 854 * 480 * 4);
         assert!(key_requests >= 1, "packet loss must trigger a keyframe request");
         // 没在看的人的包直接丢弃
-        assert_eq!(rx.on_packet(&udp::server_video(99, &udp::video_fragments(0, VIDEO_KEY, b"x")[0]), |_| true, |_, _| None), RxActions::default());
+        assert_eq!(rx.on_packet(&udp::server_video(99, &udp::video_fragments(0, VIDEO_KEY, b"x")[0]), |_| SenderInfo { rtx: true, rtt_hint: 0 }, |_, _| None), RxActions::default());
     }
 
     #[test]
@@ -1237,7 +1853,7 @@ mod tests {
         let need_key = || rx.streams.lock().unwrap()[&7].need_key;
         let feed = |frame: u32, flags: u8| {
             let f = udp::video_fragments(frame, flags, b"x");
-            rx.on_packet(&udp::server_video(7, &f[0]), |_| true, |_, b| Some(b.to_vec()));
+            rx.on_packet(&udp::server_video(7, &f[0]), |_| SenderInfo { rtx: true, rtt_hint: 0 }, |_, b| Some(b.to_vec()));
         };
         // 原画：关键帧后连续的 P 帧不用再要关键帧
         feed(100, udp::VIDEO_KEY);
@@ -1260,22 +1876,22 @@ mod tests {
         let f0 = udp::video_fragments(0, udp::VIDEO_KEY, &data);
         let f1 = udp::video_fragments(1, 0, &data);
         for f in &f0 {
-            rx.on_packet(&udp::server_video(7, f), |_| true, |_, b| Some(b.to_vec())); // 开头没关键帧时会要一次，正常
+            rx.on_packet(&udp::server_video(7, f), |_| SenderInfo { rtx: true, rtt_hint: 0 }, |_, b| Some(b.to_vec())); // 开头没关键帧时会要一次，正常
         }
         let mut acts = RxActions::default();
         for (i, f) in f1.iter().enumerate() {
             if i != 1 {
-                let a = rx.on_packet(&udp::server_video(7, f), |_| true, |_, b| Some(b.to_vec()));
+                let a = rx.on_packet(&udp::server_video(7, f), |_| SenderInfo { rtx: true, rtt_hint: 0 }, |_, b| Some(b.to_vec()));
                 acts.keyframes.extend(a.keyframes);
                 acts.nacks.extend(a.nacks);
             }
         }
         assert!(acts.keyframes.is_empty(), "{acts:?}");
         std::thread::sleep(Duration::from_millis(40));
-        let a = rx.tick(|_| true, |_, b| Some(b.to_vec()));
+        let a = rx.tick(|_| SenderInfo { rtx: true, rtt_hint: 0 }, |_, b| Some(b.to_vec()));
         assert_eq!(a.nacks, vec![(7, 0, 1, vec![1])]);
         assert!(a.keyframes.is_empty());
-        let a = rx.on_packet(&udp::server_video(7, &f1[1]), |_| true, |_, b| Some(b.to_vec()));
+        let a = rx.on_packet(&udp::server_video(7, &f1[1]), |_| SenderInfo { rtx: true, rtt_hint: 0 }, |_, b| Some(b.to_vec()));
         assert_eq!(a, RxActions::default());
         assert!(!rx.streams.lock().unwrap()[&7].need_key);
     }
@@ -1325,21 +1941,65 @@ mod tests {
     }
 
     #[test]
-    fn fec_follows_loss() {
-        // 没丢包：不加
-        assert_eq!(fec_level(0, 0, 1000, 0), (0, 0));
-        // 1% 丢包：每 10 片一个；5%：每 5 片一个
-        assert_eq!(fec_level(0, 0, 1000, 10), (10, 10));
-        assert_eq!(fec_level(10, 10, 1000, 50), (5, 10));
-        // 丢包变少：保持 10 秒再降
-        let (mut k, mut h) = (5, 10);
-        for _ in 0..10 {
-            (k, h) = fec_level(k, h, 1000, 0);
-            assert_eq!(k, 5);
-        }
-        assert_eq!(fec_level(k, h, 1000, 0), (0, 0));
-        // 发得太少不判断
-        assert_eq!(fec_level(5, 3, 10, 10), (5, 3));
+    fn ltr_slots_protect_common_reference() {
+        let mut l = LtrState::new();
+        l.reset(1);
+        l.slots = [Some(10), None];
+        // 没人确认过：没有公共槽；新的存进空槽
+        assert_eq!(l.common_slot(&l.capable(&[1, 2])), None);
+        assert_eq!(l.free_slot(&[]), 1);
+        l.ack(1, 10);
+        l.ack(2, 10);
+        let cap = l.capable(&[1, 2, 3]); // 3 是旧版本，从不确认
+        assert_eq!(cap, vec![1, 2]);
+        assert_eq!(l.common_slot(&cap), Some(0));
+        // 大家都确认的槽 0 不能被覆盖
+        assert_eq!(l.free_slot(&cap), 1);
+        l.slots[1] = Some(40);
+        l.ack(1, 40);
+        assert_eq!(l.common_slot(&cap), Some(0), "only one viewer has 40");
+        l.ack(2, 40);
+        assert_eq!(l.common_slot(&cap), Some(1));
+        assert_eq!(l.free_slot(&cap), 0);
+    }
+
+    #[test]
+    fn fec_follows_reported_loss() {
+        assert_eq!(fec_ratio(0), 0.0);
+        assert_eq!(fec_ratio(10), 0.15);
+        assert_eq!(fec_ratio(100), 0.6);
+        assert_eq!(fec_ratio(300), 1.2);
+        // 关键帧更高，但有上限
+        assert_eq!(key_fec_ratio(0.0), 0.1);
+        assert!((key_fec_ratio(0.6) - 0.9).abs() < 1e-6);
+        assert_eq!(key_fec_ratio(1.2), voc_proto::udp::RS_MAX_RATIO);
+    }
+
+    #[test]
+    fn auto_resolution_steps() {
+        assert_eq!(res_for_scale(1080, 1.0), 1080);
+        assert_eq!(res_for_scale(1080, 0.7), 900);
+        assert_eq!(res_for_scale(1080, 0.49), 720);
+        assert_eq!(res_for_scale(1080, 0.3), 540);
+        assert_eq!(res_for_scale(720, 0.7), 540);
+        assert_eq!(res_for_scale(720, 0.3), 540);
+        assert_eq!(res_for_scale(480, 0.3), 480, "never below the lowest step the user picked");
+    }
+
+    #[test]
+    fn static_frames_skipped_only_when_safe() {
+        let ms = |m| Some(Duration::from_millis(m));
+        assert!(can_skip_static(Some((0, 0)), true, ms(100), false), "nothing changed");
+        assert!(!can_skip_static(Some((0, 0)), true, ms(1200), false), "at least one frame per second");
+        // 变化很小（时钟、光标）：最多每秒 10 帧
+        assert!(can_skip_static(Some((1, 4)), true, ms(50), false));
+        assert!(!can_skip_static(Some((1, 4)), true, ms(110), false));
+        // 大范围变化：照常发
+        assert!(!can_skip_static(Some((2, 300)), true, ms(5), false), "screen changed a lot");
+        assert!(!can_skip_static(Some((0, 0)), false, ms(100), false), "system never reported regions: can't trust empty");
+        assert!(!can_skip_static(None, true, ms(100), false), "no dirty info");
+        assert!(!can_skip_static(Some((0, 0)), true, ms(100), true), "someone waits for a keyframe");
+        assert!(!can_skip_static(Some((0, 0)), true, None, false), "first frame");
     }
 
     #[test]
@@ -1438,6 +2098,28 @@ mod tests {
             println!("{name}: fresh decoder from 2nd keyframe decoded {got} frames");
             assert!(keys.len() >= 2 && keys[1].1.contains(&7) && keys[1].1.contains(&5), "{name}: forced keyframe must be IDR with SPS");
             assert!(got > 0, "{name}: a new viewer must be able to start from a forced keyframe");
+        }
+    }
+
+    /// 真实显卡：长期参考帧（LTR）和峰值受限可变码率支不支持（需要显卡，默认不跑）
+    #[test]
+    #[ignore]
+    fn ltr_and_vbr_support() {
+        use windows::Win32::Media::MediaFoundation::*;
+        mfenc::mf_init().unwrap();
+        for info in hw_encoders() {
+            let Ok(enc) = HwEncoder::new(info, 1280, 720, 30, 4_000_000) else { continue };
+            let ltr_ctl = enc.supports(&CODECAPI_AVEncVideoLTRBufferControl);
+            let ltr_mark = enc.supports(&CODECAPI_AVEncVideoMarkLTRFrame);
+            let ltr_use = enc.supports(&CODECAPI_AVEncVideoUseLTRFrame);
+            let ltr_set = enc.try_set(&CODECAPI_AVEncVideoLTRBufferControl, 0x0001_0002);
+            let max_rate = enc.supports(&CODECAPI_AVEncCommonMaxBitRate);
+            let vbr = enc.try_set(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
+            let quality = enc.try_set(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_Quality.0 as u32);
+            println!(
+                "{}: LTR buffer={ltr_ctl} mark={ltr_mark} use={ltr_use} set={ltr_set} | MaxBitRate={max_rate} PeakConstrainedVBR={vbr} Quality={quality}",
+                info.name
+            );
         }
     }
 

@@ -462,6 +462,8 @@ pub struct Link {
     watchers_low: Mutex<Vec<u32>>,
     /// 观看者自己选的画面线路：(选了 P2P 直连的, 选了走服务器的)
     watcher_routes: Mutex<(Vec<u32>, Vec<u32>)>,
+    /// 会自己画鼠标的观看者
+    watchers_cursor: Mutex<Vec<u32>>,
     /// P2P 上行带宽预算（bps）
     budget_bps: AtomicU32,
     /// 正在共享的屏幕码率（bps），没在共享为 0
@@ -474,6 +476,8 @@ pub struct Link {
     relay_enabled: AtomicBool,
     /// 服务器安排的本频道中继路线
     relays: Mutex<Vec<RelayRoute>>,
+    /// 屏幕共享画面中继路线（from = 共享者，via 转给 to）
+    video_relays: Mutex<Vec<RelayRoute>>,
     /// 上次上报链路质量的时间
     last_stats: Mutex<Instant>,
     /// 屏幕画面的匀速发送队列（语音不走这里，直接发）
@@ -511,7 +515,19 @@ pub struct Link {
     /// 发出的画面分片数、被请求补发的分片数（估计丢包率，决定冗余校验包的比例）
     video_frags_sent: AtomicU32,
     video_frags_nacked: AtomicU32,
+    /// 观看者回报的收画面情况：观看者 → (原始丢包率 千分之几, 往返 ms, 时间)
+    video_reports: Mutex<HashMap<u32, (u16, u32, Instant)>>,
+    /// 画面直连 + 经服务器两条路同时发的观看者（丢包很高时）
+    dual_video: Mutex<std::collections::HashSet<u32>>,
+    /// 语音直连 + 经服务器两条路同时发的人（直连有丢包但还没到「不稳」时）
+    dual_voice: Mutex<std::collections::HashSet<u32>>,
+    /// 观看者确认的长期参考帧 (观看者, 帧号)、有没有人请求恢复帧
+    ltr_acks: Mutex<Vec<(u32, u32)>>,
+    ltr_recover: AtomicBool,
 }
+
+/// 直连语音丢包 ≥ 这个百分比：直连和服务器两条路同时发
+const DUAL_VOICE_LOSS: u8 = 5;
 
 /// 补发用的画面历史保留多久
 const VIDEO_HIST: Duration = Duration::from_millis(1000);
@@ -573,7 +589,8 @@ impl Link {
             .filter(|r| r.from == self.my_id && sent.contains(&r.via) && prefs.get(&r.to) != Some(&RoutePref::Server))
             .map(|r| r.to)
             .collect();
-        if others.iter().all(|o| sent.contains(o) || relayed.contains(o)) {
+        let dual = self.dual_voice.lock().unwrap().clone();
+        if others.iter().all(|o| (sent.contains(o) && !dual.contains(o)) || relayed.contains(o)) {
             return; // 频道里只有自己，或全部直连 / 经成员中继：服务器不经手
         }
         let payload = udp::client_voice(seq, frame);
@@ -619,6 +636,36 @@ impl Link {
     /// 服务器下发的本频道中继路线
     pub fn set_relays(&self, routes: Vec<RelayRoute>) {
         *self.relays.lock().unwrap() = routes;
+    }
+
+    pub fn set_video_relays(&self, routes: Vec<RelayRoute>) {
+        *self.video_relays.lock().unwrap() = routes;
+    }
+
+    /// 正在帮人转发画面的路数（界面 / 诊断）、经别人转发给我的共享者
+    pub fn video_relay_info(&self) -> (Vec<RelayRoute>, Vec<RelayRoute>) {
+        let r = self.video_relays.lock().unwrap();
+        (r.iter().filter(|x| x.via == self.my_id).copied().collect(), r.iter().filter(|x| x.to == self.my_id).copied().collect())
+    }
+
+    /// 帮人转发画面：直连收到共享者的画面包，原样（密文）转给安排给我的观看者
+    fn relay_video(&self, peer: u32, payload: &[u8], buf: &mut Vec<u8>) {
+        let Some(from) = payload.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap())) else { return };
+        if from != peer {
+            return; // 只转共享者自己直连发来的，不转转来的
+        }
+        let targets: Vec<u32> = self.video_relays.lock().unwrap().iter().filter(|r| r.via == self.my_id && r.from == from).map(|r| r.to).collect();
+        if targets.is_empty() || !self.relay_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut peers = self.peers.lock().unwrap();
+        for to in targets {
+            let Some(p) = peers.map.get_mut(&to) else { continue };
+            if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
+                s.seal(udp::VIDEO, payload, buf);
+                self.send_raw(buf, path);
+            }
+        }
     }
 
     pub fn relays(&self) -> Vec<RelayRoute> {
@@ -682,6 +729,18 @@ impl Link {
         *wl = low;
     }
 
+    /// 服务器转告：哪些观看者会自己画鼠标
+    pub fn set_watchers_cursor(&self, ids: Vec<u32>) {
+        *self.watchers_cursor.lock().unwrap() = ids;
+    }
+
+    /// 观看者都会自己画鼠标（有人看时）
+    pub fn all_watchers_draw_cursor(&self) -> bool {
+        let w = self.watchers.lock().unwrap().clone();
+        let c = self.watchers_cursor.lock().unwrap();
+        !w.is_empty() && w.iter().all(|i| c.contains(i))
+    }
+
     /// 服务器转告：观看者自己选的画面线路
     pub fn set_watcher_routes(&self, direct: Vec<u32>, server: Vec<u32>) {
         *self.watcher_routes.lock().unwrap() = (direct, server);
@@ -739,7 +798,18 @@ impl Link {
                 }
             }
         }
-        if direct == watchers.len() {
+        let dual = self.dual_video.lock().unwrap().iter().filter(|i| watchers.contains(i)).count();
+        // 经观看者转发能送到的人（转发的人得是我这次直连发到的）
+        let relayed = {
+            let chosen = self.alloc.lock().unwrap().1.clone();
+            self.video_relays
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.from == self.my_id && watchers.contains(&r.to) && chosen.contains(&r.via) && !chosen.contains(&r.to))
+                .count()
+        };
+        if direct + relayed >= watchers.len() && dual == 0 {
             return;
         }
         let udp_ok = self.udp_ok.load(Ordering::Relaxed);
@@ -817,6 +887,12 @@ impl Link {
             punching: count(&|s| matches!(s, PunchState::Punching(_))),
             failed: count(&|s| matches!(s, PunchState::Failed(_))),
             nat: *self.nat.lock().unwrap(),
+            probe: match (self.probe, *self.probe_addr.lock().unwrap()) {
+                (None, _) => crate::netcheck::ProbeState::NotOffered,
+                (Some(p), Some(_)) => crate::netcheck::ProbeState::Ok(p.port()),
+                (Some(p), None) if self.created.elapsed() > Duration::from_secs(10) => crate::netcheck::ProbeState::NoReply(p.port()),
+                (Some(_), None) => crate::netcheck::ProbeState::Waiting,
+            },
         }
     }
 
@@ -834,6 +910,81 @@ impl Link {
             }
             None => self.send_raw(pkt, to),
         }
+    }
+
+    /// 观看者的长期参考帧确认 / 恢复请求
+    pub fn on_video_ltr(&self, by: u32, ack: Option<u32>, recover: bool) {
+        if let Some(f) = ack {
+            let mut a = self.ltr_acks.lock().unwrap();
+            if a.len() < 256 {
+                a.push((by, f));
+            }
+        }
+        if recover {
+            self.ltr_recover.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// 取走攒下的长期参考帧确认
+    pub fn take_ltr_acks(&self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut *self.ltr_acks.lock().unwrap())
+    }
+
+    /// 有人请求恢复帧（取走标记）
+    pub fn take_ltr_recover(&self) -> bool {
+        self.ltr_recover.swap(false, Ordering::Relaxed)
+    }
+
+    /// 恢复帧这次没发成（限速），留到下一帧
+    pub fn keep_ltr_recover(&self) {
+        self.ltr_recover.store(true, Ordering::Relaxed);
+    }
+
+    /// 观看者回报收画面的情况
+    pub fn on_video_report(&self, by: u32, loss: u16, rtt: u32) {
+        self.video_reports.lock().unwrap().insert(by, (loss.min(1000), rtt, Instant::now()));
+    }
+
+    /// 某一层观看者最近 5 秒回报的最大原始丢包率（千分之几）
+    pub fn layer_loss(&self, low: bool) -> u16 {
+        let ids = self.layer_watchers(low);
+        let r = self.video_reports.lock().unwrap();
+        ids.iter().filter_map(|i| r.get(i)).filter(|x| x.2.elapsed() < Duration::from_secs(5)).map(|x| x.0).max().unwrap_or(0)
+    }
+
+    /// 重新挑选两条路同时发画面的观看者：直连发画面、最近 5 秒回报丢包 ≥ loss 的人。返回人数
+    pub fn update_dual_video(&self, loss: u16) -> usize {
+        let direct = self.alloc.lock().unwrap().1.clone();
+        let set: std::collections::HashSet<u32> = {
+            let r = self.video_reports.lock().unwrap();
+            direct.into_iter().filter(|i| r.get(i).is_some_and(|x| x.0 >= loss && x.2.elapsed() < Duration::from_secs(5))).collect()
+        };
+        let n = set.len();
+        *self.dual_video.lock().unwrap() = set;
+        n
+    }
+
+    /// 我发出去的语音大概的丢包率（%）：到服务器的丢包和直连的人里最高的那个
+    pub fn voice_path_loss(&self) -> u8 {
+        let now = now_millis();
+        let srv = {
+            let p = self.srv_pings.lock().unwrap();
+            let done: Vec<bool> = p.iter().filter(|(t, _)| now.saturating_sub(*t) > 1500).map(|(_, g)| *g).collect();
+            if done.len() >= 5 {
+                (done.iter().filter(|g| !**g).count() * 100 / done.len()) as u8
+            } else {
+                0
+            }
+        };
+        let direct = self.alloc.lock().unwrap().0.clone();
+        let peers = self.peers.lock().unwrap();
+        let p2p = direct.iter().filter_map(|i| peers.map.get(i)).map(|p| p.quality.loss_pct).max().unwrap_or(0);
+        srv.max(p2p)
+    }
+
+    /// 和某人直连的往返时间（ms），没直连返回 None
+    pub fn peer_rtt(&self, id: u32) -> Option<u32> {
+        self.peers.lock().unwrap().map.get(&id).filter(|p| p.confirmed && p.rtt_ms > 0).map(|p| p.rtt_ms)
     }
 
     /// 观看者请求补发：peer = 直连收到的（直接重发给他），None = 服务器转来的（重发给服务器，服务器照常转发）
@@ -878,15 +1029,19 @@ impl Link {
     /// 向共享者请求补发：画面是直连收到的就直连发给他，否则发给服务器（服务器要支持）
     fn send_nack(&self, to: u32, direct: bool, server_rtx: bool, payload: &[u8]) {
         let mut buf = Vec::new();
+        let mut sent = false;
         if direct {
             let mut peers = self.peers.lock().unwrap();
             if let Some(p) = peers.map.get_mut(&to) {
                 if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
                     s.seal(udp::NACK, payload, &mut buf);
                     self.send_raw(&buf, path);
+                    sent = true;
                 }
             }
-        } else if server_rtx && self.udp_ok.load(Ordering::Relaxed) {
+        }
+        // 没直连共享者（画面是别的观看者转来的）：发给服务器
+        if !sent && server_rtx && self.udp_ok.load(Ordering::Relaxed) {
             self.send_server(udp::NACK, payload, &mut buf);
         }
     }
@@ -1186,8 +1341,29 @@ impl Link {
             };
             let mut via_server: Vec<u32> = prefs.iter().filter(|(_, r)| **r == RoutePref::Server).map(|(id, _)| *id).collect();
             via_server.sort();
-            self.tcp_send(Outgoing::Msg(ClientMsg::LinkStats { server_rtt: udp_rtt, peers: stats, relay_slots: slots, via_server }));
+            // 还能拿出来帮别人转发画面的上行：预算 - 自己的语音 - 自己共享的画面（帮人转发语音的量很小，忽略）
+            let video_relay_bps = if self.relay_enabled.load(Ordering::Relaxed) {
+                let own_video = self.video_bps.load(Ordering::Relaxed) as u64 * (video.len() as u64 + u64::from(video.len() < watchers.len()));
+                let own_voice = VOICE_COST_BPS * (voice.len() as u64 + 1);
+                (self.budget_bps.load(Ordering::Relaxed) as u64).saturating_sub(own_video + own_voice).min(u32::MAX as u64) as u32
+            } else {
+                0
+            };
+            self.tcp_send(Outgoing::Msg(ClientMsg::LinkStats {
+                server_rtt: udp_rtt,
+                peers: stats,
+                relay_slots: slots,
+                via_server,
+                video_relay_bps,
+            }));
         }
+        // 直连有丢包（≥ 5%）但还没到「不稳」的人：语音两条路同时发（服务器也照常转发给他，接收端按序号去重）
+        let dual_voice: std::collections::HashSet<u32> =
+            voice.iter().copied().filter(|i| peers.map.get(i).is_some_and(|p| p.quality.loss_pct >= DUAL_VOICE_LOSS)).collect();
+        voice.retain(|i| !dual_voice.contains(i));
+        *self.dual_voice.lock().unwrap() = dual_voice;
+        let dual_video = self.dual_video.lock().unwrap().clone();
+        video.retain(|i| !dual_video.contains(i));
         voice.sort();
         video.sort();
         if voice != peers.last_direct || video != peers.last_direct_video {
@@ -1237,7 +1413,7 @@ impl Link {
                     p.on_pong(&data);
                     p.path = Some(from);
                 }
-                udp::VOICE | udp::VIDEO | udp::MUSIC | udp::SHARE_AUDIO | udp::NACK => return Some((id, kind, data)),
+                udp::VOICE | udp::VIDEO | udp::MUSIC | udp::SHARE_AUDIO | udp::NACK | udp::CURSOR => return Some((id, kind, data)),
                 _ => {}
             }
             return None;
@@ -1249,9 +1425,35 @@ impl Link {
 // ------------------------------------------------------------ 解码
 
 struct UserDecoder {
-    dec: opus::Decoder,
+    dec: crate::opusx::Decoder,
     last_seq: Option<u16>,
 }
+
+/// 收到一包，前面丢了 gap 帧：先用这个包里的 DRED 还原（能还原多少算多少，越近的越准），
+/// 剩下的离得远的用 PLC 补，紧挨着的一帧还可以用带内 FEC。返回按时间顺序的 (序号, 声音)
+fn conceal_gap(d: &mut UserDecoder, last: u16, gap: u16, data: &[u8], pcm: &mut [i16]) -> Vec<(u16, Vec<i16>)> {
+    let mut frames = Vec::new();
+    let dred = d.dec.dred_recover(data, gap as usize, FRAME_SAMPLES);
+    for i in 0..gap {
+        let seq = last.wrapping_add(1 + i);
+        if let Some(Some(f)) = dred.get(i as usize) {
+            frames.push((seq, f.clone()));
+            continue;
+        }
+        let n = if i + 1 == gap {
+            d.dec.decode(data, &mut pcm[..FRAME_SAMPLES], true)
+        } else {
+            d.dec.decode(&[], &mut pcm[..FRAME_SAMPLES], false)
+        };
+        if let Some(n) = n {
+            frames.push((seq, pcm[..n].to_vec()));
+        }
+    }
+    frames
+}
+
+/// 中间丢了多少帧以内还补（DRED 最多约 1 秒；太长的断档当作重新开始）
+const MAX_CONCEAL: u16 = 50;
 
 /// UI 可读取的语音状态
 #[derive(Default)]
@@ -1273,6 +1475,8 @@ pub struct VoiceState {
     video_path: Mutex<HashMap<u32, (bool, Instant)>>,
     /// 屏幕共享支持补发的人
     pub rtx_sharers: Mutex<std::collections::HashSet<u32>>,
+    /// 语音编码器正在用 DRED（线路有丢包）
+    pub dred_active: AtomicBool,
     /// 服务器支持转发补发请求
     pub server_rtx: AtomicBool,
 }
@@ -1324,7 +1528,7 @@ pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mut
     let d = match decs.entry((from, stream)) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
-            let Ok(dec) = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) else { return };
+            let Some(dec) = crate::opusx::Decoder::new(SAMPLE_RATE) else { return };
             v.insert(UserDecoder { dec, last_seq: None })
         }
     };
@@ -1335,21 +1539,11 @@ pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mut
             return;
         }
         let gap = seq.wrapping_sub(last).wrapping_sub(1);
-        if (1..=5).contains(&gap) {
-            for i in 0..gap {
-                let s = last.wrapping_add(1 + i);
-                let n = if i + 1 == gap {
-                    d.dec.decode(&data, &mut pcm[..FRAME_SAMPLES], true)
-                } else {
-                    d.dec.decode(&[], &mut pcm[..FRAME_SAMPLES], false)
-                };
-                if let Ok(n) = n {
-                    frames.push((s, pcm[..n].to_vec()));
-                }
-            }
+        if (1..=MAX_CONCEAL).contains(&gap) {
+            frames.extend(conceal_gap(d, last, gap, &data, pcm));
         }
     }
-    let Ok(n) = d.dec.decode(&data, &mut pcm[..], false) else { return };
+    let Some(n) = d.dec.decode(&data, &mut pcm[..], false) else { return };
     d.last_seq = Some(seq);
     frames.push((seq, pcm[..n].to_vec()));
     drop(decs);
@@ -1360,6 +1554,16 @@ pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mut
     }
 }
 
+/// 共享者单独发来的鼠标位置
+fn on_cursor(payload: &[u8], state: &VoiceState) {
+    let Some((from, _, blob)) = udp::read_server_voice(payload) else { return };
+    let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
+    let Some((_, data)) = e2e.lock().unwrap().decrypt_stream(from, voc_proto::e2e::STREAM_CURSOR, blob) else { return };
+    if let Some((x, y, shape, vis)) = udp::read_cursor(&data) {
+        state.video.set_cursor(from, x, y, shape, vis);
+    }
+}
+
 /// 处理一个视频分片（服务器中转 / P2P 直连 / TCP 隧道共用）；需要时向共享者请求关键帧
 /// direct = 这个包是 P2P 直连收到的（否则经服务器 UDP / TCP 隧道）
 pub fn on_server_video(payload: &[u8], state: &VoiceState, direct: bool) {
@@ -1367,8 +1571,48 @@ pub fn on_server_video(payload: &[u8], state: &VoiceState, direct: bool) {
         state.video_path.lock().unwrap().insert(from, (direct, Instant::now()));
     }
     let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
-    let acts = state.video.on_packet(payload, |f| state.rtx_sharers.lock().unwrap().contains(&f), |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
+    let acts = state.video.on_packet(payload, |f| sender_info(state, f), |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
     apply_video_actions(state, acts);
+}
+
+/// 测试用：环境变量 VOC_TEST_DELAY_MS=毫秒，收到的每个 UDP 包都晚这么久才处理（模拟高延迟线路；两端都设 = 往返多两倍）
+struct TestDelay {
+    rx: std::sync::mpsc::Receiver<(Instant, SocketAddr, Vec<u8>)>,
+    delay: Duration,
+}
+
+impl TestDelay {
+    fn start(sock: &UdpSocket, link: Arc<Link>) -> Option<Self> {
+        let ms: u64 = std::env::var("VOC_TEST_DELAY_MS").ok()?.parse().ok().filter(|m| *m > 0)?;
+        let sock = sock.try_clone().ok()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("test-delay".into())
+            .spawn(move || {
+                let mut b = [0u8; 2048];
+                while !link.closed.load(Ordering::Relaxed) {
+                    if let Ok((n, f)) = sock.recv_from(&mut b) {
+                        if tx.send((Instant::now(), f, b[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { rx, delay: Duration::from_millis(ms) })
+    }
+
+    /// 取下一个到时间的包（按到达顺序，每个都晚 delay）
+    fn next(&mut self, out: &mut Vec<u8>) -> Option<SocketAddr> {
+        let (t, from, pkt) = self.rx.recv_timeout(Duration::from_millis(200)).ok()?;
+        let due = t + self.delay;
+        let now = Instant::now();
+        if due > now {
+            std::thread::sleep(due - now);
+        }
+        *out = pkt;
+        Some(from)
+    }
 }
 
 /// 测试用：环境变量 VOC_TEST_LOSS=百分比，随机丢掉收到的画面包（模拟网络丢包）
@@ -1390,8 +1634,18 @@ fn test_drop_video() -> bool {
 /// 定时检查正在看的画面（尾巴丢片、等补发超时）
 pub fn video_tick(state: &VoiceState) {
     let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
-    let acts = state.video.tick(|f| state.rtx_sharers.lock().unwrap().contains(&f), |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
+    let acts = state.video.tick(|f| sender_info(state, f), |from, blob| e2e.lock().unwrap().decrypt_video(from, blob));
     apply_video_actions(state, acts);
+}
+
+/// 某个共享者：支不支持补发、线路往返时间参考（直连用直连的 ping；经服务器按我到服务器的 ping 的两倍估）
+fn sender_info(state: &VoiceState, from: u32) -> crate::video::SenderInfo {
+    let rtx = state.rtx_sharers.lock().unwrap().contains(&from);
+    let rtt_hint = match (state.video_direct(from), state.current_link()) {
+        (Some(true), Some(l)) => l.peer_rtt(from).unwrap_or(0),
+        _ => state.ping_ms.load(Ordering::Relaxed) * 2,
+    };
+    crate::video::SenderInfo { rtx, rtt_hint }
 }
 
 fn apply_video_actions(state: &VoiceState, acts: crate::video::RxActions) {
@@ -1401,6 +1655,15 @@ fn apply_video_actions(state: &VoiceState, acts: crate::video::RxActions) {
     let Some(l) = state.current_link() else { return };
     for from in acts.keyframes {
         l.request_keyframe(from);
+    }
+    for (target, loss, rtt) in acts.reports {
+        l.tcp_send(Outgoing::Msg(ClientMsg::VideoReport { target, loss, rtt }));
+    }
+    for (target, frame) in acts.ltr_acks {
+        l.tcp_send(Outgoing::Msg(ClientMsg::VideoLtr { target, ack: Some(frame), recover: false }));
+    }
+    for target in acts.recovers {
+        l.tcp_send(Outgoing::Msg(ClientMsg::VideoLtr { target, ack: None, recover: true }));
     }
     let server_rtx = state.server_rtx.load(Ordering::Relaxed);
     for (from, layer, frame, idxs) in acts.nacks {
@@ -1421,7 +1684,7 @@ pub fn on_server_voice(payload: &[u8], state: &VoiceState, mixer: &Mutex<Mixer>,
     let d = match decs.entry(from) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
-            let Ok(dec) = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono) else { return };
+            let Some(dec) = crate::opusx::Decoder::new(SAMPLE_RATE) else { return };
             v.insert(UserDecoder { dec, last_seq: None })
         }
     };
@@ -1432,22 +1695,12 @@ pub fn on_server_voice(payload: &[u8], state: &VoiceState, mixer: &Mutex<Mixer>,
             return; // 重复（直连和中转都到了）或过期
         }
         let gap = seq.wrapping_sub(last).wrapping_sub(1);
-        if (1..=5).contains(&gap) {
-            // 丢包：前面的用 PLC 补，紧挨着的一帧用本包携带的 FEC 恢复
-            for i in 0..gap {
-                let s = last.wrapping_add(1 + i);
-                let n = if i + 1 == gap {
-                    d.dec.decode(data, &mut pcm[..FRAME_SAMPLES], true)
-                } else {
-                    d.dec.decode(&[], &mut pcm[..FRAME_SAMPLES], false)
-                };
-                if let Ok(n) = n {
-                    frames.push((s, pcm[..n].to_vec()));
-                }
-            }
+        if (1..=MAX_CONCEAL).contains(&gap) {
+            // 丢包：先用本包里的 DRED 深度冗余还原，不够的用 FEC / PLC
+            frames.extend(conceal_gap(d, last, gap, data, pcm));
         }
     }
-    let Ok(n) = d.dec.decode(data, &mut pcm[..], false) else { return };
+    let Some(n) = d.dec.decode(data, &mut pcm[..], false) else { return };
     d.last_seq = Some(seq);
     frames.push((seq, pcm[..n].to_vec()));
     drop(decs);
@@ -1498,12 +1751,14 @@ pub fn connect(
         watchers_ver: AtomicU32::new(0),
         watchers_low: Mutex::new(Vec::new()),
         watcher_routes: Mutex::new((Vec::new(), Vec::new())),
+        watchers_cursor: Mutex::new(Vec::new()),
         budget_bps: AtomicU32::new(DEFAULT_BUDGET_BPS),
         video_bps: AtomicU32::new(0),
         alloc: Mutex::new((Vec::new(), Vec::new())),
         server_rtt: AtomicU32::new(0),
         relay_enabled: AtomicBool::new(true),
         relays: Mutex::new(Vec::new()),
+        video_relays: Mutex::new(Vec::new()),
         last_stats: Mutex::new(Instant::now()),
         pace_tx: Mutex::new(None),
         music_seq: AtomicU16::new(0),
@@ -1525,6 +1780,11 @@ pub fn connect(
         video_hist: Mutex::new(std::collections::VecDeque::new()),
         video_frags_sent: AtomicU32::new(0),
         video_frags_nacked: AtomicU32::new(0),
+        video_reports: Mutex::new(HashMap::new()),
+        dual_video: Mutex::new(Default::default()),
+        dual_voice: Mutex::new(Default::default()),
+        ltr_acks: Mutex::new(Vec::new()),
+        ltr_recover: AtomicBool::new(false),
     });
     spawn_pacer(link.clone());
     state.disconnect();
@@ -1591,9 +1851,23 @@ pub fn connect(
         let mut buf = [0u8; 2048];
         let mut out = Vec::new();
         let mut pcm = Vec::with_capacity(FRAME_SAMPLES * 3);
+        let mut delayed = TestDelay::start(&recv_sock, l.clone());
+        let mut held = Vec::new();
         while !l.closed.load(Ordering::Relaxed) {
             // 超时 / Windows 的 ConnectionReset（打洞时常见）都忽略
-            let Ok((n, from)) = recv_sock.recv_from(&mut buf) else { continue };
+            let (n, from) = match delayed.as_mut() {
+                Some(d) => match d.next(&mut held) {
+                    Some(f) => {
+                        buf[..held.len()].copy_from_slice(&held);
+                        (held.len(), f)
+                    }
+                    None => continue,
+                },
+                None => {
+                    let Ok(r) = recv_sock.recv_from(&mut buf) else { continue };
+                    r
+                }
+            };
             let from = norm(from);
             let pkt = &buf[..n];
             if Some(from) == l.probe {
@@ -1628,14 +1902,19 @@ pub fn connect(
                     udp::VIDEO => on_server_video(&data, &state, false),
                     udp::NACK => l.resend_video(None, &data),
                     udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &data, &state, &mixer, &mut pcm),
+                    udp::CURSOR => on_cursor(&data, &state),
                     _ => {}
                 }
             } else if let Some((peer, kind, v)) = l.on_peer_packet(from, pkt, &mut out) {
                 match kind {
                     udp::VIDEO if test_drop_video() => {}
-                    udp::VIDEO => on_server_video(&v, &state, true),
+                    udp::VIDEO => {
+                        l.relay_video(peer, &v, &mut out);
+                        on_server_video(&v, &state, true);
+                    }
                     udp::NACK => l.resend_video(Some(peer), &v),
                     udp::MUSIC | udp::SHARE_AUDIO => on_stream_audio(kind, &v, &state, &mixer, &mut pcm),
+                    udp::CURSOR => on_cursor(&v, &state),
                     _ => {
                         l.relay_forward(peer, &v, &mut out);
                         on_server_voice(&v, &state, &mixer, &mut pcm);
@@ -1834,12 +2113,28 @@ pub fn spawn_encoder(
         .expect("spawn encoder");
 }
 
-fn new_encoder() -> opus::Encoder {
-    let mut e = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).expect("opus encoder");
-    let _ = e.set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE));
-    let _ = e.set_inband_fec(true); // 带内前向纠错：丢一个包可由下一个包恢复
-    let _ = e.set_packet_loss_perc(10);
+fn new_encoder() -> crate::opusx::Encoder {
+    let mut e = crate::opusx::Encoder::new_voip(SAMPLE_RATE).expect("opus encoder");
+    e.set_bitrate(OPUS_BITRATE);
+    e.set_dred_duration(DRED_DURATION);
+    apply_loss_mode(&mut e, 0);
     e
+}
+
+/// DRED 冗余时长（10 ms 为单位）：最多约 0.5 秒（实际长度受码率限制，24 kbps 时约 130 ms）
+const DRED_DURATION: i32 = 50;
+/// 线路丢包 ≥ 这个百分比时改用 DRED（带内 FEC 只能补一帧，而且开着它 DRED 几乎分不到码率）
+const DRED_LOSS_PCT: u8 = 3;
+
+/// 按线路丢包调整编码器：丢包少时用带内 FEC（不影响音质）；丢包多时关 FEC、按实测丢包率给 DRED 分码率
+fn apply_loss_mode(e: &mut crate::opusx::Encoder, loss_pct: u8) {
+    if loss_pct >= DRED_LOSS_PCT {
+        e.set_inband_fec(false);
+        e.set_packet_loss_perc(loss_pct.min(50) as i32);
+    } else {
+        e.set_inband_fec(true); // 带内前向纠错：丢一个包可由下一个包恢复
+        e.set_packet_loss_perc(10);
+    }
 }
 
 /// 16 kHz / 20 ms 帧的 VAD + 编码 + 发送
@@ -1847,8 +2142,11 @@ struct Transmitter {
     settings: Arc<Settings>,
     state: Arc<VoiceState>,
     mixer: Arc<Mutex<Mixer>>,
-    enc: opus::Encoder,
+    enc: crate::opusx::Encoder,
     loop_dec: Option<opus::Decoder>,
+    /// 当前按多少丢包率配置编码器（每秒按线路实测更新一次）
+    loss_mode: u8,
+    loss_checked: Instant,
     pcm: Vec<i16>,
     bytes: Vec<u8>,
     decoded: Vec<i16>,
@@ -1877,6 +2175,8 @@ impl Transmitter {
             loop_seq: 0,
             low: false,
             zero_frames: 0,
+            loss_mode: 0,
+            loss_checked: Instant::now(),
         }
     }
 
@@ -1911,9 +2211,20 @@ impl Transmitter {
         let low = crate::audio::LOW_BANDWIDTH.load(Ordering::Relaxed);
         if low != self.low {
             self.low = low;
-            let _ = self.enc.set_bitrate(opus::Bitrate::Bits(if low { LOW_OPUS_BITRATE } else { OPUS_BITRATE }));
+            self.enc.set_bitrate(if low { LOW_OPUS_BITRATE } else { OPUS_BITRATE });
         }
-        let Ok(n) = self.enc.encode(&self.pcm, &mut self.bytes) else { return };
+        // 每秒看一次线路丢包，变了就调编码器（FEC / DRED）
+        if self.loss_checked.elapsed() >= Duration::from_secs(1) {
+            self.loss_checked = Instant::now();
+            let loss = self.state.current_link().map(|l| l.voice_path_loss()).unwrap_or(0);
+            let mode = if loss >= DRED_LOSS_PCT { loss } else { 0 };
+            if mode.abs_diff(self.loss_mode) >= 2 || (mode == 0) != (self.loss_mode == 0) {
+                self.loss_mode = mode;
+                apply_loss_mode(&mut self.enc, mode);
+                self.state.dred_active.store(mode > 0, Ordering::Relaxed);
+            }
+        }
+        let Some(n) = self.enc.encode(&self.pcm, &mut self.bytes) else { return };
         let packet = &self.bytes[..n];
         if let Some(l) = self.state.current_link().filter(|l| l.in_channel.load(Ordering::Relaxed)) {
             // 端到端加密后再发：服务器中转时只看得到密文

@@ -2,6 +2,7 @@
 
 mod aec;
 mod app;
+mod applog;
 mod audio;
 mod autostart;
 mod denoise;
@@ -14,6 +15,7 @@ mod mf;
 mod net;
 mod netcheck;
 mod notify;
+mod opusx;
 mod portmap;
 mod theme;
 mod tray;
@@ -63,6 +65,7 @@ pub fn window_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    applog::init();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("VOC")
         .with_icon(window_icon())

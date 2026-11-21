@@ -94,6 +94,9 @@ pub enum ClientMsg {
         /// 支持丢包补发（NACK）和冗余校验包（FEC）
         #[serde(default)]
         rtx: bool,
+        /// 原画码率（bps），服务器安排观看者互相转发时估算上行用
+        #[serde(default)]
+        bps: u32,
     },
     /// 开始 / 停止伴奏（name = 程序名，None = 停止）
     SetMusic {
@@ -109,10 +112,29 @@ pub enum ClientMsg {
         /// 观看者选的画面线路：0 自动，1 P2P 直连（打得通就直连，不看上行预算），2 走服务器
         #[serde(default)]
         route: u8,
+        /// 我会自己画鼠标（共享者可以不把鼠标画进画面，单独发位置）
+        #[serde(default)]
+        cursor: bool,
     },
     /// 观看者丢包后请求共享者发关键帧
     KeyframeRequest {
         target: u32,
+    },
+    /// 长期参考帧：ack = 解码成功的长期参考帧帧号；recover = 丢了帧，请求一帧恢复帧（代替关键帧）
+    VideoLtr {
+        target: u32,
+        #[serde(default)]
+        ack: Option<u32>,
+        #[serde(default)]
+        recover: bool,
+    },
+    /// 观看者每秒回报一次收某人画面的情况（共享者据此决定加多少冗余、要不要两条路同时发）：
+    /// loss = 原始丢包率（千分之几，冗余和补发之前）；rtt = 估计的往返时间（ms）
+    VideoReport {
+        target: u32,
+        loss: u16,
+        #[serde(default)]
+        rtt: u32,
     },
     /// 本机能解码的视频格式（"av1" / "hevc" / "h264"），共享者据此选择编码格式
     Caps {
@@ -132,6 +154,9 @@ pub enum ClientMsg {
         /// 用户手动选了「走服务器」的人：我和他之间的语音不要安排成员中继
         #[serde(default)]
         via_server: Vec<u32>,
+        /// 还能拿出来帮别人转发屏幕共享画面的上行（bps）；0 = 不当画面中继
+        #[serde(default)]
+        video_relay_bps: u32,
     },
 }
 
@@ -161,6 +186,11 @@ pub struct RelayRoute {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// 观看者互相转发屏幕共享画面的路线：from = 共享者，via 把直连收到的画面转给 to（服务器不再转发这一路）。
+    /// 只发给路线上的三个人（有变化才发）
+    VideoRelays {
+        routes: Vec<RelayRoute>,
+    },
     Welcome {
         user_id: u32,
         udp_port: u16,
@@ -217,10 +247,28 @@ pub enum ServerMsg {
         /// 其中选了走服务器的人
         #[serde(default)]
         server: Vec<u32>,
+        /// 其中会自己画鼠标的人
+        #[serde(default)]
+        cursor: Vec<u32>,
     },
     /// 发给共享者：某观看者请求关键帧
     KeyframeRequest {
         by: u32,
+    },
+    /// 发给共享者：观看者的长期参考帧确认 / 恢复请求（见 ClientMsg::VideoLtr）
+    VideoLtr {
+        by: u32,
+        #[serde(default)]
+        ack: Option<u32>,
+        #[serde(default)]
+        recover: bool,
+    },
+    /// 发给共享者：某观看者收画面的情况（见 ClientMsg::VideoReport）
+    VideoReport {
+        by: u32,
+        loss: u16,
+        #[serde(default)]
+        rtt: u32,
     },
     /// 本频道当前的成员中继路线（有变化才发）
     Relays {

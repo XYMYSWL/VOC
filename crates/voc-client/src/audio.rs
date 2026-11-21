@@ -507,6 +507,7 @@ impl StreamHealth {
             K::RealtimeDenied => {}
             K::DeviceNotAvailable | K::StreamInvalidated | K::DeviceChanged | K::BackendError | K::Other => {
                 eprintln!("音频设备错误：{e}");
+                crate::applog::log(format!("音频设备错误：{e}"));
                 self.failed.store(true, Ordering::Relaxed);
             }
             _ => eprintln!("音频设备错误：{e}"),

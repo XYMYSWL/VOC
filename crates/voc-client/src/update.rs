@@ -30,14 +30,15 @@ pub fn accel_link(asset: &str) -> String {
     format!("{}https://github.com/{REPO}/releases/latest/download/{asset}", MIRRORS[0])
 }
 
-/// 下载安装程序要依次尝试的地址：加速时先各个镜像（要有 SHA-256 才能用镜像），最后直连 GitHub
+/// 下载安装程序要依次尝试的地址：开了加速先走镜像、最后直连；没开加速先直连，连不上再自动走镜像。
+/// 镜像只在有 SHA-256 时用（下载的文件要能核对）
 fn download_urls(asset: &SetupAsset, accel: bool) -> Vec<String> {
-    let mut v: Vec<String> = Vec::new();
-    if accel && asset.sha256.is_some() {
-        v.extend(MIRRORS.iter().map(|m| format!("{m}{}", asset.url)));
+    let mirrors: Vec<String> = if asset.sha256.is_some() { MIRRORS.iter().map(|m| format!("{m}{}", asset.url)).collect() } else { Vec::new() };
+    if accel {
+        mirrors.into_iter().chain(std::iter::once(asset.url.clone())).collect()
+    } else {
+        std::iter::once(asset.url.clone()).chain(mirrors).collect()
     }
-    v.push(asset.url.clone());
-    v
 }
 
 /// Release 里的安装程序
@@ -110,6 +111,9 @@ impl Updater {
                     UpdateState::UpToDate
                 }
             });
+            if let Err(e) = &r {
+                crate::applog::log(format!("检查更新失败：{e}"));
+            }
             *st.lock().unwrap() = r.unwrap_or_else(UpdateState::Failed);
             ctx.request_repaint();
         });
@@ -141,7 +145,10 @@ impl Updater {
             }
             *st.lock().unwrap() = match r {
                 Ok(()) => UpdateState::Launched,
-                Err(e) => UpdateState::Failed(e),
+                Err(e) => {
+                    crate::applog::log(format!("一键更新失败：{e}"));
+                    UpdateState::Failed(e)
+                }
             };
             ctx.request_repaint();
         });
@@ -176,8 +183,9 @@ fn fetch_latest(accel: bool) -> Result<Release, String> {
         Ok(r) => return Ok(r),
         Err(e) => e,
     };
-    if accel {
-        // 官方接口连不上：经镜像问版本号。版本信息没法核对，只提示、不给一键安装
+    let _ = accel;
+    {
+        // 官方接口连不上：自动经镜像问版本号（不管开没开加速）。版本信息没法核对，只提示、不给一键安装
         for m in MIRRORS {
             if let Ok(mut r) = get_text(&format!("{m}{url}")).and_then(|b| parse_release(&b)) {
                 r.setup = None;
@@ -320,10 +328,14 @@ mod tests {
         assert_eq!(v.len(), MIRRORS.len() + 1);
         assert_eq!(v[0], format!("{}{url}", MIRRORS[0]));
         assert_eq!(v.last().unwrap(), &url, "GitHub itself is the last resort");
-        // 不加速、或没有 SHA-256（镜像给的文件没法核对）：只直连
-        assert_eq!(download_urls(&with_hash, false), vec![url.clone()]);
+        // 不加速：先直连，连不上再走镜像
+        let plain = download_urls(&with_hash, false);
+        assert_eq!(plain[0], url);
+        assert_eq!(plain.len(), MIRRORS.len() + 1);
+        // 没有 SHA-256（镜像给的文件没法核对）：只直连
         let no_hash = SetupAsset { sha256: None, ..with_hash };
-        assert_eq!(download_urls(&no_hash, true), vec![url]);
+        assert_eq!(download_urls(&no_hash, true), vec![url.clone()]);
+        assert_eq!(download_urls(&no_hash, false), vec![url]);
         assert!(accel_link(PORTABLE_ASSET).ends_with("/releases/latest/download/VOC-portable.zip"));
     }
 

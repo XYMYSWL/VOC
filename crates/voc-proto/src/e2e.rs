@@ -236,10 +236,16 @@ fn video_key(key: &[u8; 32]) -> ChaCha20Poly1305 {
 /// 伴奏 / 屏幕共享声音：各自从语音密钥派生独立的密钥和计数器（不打乱语音的帧序号）
 pub const STREAM_MUSIC: u8 = 0;
 pub const STREAM_SHARE: u8 = 1;
-const STREAMS: usize = 2;
+/// 屏幕共享的鼠标位置
+pub const STREAM_CURSOR: u8 = 2;
+const STREAMS: usize = 3;
 
 fn stream_key(key: &[u8; 32], stream: u8) -> ChaCha20Poly1305 {
-    let label: &[u8] = if stream == STREAM_MUSIC { b"voc music v1" } else { b"voc share-audio v1" };
+    let label: &[u8] = match stream {
+        STREAM_MUSIC => b"voc music v1",
+        STREAM_SHARE => b"voc share-audio v1",
+        _ => b"voc cursor v1",
+    };
     let mut out = [0u8; 32];
     hkdf::Hkdf::<Sha256>::new(None, key).expand(label, &mut out).expect("hkdf");
     ChaCha20Poly1305::new((&out).into())
@@ -302,7 +308,7 @@ impl SenderKey {
             video_ctr: 0,
             video_aead: video_key(&key),
             stream_ctr: [0; STREAMS],
-            stream_aead: [stream_key(&key, STREAM_MUSIC), stream_key(&key, STREAM_SHARE)],
+            stream_aead: [stream_key(&key, STREAM_MUSIC), stream_key(&key, STREAM_SHARE), stream_key(&key, STREAM_CURSOR)],
         }
     }
 
@@ -394,7 +400,7 @@ impl ReceiverKeys {
                 window: 0,
                 video_aead: video_key(&key),
                 video_max: None,
-                stream_aead: [stream_key(&key, STREAM_MUSIC), stream_key(&key, STREAM_SHARE)],
+                stream_aead: [stream_key(&key, STREAM_MUSIC), stream_key(&key, STREAM_SHARE), stream_key(&key, STREAM_CURSOR)],
                 stream_max: [None; STREAMS],
                 stream_window: [0; STREAMS],
             },

@@ -109,6 +109,8 @@ VOC_BIND_IP="$VOC_BIND_IP"
 VOC_BIND="$VOC_BIND"
 VOC_NAME="$VOC_NAME"
 VOC_CHANNELS="$VOC_CHANNELS"
+# 附加参数，例如限制服务器转发屏幕共享画面的总带宽（Mbps）：VOC_EXTRA_ARGS="--max-video-mbps 50"
+VOC_EXTRA_ARGS=""
 EOF
     chmod 0644 "$CONF"
 fi
@@ -130,7 +132,7 @@ User=$SVC_USER
 Group=$SVC_USER
 EnvironmentFile=$CONF
 WorkingDirectory=$DATA
-ExecStart=$BIN --bind \${VOC_BIND} --name \${VOC_NAME} --channels \${VOC_CHANNELS} --codes $CODES
+ExecStart=$BIN --bind \${VOC_BIND} --name \${VOC_NAME} --channels \${VOC_CHANNELS} --codes $CODES \$VOC_EXTRA_ARGS
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
@@ -167,14 +169,18 @@ cat > "$ADMIN" <<EOF
 #   voc gen-code [-n 数量] [--note 备注] [--days 天数]   生成授权码
 #   voc list-codes                                       查看授权码
 #   voc revoke-code <ID> / voc restore-code <ID>          吊销 / 恢复
-#   voc status | logs | restart | stop | start           服务管理
+#   voc status                                           运行状态（在线的人、谁在共享、转发带宽、NAT 探测端口）
+#   voc logs | restart | stop | start                    服务管理
 #   voc config                                           编辑配置
 #   voc upgrade [vX.Y.Z]                                 升级到最新版（或指定版本），保留授权码和配置
 #   voc version                                          显示版本
 set -e
 [ "\$(id -u)" -eq 0 ] || { echo "请用 sudo 运行：sudo voc \$*"; exit 1; }
 case "\${1:-}" in
-    status) exec systemctl status voc-server --no-pager ;;
+    status)
+        systemctl status voc-server --no-pager -n 0 || true
+        echo
+        exec $BIN status --codes $CODES ;;
     logs) exec journalctl -u voc-server -f -n 100 ;;
     restart|stop|start) exec systemctl "\$1" voc-server ;;
     config) "\${EDITOR:-nano}" $CONF && systemctl restart voc-server && echo "已重启生效" ;;
@@ -189,7 +195,7 @@ case "\${1:-}" in
         else
             exec su -s /bin/sh $SVC_USER -c '$BIN "\$@" --codes $CODES' -- sh "\$@"
         fi ;;
-    *) sed -n '2,9p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,10p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 EOF
 chmod 0755 "$ADMIN"

@@ -68,14 +68,20 @@ struct User {
     watch_low: HashSet<u32>,
     /// 观看时选的画面线路：共享者 → 1 P2P / 2 服务器（自动的不记）
     watch_route: HashMap<u32, u8>,
+    /// 我会自己画鼠标的共享者（我在看他）
+    watch_cursor: HashSet<u32>,
     /// 我的屏幕共享有低画质层
     simulcast: bool,
     /// 我的屏幕共享支持丢包补发（收到 NACK 会重发）和冗余校验包
     rtx: bool,
+    /// 我的屏幕共享原画码率（bps，估算画面中继的上行用）
+    share_bps: u32,
+    /// 上次发给我的画面中继路线
+    last_video_relays: Vec<RelayRoute>,
     /// 我最近发出的画面分片（观看者补发请求先从这里找，找不到再转给我）
     video_cache: VideoCache,
-    /// 上次发给我的观看者名单（我是共享者时）：全部、要低画质的、选了 P2P 的、选了走服务器的
-    last_watchers: (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>),
+    /// 上次发给我的观看者名单（我是共享者时）：全部、要低画质的、选了 P2P 的、选了走服务器的、自己画鼠标的
+    last_watchers: (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>),
     /// 能解码的视频格式
     decoders: Vec<String>,
     /// 正在放伴奏的程序名
@@ -148,6 +154,7 @@ impl VideoCache {
 }
 
 /// 客户端上报的链路质量
+#[derive(Clone)]
 struct LinkReport {
     at: Instant,
     server_rtt: u32,
@@ -155,6 +162,8 @@ struct LinkReport {
     slots: u16,
     /// 手动选了走服务器的人
     via_server: HashSet<u32>,
+    /// 还能帮别人转发画面的上行（bps）
+    video_relay_bps: u32,
 }
 
 /// 链路上报超过这么久没更新就不再采信
@@ -180,7 +189,53 @@ struct State {
     replay: ReplayCache,
     /// 成员中继路线：(说话的人, 听的人) → 中继成员
     relays: HashMap<(u32, u32), u32>,
+    /// 屏幕共享画面中继：(共享者, 观看者) → 帮忙转发的观看者
+    video_relays: HashMap<(u32, u32), u32>,
+    /// 这一秒转发的语音 / 画面字节数；上一秒的（状态文件和带宽上限用）
+    sec_bytes: (u64, u64),
+    last_sec_bytes: (u64, u64),
+    /// 画面转发总带宽上限（bps）
+    max_video_bps: Option<u64>,
+    /// 因为服务器带宽不够被临时改看「流畅」的 (观看者, 共享者)；带宽宽松了多少秒
+    forced_low: HashSet<(u32, u32)>,
+    cap_calm_secs: u32,
+    /// 认证失败太多次的 IP
+    bans: BanList,
+    /// NAT 探测端口（状态文件用）
+    probe_listening: bool,
 }
+
+/// 认证失败的 IP：(1 分钟内失败次数, 这一分钟从什么时候开始, 封到什么时候)
+#[derive(Default)]
+struct BanList(HashMap<std::net::IpAddr, (u32, Instant, Option<Instant>)>);
+
+impl BanList {
+    fn banned(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        self.0.retain(|_, (_, start, until)| now.duration_since(*start) < Duration::from_secs(60) || until.is_some_and(|u| u > now));
+        self.0.get(&ip).is_some_and(|b| b.2.is_some_and(|u| u > now))
+    }
+
+    /// 记一次认证失败。返回 (要不要打日志：这一分钟的第一次, 这次刚被封)
+    fn failed(&mut self, ip: std::net::IpAddr, now: Instant) -> (bool, bool) {
+        let e = self.0.entry(ip).or_insert((0, now, None));
+        if now.duration_since(e.1) >= Duration::from_secs(60) {
+            *e = (0, now, e.2);
+        }
+        e.0 += 1;
+        if e.0 == BAN_FAILS {
+            e.2 = Some(now + BAN_FOR);
+        }
+        (e.0 == 1, e.0 == BAN_FAILS)
+    }
+
+    fn count(&self, now: Instant) -> usize {
+        self.0.values().filter(|b| b.2.is_some_and(|u| u > now)).count()
+    }
+}
+
+/// 同一个 IP 1 分钟内认证失败这么多次就封
+const BAN_FAILS: u32 = 10;
+const BAN_FOR: Duration = Duration::from_secs(300);
 
 type Shared = Arc<Mutex<State>>;
 
@@ -284,19 +339,26 @@ impl State {
 
     /// 告诉每个共享者现在有谁在看（有变化才发）
     fn push_watchers(&mut self) {
-        type Pair = (u32, Option<u32>, HashSet<u32>, HashSet<u32>, HashMap<u32, u8>);
+        type Pair = (u32, Option<u32>, HashSet<u32>, HashSet<u32>, HashMap<u32, u8>, HashSet<u32>);
+        let forced = self.forced_low.clone();
         let pairs: Vec<Pair> = self
             .users
             .iter()
-            .map(|(id, u)| (*id, u.channel, u.watching.clone(), u.watch_low.clone(), u.watch_route.clone()))
+            .map(|(id, u)| {
+                let mut low = u.watch_low.clone();
+                low.extend(forced.iter().filter(|(v, _)| v == id).map(|(_, s)| *s));
+                (*id, u.channel, u.watching.clone(), low, u.watch_route.clone(), u.watch_cursor.clone())
+            })
             .collect();
         for (id, u) in self.users.iter_mut() {
-            // (观看者, 要低画质, 线路)
-            let mut w: Vec<(u32, bool, u8)> = match (&u.sharing, u.channel) {
+            // (观看者, 要低画质, 线路, 自己画鼠标)
+            let mut w: Vec<(u32, bool, u8, bool)> = match (&u.sharing, u.channel) {
                 (Some(_), Some(ch)) => pairs
                     .iter()
-                    .filter(|(wid, wch, set, _, _)| wid != id && *wch == Some(ch) && set.contains(id))
-                    .map(|(wid, _, _, low, route)| (*wid, u.simulcast && low.contains(id), route.get(id).copied().unwrap_or(0)))
+                    .filter(|(wid, wch, set, _, _, _)| wid != id && *wch == Some(ch) && set.contains(id))
+                    .map(|(wid, _, _, low, route, cur)| {
+                        (*wid, u.simulcast && low.contains(id), route.get(id).copied().unwrap_or(0), cur.contains(id))
+                    })
                     .collect(),
                 _ => Vec::new(),
             };
@@ -305,11 +367,12 @@ impl State {
             let low: Vec<u32> = w.iter().filter(|x| x.1).map(|x| x.0).collect();
             let direct: Vec<u32> = w.iter().filter(|x| x.2 == 1).map(|x| x.0).collect();
             let server: Vec<u32> = w.iter().filter(|x| x.2 == 2).map(|x| x.0).collect();
-            let now = (ids, low, direct, server);
+            let cursor: Vec<u32> = w.iter().filter(|x| x.3).map(|x| x.0).collect();
+            let now = (ids, low, direct, server, cursor);
             if now != u.last_watchers {
                 u.last_watchers = now.clone();
-                let (ids, low, direct, server) = now;
-                u.send(ServerMsg::Watchers { ids, low, direct, server });
+                let (ids, low, direct, server, cursor) = now;
+                u.send(ServerMsg::Watchers { ids, low, direct, server, cursor });
             }
         }
     }
@@ -319,7 +382,8 @@ impl State {
         let Some(u) = self.users.get(&from) else { return Vec::new() };
         let Some(ch) = u.channel else { return Vec::new() };
         let music = kind == udp::MUSIC;
-        if music && u.music.is_none() || !music && (u.sharing.is_none() || !u.share_audio) {
+        // 伴奏要在放；共享声音要在共享且带声音；鼠标只要在共享
+        if music && u.music.is_none() || !music && (u.sharing.is_none() || (kind == udp::SHARE_AUDIO && !u.share_audio)) {
             return Vec::new();
         }
         let direct = if music { u.direct.clone() } else { u.direct_video.clone() };
@@ -431,6 +495,70 @@ impl State {
         }
     }
 
+    /// 安排观看者互相转发画面：共享者直连发给 R 的画面，由 R 原样（密文）转给和 R 直连稳定、又没直连共享者的观看者 T。
+    /// 条件：R、T 同一画质层；R→T、T→R 都是稳定直连（丢包 ≤ 3%、抖动 ≤ 30 ms）；R 剩余上行够一路画面（按共享码率 × 1.1）；
+    /// 两人之间没选「走服务器」。已有路线仍有效就保留；没有合适的就由服务器照常转发
+    fn push_video_relays(&mut self) {
+        let now = Instant::now();
+        fn fresh(u: &User, now: Instant) -> Option<&LinkReport> {
+            u.stats.as_ref().filter(|r| now.duration_since(r.at) < STATS_TTL && u.p2p.is_some())
+        }
+        let fresh = |u: &User| fresh(u, now).cloned();
+        let good = |a: &User, b: u32| {
+            fresh(a).and_then(|r| r.peers.iter().find(|p| p.id == b).copied()).filter(|p| p.loss <= relay::MAX_LOSS && p.jitter <= relay::MAX_JITTER).map(|p| p.rtt)
+        };
+        let mut plan: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut used: HashMap<u32, u64> = HashMap::new();
+        let mut sharers: Vec<u32> = self.users.iter().filter(|(_, u)| u.sharing.is_some() && u.channel.is_some()).map(|(i, _)| *i).collect();
+        sharers.sort();
+        for s in sharers {
+            let su = &self.users[&s];
+            let cost = (su.share_bps.max(1_000_000) as u64) * 11 / 10;
+            let mut watchers: Vec<u32> =
+                self.users.iter().filter(|(i, u)| **i != s && u.channel == su.channel && u.watching.contains(&s)).map(|(i, _)| *i).collect();
+            watchers.sort();
+            let low = |id: u32| su.simulcast && self.users[&id].watch_low.contains(&s);
+            for &t in watchers.iter().filter(|t| !su.direct_video.contains(t)) {
+                let tu = &self.users[&t];
+                let mut cands: Vec<(u32, u32)> = watchers
+                    .iter()
+                    .copied()
+                    .filter(|r| *r != t && su.direct_video.contains(r) && low(*r) == low(t))
+                    .filter_map(|r| {
+                        let ru = &self.users[&r];
+                        let rep = fresh(ru)?;
+                        let hidden = ru.p2p_hide.contains(&t) || tu.p2p_hide.contains(&r) || rep.via_server.contains(&t)
+                            || fresh(tu).is_some_and(|x| x.via_server.contains(&r));
+                        let spare = (rep.video_relay_bps as u64).saturating_sub(used.get(&r).copied().unwrap_or(0));
+                        let rtt = good(ru, t)?;
+                        good(tu, r)?;
+                        (!hidden && spare >= cost).then_some((rtt, r))
+                    })
+                    .collect();
+                cands.sort();
+                let keep = self.video_relays.get(&(s, t)).copied().filter(|v| cands.iter().any(|(_, r)| r == v));
+                if let Some(via) = keep.or(cands.first().map(|c| c.1)) {
+                    plan.insert((s, t), via);
+                    *used.entry(via).or_default() += cost;
+                }
+            }
+        }
+        self.video_relays = plan;
+        let routes: Vec<RelayRoute> = self
+            .video_relays
+            .iter()
+            .map(|((s, t), v)| RelayRoute { from: *s, to: *t, via: *v, ms: 0, server_ms: 0 })
+            .collect();
+        for (id, u) in self.users.iter_mut() {
+            let mut mine: Vec<RelayRoute> = routes.iter().filter(|r| r.from == *id || r.via == *id || r.to == *id).copied().collect();
+            mine.sort();
+            if mine != u.last_video_relays {
+                u.last_video_relays = mine.clone();
+                u.send(ServerMsg::VideoRelays { routes: mine });
+            }
+        }
+    }
+
     /// 转发一个视频分片给正在观看的人（已 P2P 直连的除外）
     fn forward_video(&mut self, from: u32, frag: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
         let Some(u) = self.users.get(&from) else { return Vec::new() };
@@ -445,11 +573,13 @@ impl State {
             u.video_cache.insert(f.flags & udp::VIDEO_LOW, f.frame, f.idx, frag);
         }
         let mut out = Vec::new();
+        let relayed: HashSet<u32> = self.video_relays.keys().filter(|(s, _)| *s == from).map(|(_, t)| *t).collect();
+        let forced: HashSet<u32> = self.forced_low.iter().filter(|(_, s)| *s == from).map(|(v, _)| *v).collect();
         for (id, other) in self.users.iter_mut() {
-            if other.channel != Some(ch) || !other.watching.contains(&from) || direct.contains(id) {
+            if other.channel != Some(ch) || !other.watching.contains(&from) || direct.contains(id) || relayed.contains(id) {
                 continue;
             }
-            if layer_low != (simulcast && other.watch_low.contains(&from)) {
+            if layer_low != (simulcast && (other.watch_low.contains(&from) || forced.contains(id))) {
                 continue;
             }
             match (other.voice_udp, other.udp) {
@@ -462,8 +592,129 @@ impl State {
                     let _ = other.tx.send(Out::Video(payload.clone()));
                 }
             }
+            self.sec_bytes.1 += payload.len() as u64 + 60;
         }
         out
+    }
+
+    fn banned(&mut self, ip: std::net::IpAddr) -> bool {
+        self.bans.banned(ip, Instant::now())
+    }
+
+    fn auth_failed(&mut self, ip: std::net::IpAddr) -> (bool, bool) {
+        self.bans.failed(ip, Instant::now())
+    }
+
+    /// 每秒：统计转发带宽；超过画面上限时让一个经服务器看原画的人改看「流畅」，宽松 10 秒后放回一个
+    fn balance_video_cap(&mut self) {
+        self.last_sec_bytes = std::mem::take(&mut self.sec_bytes);
+        let Some(cap) = self.max_video_bps else {
+            if !self.forced_low.is_empty() {
+                self.forced_low.clear();
+                self.push_watchers();
+            }
+            return;
+        };
+        let rate = self.last_sec_bytes.1 * 8;
+        if rate > cap {
+            self.cap_calm_secs = 0;
+            let mut cands: Vec<(u32, u32)> = Vec::new();
+            for (vid, v) in &self.users {
+                for s in &v.watching {
+                    let Some(su) = self.users.get(s) else { continue };
+                    let via_server = !su.direct_video.contains(vid) && !self.video_relays.contains_key(&(*s, *vid));
+                    if su.simulcast && via_server && !v.watch_low.contains(s) && !self.forced_low.contains(&(*vid, *s)) {
+                        cands.push((*vid, *s));
+                    }
+                }
+            }
+            cands.sort();
+            if let Some(c) = cands.first() {
+                self.forced_low.insert(*c);
+                self.push_watchers();
+            }
+        } else if rate < cap * 6 / 10 && !self.forced_low.is_empty() {
+            self.cap_calm_secs += 1;
+            if self.cap_calm_secs >= 10 {
+                self.cap_calm_secs = 0;
+                let mut v: Vec<(u32, u32)> = self.forced_low.iter().copied().collect();
+                v.sort();
+                self.forced_low.remove(&v[v.len() - 1]);
+                self.push_watchers();
+            }
+        } else {
+            self.cap_calm_secs = 0;
+        }
+        // 已经不看了的去掉
+        let users = &self.users;
+        self.forced_low.retain(|(v, s)| users.get(v).is_some_and(|u| u.watching.contains(s)));
+    }
+
+    /// 状态文件内容
+    fn status_text(&self, port: u16) -> String {
+        use std::fmt::Write;
+        let mut t = String::new();
+        let _ = writeln!(t, "VOC 服务器 {} · 「{}」", env!("CARGO_PKG_VERSION"), self.server_name);
+        let probe = if self.probe_listening { format!("NAT 探测 UDP {}（监听中）", self.probe_port) } else { "NAT 探测端口没开".into() };
+        let _ = writeln!(t, "端口：TCP/UDP {port} · {probe}");
+        let mbps = |b: u64| b as f64 * 8.0 / 1e6;
+        let cap = self.max_video_bps.map(|c| format!("上限 {:.0} Mbps", c as f64 / 1e6)).unwrap_or_else(|| "不限".into());
+        let _ = writeln!(
+            t,
+            "最近 1 秒服务器转发：语音 {:.2} Mbps · 画面 {:.2} Mbps（画面{cap}）",
+            mbps(self.last_sec_bytes.0),
+            mbps(self.last_sec_bytes.1)
+        );
+        let _ = writeln!(t, "在线 {} 人", self.users.len());
+        let mut chans: Vec<&ChannelInfo> = self.channels.iter().collect();
+        chans.sort_by_key(|c| c.id);
+        for c in chans {
+            let mut names: Vec<String> = self
+                .users
+                .values()
+                .filter(|u| u.channel == Some(c.id))
+                .map(|u| {
+                    let mut n = u.name.clone();
+                    if u.deafened {
+                        n += "（静音）";
+                    } else if u.muted {
+                        n += "（闭麦）";
+                    }
+                    if let Some(d) = &u.sharing {
+                        n += &format!("（共享 {d}）");
+                    }
+                    n
+                })
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            names.sort();
+            let _ = writeln!(t, "  「{}」：{}", c.name, names.join("、"));
+        }
+        for (id, u) in &self.users {
+            if u.sharing.is_none() {
+                continue;
+            }
+            let watchers: Vec<u32> = self.users.iter().filter(|(_, v)| v.watching.contains(id)).map(|(i, _)| *i).collect();
+            let direct = watchers.iter().filter(|w| u.direct_video.contains(w)).count();
+            let relayed = watchers.iter().filter(|w| self.video_relays.contains_key(&(*id, **w))).count();
+            let _ = writeln!(
+                t,
+                "  {} 的屏幕：{} 人在看（直连 {direct}，观看者转发 {relayed}，经服务器 {}）",
+                u.name,
+                watchers.len(),
+                watchers.len() - direct - relayed
+            );
+        }
+        if !self.forced_low.is_empty() {
+            let _ = writeln!(t, "因为画面带宽上限临时改看「流畅」的：{} 人", self.forced_low.len());
+        }
+        let banned = self.bans.count(Instant::now());
+        if banned > 0 {
+            let _ = writeln!(t, "封禁中的 IP：{banned} 个（认证失败太多次）");
+        }
+        t
     }
 
     /// 观看者的补发请求：缓存里有的直接重发给他，没有的转给共享者（共享者重发后照常转发）
@@ -508,6 +759,7 @@ impl State {
             if relayed.contains(id) {
                 continue; // 由成员中继转发
             }
+            self.sec_bytes.0 += payload.len() as u64 + 60;
             match (other.voice_udp, other.udp) {
                 (true, Some(addr)) => {
                     let mut pkt = Vec::with_capacity(payload.len() + 64);
@@ -527,6 +779,8 @@ impl State {
 
 struct Config {
     bind: SocketAddr,
+    /// 服务器转发屏幕共享画面的总带宽上限（bps），None = 不限
+    max_video_bps: Option<u64>,
     /// NAT 探测端口，None = 主端口 + 1，Some(0) = 不开
     probe_port: Option<u16>,
     name: String,
@@ -549,6 +803,10 @@ VOC 服务器
     -c, --channels   初始语音频道
         --codes      授权码文件，默认 voc-codes.json
         --probe-port NAT 探测用的 UDP 端口，默认主端口 + 1（7879），0 = 不开
+        --max-video-mbps  服务器转发屏幕共享画面的总带宽上限（Mbps），超出时让部分观看者自动看「流畅」；默认不限
+
+查看运行状态（在线的人、谁在共享、转发带宽、NAT 探测端口）：
+  voc-server status [--codes 文件]
 
 管理授权码（服务器运行中也可以执行，立即生效）：
   voc-server gen-code [-n 数量] [--note 备注] [--days 有效天数] [--codes 文件]
@@ -579,6 +837,7 @@ fn main() {
 
     match rest.first().map(String::as_str) {
         Some("gen-code") => cmd_gen(&codes_path, &rest[1..]),
+        Some("status") => cmd_status(&codes_path),
         Some("list-codes") => cmd_list(&codes_path),
         Some("revoke-code") | Some("restore-code") => {
             let id = rest.get(1).unwrap_or_else(|| die("需要授权码 ID"));
@@ -604,6 +863,7 @@ fn parse_run(args: &[String], codes: PathBuf) -> Config {
     let mut cfg = Config {
         bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
         probe_port: None,
+        max_video_bps: None,
         name: "VOC 服务器".into(),
         channels: vec!["大厅".into(), "开黑一号".into(), "开黑二号".into(), "挂机".into()],
         codes,
@@ -615,6 +875,10 @@ fn parse_run(args: &[String], codes: PathBuf) -> Config {
             "--bind" | "-b" => cfg.bind = val().parse().unwrap_or_else(|_| die("--bind 格式应为 IP:端口")),
             "--name" | "-n" => cfg.name = val(),
             "--probe-port" => cfg.probe_port = Some(val().parse().unwrap_or_else(|_| die("--probe-port 必须是端口号"))),
+            "--max-video-mbps" => {
+                let m: f64 = val().parse().unwrap_or_else(|_| die("--max-video-mbps 必须是数字"));
+                cfg.max_video_bps = (m > 0.0).then_some((m * 1_000_000.0) as u64);
+            }
             "--channels" | "-c" => {
                 cfg.channels = val().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             }
@@ -643,6 +907,26 @@ fn cmd_gen(path: &std::path::Path, args: &[String]) {
     println!("已生成 {} 个授权码（只显示这一次，请妥善发给对应的人）：", codes.len());
     for c in codes {
         println!("{}", c.display());
+    }
+}
+
+/// 运行中的服务器每 5 秒写一次的状态文件（在授权码文件旁边）
+fn status_path(codes: &std::path::Path) -> PathBuf {
+    let stem = codes.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "voc".into());
+    codes.with_file_name(format!("{stem}.status.txt"))
+}
+
+fn cmd_status(codes: &std::path::Path) {
+    let p = status_path(codes);
+    match std::fs::read_to_string(&p) {
+        Ok(t) => {
+            let age = std::fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|m| m.elapsed().ok()).map(|d| d.as_secs()).unwrap_or(0);
+            print!("{t}");
+            if age > 15 {
+                println!("（这是 {age} 秒前的状态：服务器可能没在运行）");
+            }
+        }
+        Err(_) => println!("没有状态文件 {}：服务器没在运行，或者版本太旧（0.5.1 起才有）", p.display()),
     }
 }
 
@@ -704,6 +988,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         codes,
         replay: ReplayCache::default(),
         relays: HashMap::new(),
+        video_relays: HashMap::new(),
+        sec_bytes: (0, 0),
+        last_sec_bytes: (0, 0),
+        max_video_bps: cfg.max_video_bps,
+        forced_low: HashSet::new(),
+        cap_calm_secs: 0,
+        bans: BanList::default(),
+        probe_listening: false,
     }));
 
     println!("[VOC] 服务器「{}」已启动：TCP/UDP {}", cfg.name, cfg.bind);
@@ -715,6 +1007,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     println!("[VOC] 加密：ML-KEM-768 + ChaCha20-Poly1305，全流量随机化；放行 TCP 与 UDP 端口 {port}");
 
     tokio::spawn(udp_loop(state.clone(), udp_sock.clone()));
+    state.lock().unwrap().probe_listening = probe_sock.is_some();
+    tokio::spawn(status_loop(state.clone(), status_path(&cfg.codes), port));
     if let Some(p) = probe_sock {
         println!("[VOC] NAT 探测：UDP {}（云服务器的安全组也要放行这个 UDP 端口）", p.local_addr()?.port());
         tokio::spawn(probe_loop(state.clone(), p));
@@ -726,6 +1020,15 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         tokio::select! {
             r = tcp.accept() => {
                 let Ok((stream, addr)) = r else { continue };
+                // 被封的 IP：不做任何处理，吞掉数据后关闭（和探测得到的反应一样）
+                if state.lock().unwrap().banned(addr.ip()) {
+                    tokio::spawn(async move {
+                        let (rd, wr) = stream.into_split();
+                        sink(rd).await;
+                        drop(wr);
+                    });
+                    continue;
+                }
                 let _ = stream.set_nodelay(true);
                 let (st, us) = (state.clone(), udp_sock.clone());
                 tokio::spawn(async move {
@@ -818,7 +1121,14 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     let (p, psk, entry) = match ident {
         Ok(x) => x,
         Err(why) => {
-            println!("[{addr}] 拒绝：{why}");
+            // 同一个 IP 1 分钟内只记第一次，免得扫描刷屏；失败太多次就封几分钟
+            let (log, banned) = state.lock().unwrap().auth_failed(addr.ip());
+            if log {
+                println!("[{addr}] 拒绝：{why}");
+            }
+            if banned {
+                println!("[VOC] {} 1 分钟内认证失败 {BAN_FAILS} 次，封 {} 分钟", addr.ip(), BAN_FOR.as_secs() / 60);
+            }
             sink(rd).await;
             return Ok(());
         }
@@ -918,8 +1228,11 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 watching: HashSet::new(),
                 watch_low: HashSet::new(),
                 watch_route: HashMap::new(),
+                watch_cursor: HashSet::new(),
                 simulcast: false,
                 rtx: false,
+                share_bps: 0,
+                last_video_relays: Vec::new(),
                 video_cache: VideoCache::default(),
                 last_watchers: Default::default(),
                 decoders: Vec::new(),
@@ -1195,13 +1508,14 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::ShareStart { desc, audio, simulcast, rtx } => {
+        ClientMsg::ShareStart { desc, audio, simulcast, rtx, bps } => {
             let desc: String = desc.trim().chars().take(16).collect();
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.channel.is_some() {
                     u.share_audio = audio;
                     u.simulcast = simulcast;
                     u.rtx = rtx;
+                    u.share_bps = bps.min(100_000_000);
                     u.video_cache = VideoCache::default();
                     u.sharing = Some(if desc.is_empty() { "屏幕".into() } else { desc });
                     let name = u.name.clone();
@@ -1217,7 +1531,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::Watch { target, on, low, route } => {
+        ClientMsg::Watch { target, on, low, route, cursor } => {
             let ok = match (st.users.get(&uid), st.users.get(&target)) {
                 (Some(me), Some(t)) => t.sharing.is_some() && me.channel.is_some() && me.channel == t.channel,
                 _ => false,
@@ -1235,11 +1549,29 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                     } else {
                         u.watch_route.remove(&target);
                     }
+                    if cursor {
+                        u.watch_cursor.insert(target);
+                    } else {
+                        u.watch_cursor.remove(&target);
+                    }
                 } else {
                     u.watching.remove(&target);
                     u.watch_low.remove(&target);
                     u.watch_route.remove(&target);
+                    u.watch_cursor.remove(&target);
                 }
+            }
+        }
+        ClientMsg::VideoLtr { target, ack, recover } => {
+            let watching = st.users.get(&uid).is_some_and(|u| u.watching.contains(&target));
+            if let (true, Some(t)) = (watching, st.users.get(&target)) {
+                t.send(ServerMsg::VideoLtr { by: uid, ack, recover });
+            }
+        }
+        ClientMsg::VideoReport { target, loss, rtt } => {
+            let watching = st.users.get(&uid).is_some_and(|u| u.watching.contains(&target));
+            if let (true, Some(t)) = (watching, st.users.get(&target)) {
+                t.send(ServerMsg::VideoReport { by: uid, loss: loss.min(1000), rtt: rtt.min(10_000) });
             }
         }
         ClientMsg::KeyframeRequest { target } => {
@@ -1257,12 +1589,19 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::LinkStats { server_rtt, peers, relay_slots, via_server } => {
+        ClientMsg::LinkStats { server_rtt, peers, relay_slots, via_server, video_relay_bps } => {
             let Some(u) = st.users.get_mut(&uid) else { return };
             let allowed: HashSet<u32> = u.last_peers.iter().map(|p| p.id).collect();
             let peers: Vec<PeerStat> = peers.into_iter().filter(|p| allowed.contains(&p.id)).take(32).collect();
             let via_server: HashSet<u32> = via_server.into_iter().take(32).collect();
-            u.stats = Some(LinkReport { at: Instant::now(), server_rtt: server_rtt.min(10_000), peers, slots: relay_slots.min(16), via_server });
+            u.stats = Some(LinkReport {
+                at: Instant::now(),
+                server_rtt: server_rtt.min(10_000),
+                peers,
+                slots: relay_slots.min(16),
+                via_server,
+                video_relay_bps,
+            });
         }
         ClientMsg::DirectPeers { ids, video } => {
             let Some(u) = st.users.get(&uid) else { return };
@@ -1308,11 +1647,23 @@ async fn revocation_loop(state: Shared) {
     }
 }
 
+/// 每 5 秒把运行状态写进状态文件（`voc-server status` / `voc status` 读）
+async fn status_loop(state: Shared, path: PathBuf, port: u16) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let text = state.lock().unwrap().status_text(port);
+        let _ = std::fs::write(&path, text);
+    }
+}
+
 /// 每秒重新规划一次成员中继（上报过期、链路变化都会体现）
 async fn relay_loop(state: Shared) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        state.lock().unwrap().push_relays();
+        let mut st = state.lock().unwrap();
+        st.push_relays();
+        st.push_video_relays();
+        st.balance_video_cap();
     }
 }
 
@@ -1409,7 +1760,7 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
                 }
                 udp::VIDEO => out = st.forward_video(uid, &data),
                 udp::NACK => out = st.on_nack(uid, &data),
-                udp::MUSIC | udp::SHARE_AUDIO => {
+                udp::MUSIC | udp::SHARE_AUDIO | udp::CURSOR => {
                     if let Some((seq, f)) = udp::read_client_voice(&data) {
                         out = st.forward_stream(uid, kind, seq, f);
                     }
@@ -1426,6 +1777,33 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
 #[cfg(test)]
 mod tests {
     use super::is_public;
+
+    #[test]
+    fn repeated_auth_failures_ban_the_ip_for_a_while() {
+        use super::{BanList, BAN_FAILS, BAN_FOR};
+        use std::time::{Duration, Instant};
+        let mut b = BanList::default();
+        let (ip, other): (std::net::IpAddr, std::net::IpAddr) = ("1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap());
+        let t = Instant::now();
+        assert_eq!(b.failed(ip, t), (true, false), "first failure is logged");
+        for i in 2..BAN_FAILS {
+            assert_eq!(b.failed(ip, t), (false, false), "failure {i} is not logged again");
+        }
+        assert!(!b.banned(ip, t));
+        assert_eq!(b.failed(ip, t), (false, true));
+        assert!(b.banned(ip, t + Duration::from_secs(1)));
+        assert!(!b.banned(other, t), "other IPs are not affected");
+        assert_eq!(b.count(t), 1);
+        assert!(!b.banned(ip, t + BAN_FOR + Duration::from_secs(1)), "ban expires");
+        // 慢慢试（每分钟不到 10 次）不会被封
+        let mut b = BanList::default();
+        for m in 0..30u64 {
+            for _ in 0..(BAN_FAILS - 1) {
+                b.failed(other, t + Duration::from_secs(61 * m));
+            }
+        }
+        assert!(!b.banned(other, t + Duration::from_secs(61 * 30)));
+    }
 
     #[test]
     fn public_address_filter() {
