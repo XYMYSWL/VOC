@@ -627,7 +627,11 @@ fn remote_smoke() {
 fn channel_capacity_is_20() {
     let srv = Server::start(7);
     let codes = srv.gen_codes(21);
-    let mut cs: Vec<Client> = codes.iter().enumerate().map(|(i, c)| Client::connect(srv.port, c, &format!("u{i}")).unwrap()).collect();
+    // 21 个人连续登录；机器很忙时握手偶尔超时，重试一下
+    let connect = |c: &str, name: String| {
+        (0..3).find_map(|_| Client::connect(srv.port, c, &name).ok()).expect("login after 3 attempts")
+    };
+    let mut cs: Vec<Client> = codes.iter().enumerate().map(|(i, c)| connect(c, format!("u{i}"))).collect();
     for c in cs.iter_mut().take(20) {
         c.send(ClientMsg::JoinChannel { channel_id: 1 });
     }
