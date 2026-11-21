@@ -889,7 +889,15 @@ impl App {
             return;
         }
         self.test_log_at = std::time::Instant::now();
-        let mut line = format!("{} ", voc_proto::now_millis());
+        let mut line = format!(
+            "{} 闭麦 {} 静音 {} ",
+            voc_proto::now_millis(),
+            self.settings.muted.load(Ordering::Relaxed),
+            self.settings.deafened.load(Ordering::Relaxed)
+        );
+        if let Some(l) = self.voice.current_link() {
+            line += &format!("NAT {:?} ", *l.nat.lock().unwrap());
+        }
         if let Some(l) = self.voice.current_link() {
             let (v, d) = l.allocation();
             line += &format!("udp {:?} 语音直连 {v:?} 画面直连 {d:?} 观看者 {} ", self.voice.transport_udp(), l.watcher_count());
@@ -1812,12 +1820,19 @@ impl App {
             ],
             chat: vec![
                 ChatLine::System("小明 进入了语音频道「开黑一号」".into()),
-                ChatLine::User { from: "阿豪".into(), text: "今晚八点三角洲，来不来".into(), ts: now - 600_000, mine: false, id: None, reactions: Vec::new() },
+                ChatLine::User {
+                    from: "阿豪".into(),
+                    text: "@小明 今晚八点三角洲，来不来".into(),
+                    ts: now - 600_000,
+                    mine: false,
+                    id: Some((2, 1)),
+                    reactions: vec![("👍".into(), vec![1, 3, 4])],
+                },
                 ChatLine::User { from: "阿豪".into(), text: "我先开个屏幕给你们看配装".into(), ts: now - 590_000, mine: false, id: None, reactions: Vec::new() },
                 ChatLine::User { from: "小明".into(), text: "来！我把降噪开了，键盘声应该听不到了".into(), ts: now - 420_000, mine: true, id: None, reactions: Vec::new() },
                 ChatLine::System("阿豪 开始了屏幕共享".into()),
                 ChatLine::User { from: "阿杰".into(), text: "我这边网络有点卡，先闭麦听你们说".into(), ts: now - 120_000, mine: false, id: None, reactions: Vec::new() },
-                ChatLine::User { from: "Mia".into(), text: "1080p60 好清楚 👍".into(), ts: now - 30_000, mine: false, id: None, reactions: Vec::new() },
+                ChatLine::User { from: "Mia".into(), text: "1080p60 好清楚 👍".into(), ts: now - 30_000, mine: false, id: Some((5, 1)), reactions: vec![("❤".into(), vec![2])] },
             ],
             chat_input: String::new(),
             new_channel: String::new(),
