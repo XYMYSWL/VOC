@@ -20,11 +20,17 @@ jobs:
     outputs:
       exists: ${{ steps.r.outputs.exists }}
     steps:
+      # 标签名只经环境变量传给脚本（不直接拼进脚本源码），并且必须是 v数字.数字.数字
       - id: r
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "标签 $TAG 不是 vX.Y.Z 格式，不发布"; exit 1
+          fi
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"; echo "Release 已存在，跳过"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -43,9 +49,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: 版本号要和标签一致
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "标签 $($env:TAG) 不是 vX.Y.Z 格式" }
           $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ("v$ver" -ne "${{ github.ref_name }}") { throw "Cargo.toml 版本 $ver 和标签 ${{ github.ref_name }} 不一致" }
+          if ("v$ver" -ne $env:TAG) { throw "Cargo.toml 版本 $ver 和标签 $($env:TAG) 不一致" }
       - name: 准备签名证书
         id: sign
         shell: pwsh
@@ -71,11 +80,13 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          SIGNED: ${{ steps.sign.outputs.signed }}
         run: |
           Copy-Item deploy\linux\get.sh dist\get.sh -Force
           $files = @("dist\get.sh", "dist\VOC-portable.zip", "dist\voc-server-linux.tar.gz")
-          if ("${{ steps.sign.outputs.signed }}" -eq "true") { $files += @("dist\VOC-Setup.exe", "dist\VOC.cer") + (Get-ChildItem dist\VOC-*.msix).FullName }
-          gh release create "${{ github.ref_name }}" --title "VOC ${{ github.ref_name }}" --generate-notes @files
+          if ($env:SIGNED -eq "true") { $files += @("dist\VOC-Setup.exe", "dist\VOC.cer") + (Get-ChildItem dist\VOC-*.msix).FullName }
+          gh release create $env:TAG --title "VOC $($env:TAG)" --generate-notes @files
       - name: 清除签名私钥
         if: always()
         shell: pwsh

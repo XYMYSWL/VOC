@@ -6,6 +6,7 @@
 #   sudo bash install.sh --port 443 --name "我的 VOC 服"  # 自定义端口、名称
 #   sudo bash install.sh --channels "大厅,五排,双排,挂机"
 #   sudo bash install.sh --upgrade                        # 只更新程序，保留配置和授权码
+#   sudo bash install.sh --max-video-mbps 1.5             # 服务器转发屏幕共享画面最多 1.5 Mbps（带宽小的服务器用）
 #
 # 再次运行即为升级：授权码（/var/lib/voc）和配置（/etc/voc）都会保留。
 # 不想手动下载解压？用一键脚本：curl -fsSL https://github.com/XYMYSWL/VOC/releases/latest/download/get.sh | sudo bash
@@ -18,6 +19,7 @@ CHANNELS=""
 BIND_IP=""
 UPGRADE=0
 FIREWALL=1
+MAX_VIDEO=""
 
 BIN=/usr/local/bin/voc-server
 ADMIN=/usr/local/bin/voc
@@ -43,6 +45,8 @@ usage() {
   --channels <a,b,c>    初始语音频道
   --bind-ip <IP>        只监听某个地址，默认 0.0.0.0（全部 IPv4）；用 :: 可同时监听 IPv6
   --upgrade             只替换程序并重启，不改配置
+  --max-video-mbps <N>  服务器转发屏幕共享画面的总带宽上限（Mbps，可以带小数；off = 不限）。
+                        超出时让部分观看者自动改看「流畅」。装好后也能改：sudo voc video-limit 1.5
   --no-firewall         不自动放行防火墙端口
 EOF
 }
@@ -54,6 +58,7 @@ while [ $# -gt 0 ]; do
         --channels) CHANNELS="${2:-}"; shift 2 ;;
         --bind-ip) BIND_IP="${2:-}"; shift 2 ;;
         --upgrade) UPGRADE=1; shift ;;
+        --max-video-mbps) MAX_VIDEO="${2:-}"; shift 2 ;;
         --no-firewall) FIREWALL=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "未知参数：$1（用 --help 查看）" ;;
@@ -67,6 +72,24 @@ if [ -n "$PORT" ]; then
     case "$PORT" in ''|*[!0-9]*) die "端口必须是数字" ;; esac
     [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "端口范围 1-65535"
 fi
+# 画面限速 → 配置里的 VOC_VIDEO_ARGS
+VIDEO_ARGS=""
+if [ -n "$MAX_VIDEO" ]; then
+    case "$MAX_VIDEO" in
+        off|0) VIDEO_ARGS="" ;;
+        *) printf '%s' "$MAX_VIDEO" | grep -Eq '^[0-9]+(\.[0-9]+)?$' || die "--max-video-mbps 要填数字（Mbps），例如 1.5，或 off"
+           VIDEO_ARGS="--max-video-mbps $MAX_VIDEO" ;;
+    esac
+fi
+
+# 改配置文件里的一项（没有就加上）
+set_conf() {
+    if grep -q "^$1=" "$CONF"; then
+        sed -i "s|^$1=.*|$1=\"$2\"|" "$CONF"
+    else
+        printf '%s="%s"\n' "$1" "$2" >> "$CONF"
+    fi
+}
 
 # ---------------------------------------------------------------- 选择程序
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -109,10 +132,18 @@ VOC_BIND_IP="$VOC_BIND_IP"
 VOC_BIND="$VOC_BIND"
 VOC_NAME="$VOC_NAME"
 VOC_CHANNELS="$VOC_CHANNELS"
-# 附加参数，例如限制服务器转发屏幕共享画面的总带宽（Mbps）：VOC_EXTRA_ARGS="--max-video-mbps 50"
-VOC_EXTRA_ARGS=""
+# 服务器转发屏幕共享画面的总带宽上限，用命令改：sudo voc video-limit 1.5（Mbps）/ sudo voc video-limit off
+VOC_VIDEO_ARGS="${VOC_VIDEO_ARGS:-}"
+# 其他附加参数
+VOC_EXTRA_ARGS="${VOC_EXTRA_ARGS:-}"
 EOF
     chmod 0644 "$CONF"
+fi
+if [ -n "$MAX_VIDEO" ]; then
+    # 以前写在附加参数里的画面限速先去掉，免得两处打架
+    sed -i 's/--max-video-mbps [0-9.]*//' "$CONF"
+    set_conf VOC_VIDEO_ARGS "$VIDEO_ARGS"
+    if [ -n "$VIDEO_ARGS" ]; then info "画面限速：$MAX_VIDEO Mbps"; else info "画面限速：不限"; fi
 fi
 # shellcheck disable=SC1090
 . "$CONF"
@@ -132,7 +163,7 @@ User=$SVC_USER
 Group=$SVC_USER
 EnvironmentFile=$CONF
 WorkingDirectory=$DATA
-ExecStart=$BIN --bind \${VOC_BIND} --name \${VOC_NAME} --channels \${VOC_CHANNELS} --codes $CODES \$VOC_EXTRA_ARGS
+ExecStart=$BIN --bind \${VOC_BIND} --name \${VOC_NAME} --channels \${VOC_CHANNELS} --codes $CODES \$VOC_VIDEO_ARGS \$VOC_EXTRA_ARGS
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
@@ -172,11 +203,37 @@ cat > "$ADMIN" <<EOF
 #   voc status                                           运行状态（在线的人、谁在共享、转发带宽、NAT 探测端口）
 #   voc logs | restart | stop | start                    服务管理
 #   voc config                                           编辑配置
+#   voc video-limit [Mbps|off]                           服务器转发屏幕共享画面的上限（不带参数 = 查看）
 #   voc upgrade [vX.Y.Z]                                 升级到最新版（或指定版本），保留授权码和配置
 #   voc version                                          显示版本
 set -e
 [ "\$(id -u)" -eq 0 ] || { echo "请用 sudo 运行：sudo voc \$*"; exit 1; }
+set_conf() {
+    if grep -q "^\$1=" $CONF; then
+        sed -i "s|^\$1=.*|\$1=\"\$2\"|" $CONF
+    else
+        printf '%s="%s"\n' "\$1" "\$2" >> $CONF
+    fi
+}
 case "\${1:-}" in
+    video-limit)
+        V="\${2:-}"
+        CUR="\$(. $CONF; printf '%s %s' "\${VOC_VIDEO_ARGS:-}" "\${VOC_EXTRA_ARGS:-}" | grep -o -- '--max-video-mbps [0-9.]*' | head -1 | awk '{print \$2}')"
+        if [ -z "\$V" ]; then
+            if [ -n "\$CUR" ]; then echo "服务器转发屏幕共享画面：最多 \$CUR Mbps"; else echo "服务器转发屏幕共享画面：不限"; fi
+            echo "修改：sudo voc video-limit 1.5（单位 Mbps，可带小数）/ sudo voc video-limit off（不限）"
+            exit 0
+        fi
+        case "\$V" in
+            off|0) NEW="" ;;
+            *) printf '%s' "\$V" | grep -Eq '^[0-9]+(\.[0-9]+)?\$' || { echo "要填数字（Mbps），例如 1.5，或 off"; exit 1; }
+               NEW="--max-video-mbps \$V" ;;
+        esac
+        sed -i 's/--max-video-mbps [0-9.]*//' $CONF
+        set_conf VOC_VIDEO_ARGS "\$NEW"
+        echo "已保存。重启服务生效：在线的人会断开一两秒，然后自动重连……"
+        systemctl restart voc-server
+        if [ -n "\$NEW" ]; then echo "服务器转发屏幕共享画面：最多 \$V Mbps（超出时部分观看者自动改看「流畅」）"; else echo "服务器转发屏幕共享画面：不限"; fi ;;
     status)
         systemctl status voc-server --no-pager -n 0 || true
         echo
@@ -195,7 +252,7 @@ case "\${1:-}" in
         else
             exec su -s /bin/sh $SVC_USER -c '$BIN "\$@" --codes $CODES' -- sh "\$@"
         fi ;;
-    *) sed -n '2,10p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,11p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 EOF
 chmod 0755 "$ADMIN"
@@ -265,6 +322,7 @@ echo "  sudo voc gen-code --note 小明        给小明生成授权码"
 echo "  sudo voc gen-code -n 5 --days 30     生成 5 个 30 天有效的授权码"
 echo "  sudo voc list-codes / revoke-code <ID>"
 echo "  sudo voc status / logs / restart"
+echo "  sudo voc video-limit 1.5             服务器带宽小：转发屏幕共享画面最多 1.5 Mbps（off = 不限）"
 echo "  sudo voc upgrade                     升级到最新版（保留授权码和配置）"
 echo
 red "⚠ 如果是云服务器（阿里云、腾讯云、AWS 等），还要在控制台的「安全组 / 防火墙」里放行 TCP 和 UDP 的 $VOC_PORT 端口，以及 UDP $PROBE_PORT（NAT 探测，可选）。"

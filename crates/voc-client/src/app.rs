@@ -59,12 +59,16 @@ struct Persisted {
     deafen_key: crate::hotkey::Hotkey,
     /// 低带宽模式（手机热点、流量少的网络）
     low_bandwidth: bool,
-    /// 手动选的线路：服务器地址 → 昵称 → 选择（没有的按自动）
+    /// 0.5.x 的手动线路（一个选择）：启动时迁移到 peer_routes 后清空
     routes: HashMap<String, HashMap<String, voice::RoutePref>>,
+    /// 0.6 起的手动线路：服务器地址 → 昵称 → 语音 / 画面 / 不透露 IP（没有的按自动）
+    peer_routes: HashMap<String, HashMap<String, voice::PeerRoute>>,
     /// 上次所在的语音频道（按服务器），开机自启自动登录后回到这里
     last_channel: HashMap<String, u32>,
     /// 观看屏幕共享时用显卡硬解
     hw_decode: bool,
+    /// 观看屏幕共享：流畅优先（匀速播放，默认）/ 延迟优先
+    smooth_playback: bool,
     /// 0.5.1 起默认硬解：老配置里的「软解」迁移一次（老配置没有这个字段 → false → 迁移）
     #[serde(default)]
     hw_decode_migrated: bool,
@@ -119,8 +123,10 @@ impl Default for Persisted {
             deafen_key: crate::hotkey::Hotkey::ctrl(0x44),
             low_bandwidth: false,
             routes: HashMap::new(),
+            peer_routes: HashMap::new(),
             last_channel: HashMap::new(),
             hw_decode: true,
+            smooth_playback: true,
             hw_decode_migrated: true,
             auto_update: true,
             update_accel: false,
@@ -468,6 +474,9 @@ pub struct App {
     updater: crate::update::Updater,
     /// 上次点「复制诊断信息」的时间（显示「已复制」）
     diag_copied: Option<std::time::Instant>,
+    /// 诊断信息里附上「编号 ↔ 昵称」对照（默认不附）
+    diag_names: bool,
+    log_path_copied: Option<std::time::Instant>,
     /// 断开后保留的聊天（按服务器），只在内存里，关闭 VOC 时清空
     chat_store: HashMap<String, (Vec<ChatLine>, Vec<DmThread>)>,
     /// 重连成功后要回到的语音频道
@@ -556,6 +565,10 @@ impl App {
         crate::audio::LOW_BANDWIDTH.store(cfg.low_bandwidth, Ordering::Relaxed);
         settings.input_gain.set(cfg.input_gain);
         settings.output_volume.set(cfg.output_volume);
+        // 测试：VOC_TEST_TONE=1 时不用麦克风、自己「一直说话」（见 voice.rs），也不从音箱放声音
+        if std::env::var_os("VOC_TEST_TONE").is_some() {
+            settings.output_volume.set(0.0);
+        }
         let mixer = Arc::new(Mutex::new(Mixer::default()));
         let voice = Arc::new(VoiceState::default());
         // 0.5.1 起观看默认用显卡解码（出错会自动退回软解）；老配置里默认的「软解」改一次
@@ -563,7 +576,18 @@ impl App {
             cfg.hw_decode = true;
             cfg.hw_decode_migrated = true;
         }
+        // 0.6：每人的线路从一个选择分成语音 / 画面 / 不透露 IP（「走服务器」= 不透露 IP，「强制直连」= 语音和画面都强制直连）
+        for (server, m) in std::mem::take(&mut cfg.routes) {
+            let dst = cfg.peer_routes.entry(server).or_default();
+            for (name, r) in m {
+                let pr = voice::PeerRoute::from_old(r);
+                if !pr.is_default() {
+                    dst.entry(name).or_insert(pr);
+                }
+            }
+        }
         video::HW_DECODE.store(cfg.hw_decode, Ordering::Relaxed);
+        video::SMOOTH_PLAYBACK.store(cfg.smooth_playback, Ordering::Relaxed);
         voice.video.set_ctx(cc.egui_ctx.clone()); // 收到新视频帧时唤醒界面
         let (frames_tx, frames_rx) = mpsc::sync_channel(100);
         let denoise: DenoiseSlot = Arc::new(Mutex::new(None));
@@ -599,6 +623,8 @@ impl App {
             sfx_seq: 0,
             updater: crate::update::Updater::default(),
             diag_copied: None,
+            diag_names: false,
+            log_path_copied: None,
             chat_store: HashMap::new(),
             rejoin: None,
             egui_ctx: cc.egui_ctx.clone(),
@@ -726,6 +752,7 @@ impl App {
         std::thread::spawn(move || {
             let notify_ctx = ctx2.clone();
             let mut pcm = Vec::new();
+            crate::traffic::reset(); // 「本次流量」从登录起算
             let r = net::connect(
                 &addr,
                 &name,
@@ -733,6 +760,8 @@ impl App {
                 move || notify_ctx.request_repaint(),
                 move |kind, payload| match kind {
                     voc_proto::crypto::KIND_VIDEO => voice::on_server_video(payload, &voice, false),
+                    // UDP 不通时经 TCP 收到的伴奏 / 共享声音 / 鼠标
+                    voc_proto::crypto::KIND_STREAM => voice::on_tcp_stream(payload, &voice, &mixer, &mut pcm),
                     _ => voice::on_server_voice(payload, &voice, &mixer, &mut pcm),
                 },
             );
@@ -876,7 +905,7 @@ impl App {
             let rtx = env("VOC_TEST_RTX") != Some(0);
             match Sharer::start(cfg.clone(), self.voice.clone()) {
                 Ok(sh) => {
-                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true, rtx, bps: cfg.bitrate() });
+                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true, rtx, bps: cfg.bitrate(), p2p_only: cfg.p2p_only });
                     self.sharer = Some(sh);
                 }
                 Err(e) => eprintln!("VOC_TEST_SHARE 失败：{e}"),
@@ -909,15 +938,32 @@ impl App {
         );
         if let Some(l) = self.voice.current_link() {
             line += &format!("NAT {:?} ", *l.nat.lock().unwrap());
+            // 三人测试：每个人的语音这一秒放了几帧（满分 50）、其中补出来的几帧；中转路线；语音优先改走服务器的人
+            let mut rx: Vec<(u32, (u32, u32))> = std::mem::take(&mut *self.voice.voice_rx.lock().unwrap()).into_iter().collect();
+            rx.sort();
+            line += &format!(
+                "语音收 {} 中转 {} 改走服务器 {:?} ",
+                rx.iter().map(|(id, (n, c))| format!("#{id}:{n}/{c}")).collect::<Vec<_>>().join(","),
+                l.relays().iter().map(|r| format!("#{}→#{}经#{}", r.from, r.to, r.via)).collect::<Vec<_>>().join(","),
+                l.server_fallback.lock().unwrap().iter().collect::<Vec<_>>()
+            );
+            let q: Vec<String> = l.direct_peers().iter().map(|(id, q)| format!("#{id}:{}ms/{}%{}", q.rtt_ms, q.loss_pct, if q.unstable { "不稳" } else { "" })).collect();
+            line += &format!("直连质量 {} ", q.join(","));
         }
         if let Some(l) = self.voice.current_link() {
             let (v, d) = l.allocation();
-            line += &format!("udp {:?} 语音直连 {v:?} 画面直连 {d:?} 观看者 {} ", self.voice.transport_udp(), l.watcher_count());
+            line += &format!(
+                "udp {:?} 语音直连 {v:?} 画面直连 {d:?} 观看者 {} 陌生丢 {} 匀速丢 {} ",
+                self.voice.transport_udp(),
+                l.watcher_count(),
+                l.unknown_dropped.load(Ordering::Relaxed),
+                l.pace_dropped_total()
+            );
         }
         if let Some(sh) = &self.sharer {
             let st = &sh.stats;
             line += &format!(
-                "| 共享 鼠标单独发 {} 恢复帧 {} 变化区域 {} 占 {}‰ 冗余 {} 静止跳过 {} 降到 {} 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
+                "| 共享 鼠标单独发 {} 恢复帧 {} 变化区域 {} 占 {}‰ 冗余 {} 静止跳过 {} 降到 {} {}系统给 {} fps 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
                 st.cursor_separate.load(Ordering::Relaxed),
                 st.ltr_recovers.load(Ordering::Relaxed),
                 st.dirty_last.load(Ordering::Relaxed),
@@ -925,6 +971,8 @@ impl App {
                 st.fec_pct.load(Ordering::Relaxed),
                 st.static_skipped.load(Ordering::Relaxed),
                 st.auto_height.load(Ordering::Relaxed),
+                if st.congested.load(Ordering::Relaxed) { "拥塞 " } else { "" },
+                st.source_fps.load(Ordering::Relaxed),
                 st.capture_fps.load(Ordering::Relaxed),
                 st.fps.load(Ordering::Relaxed),
                 st.kbps.load(Ordering::Relaxed),
@@ -957,13 +1005,13 @@ impl App {
     fn sync_routes(&self) {
         let Screen::Main(s) = &self.screen else { return };
         let Some(l) = self.voice.current_link() else { return };
-        let map: HashMap<u32, voice::RoutePref> = match self.cfg.routes.get(&s.server_key) {
+        let id_of = |n: &str| s.users.iter().find(|u| u.name == n && u.id != s.user_id).map(|u| u.id);
+        let map: HashMap<u32, voice::PeerPref> = match self.cfg.peer_routes.get(&s.server_key) {
             Some(m) => s
                 .users
                 .iter()
                 .filter(|u| u.id != s.user_id)
-                .filter_map(|u| m.get(&u.name).map(|r| (u.id, *r)))
-                .filter(|(_, r)| *r != voice::RoutePref::Auto)
+                .filter_map(|u| m.get(&u.name).filter(|r| !r.is_default()).map(|r| (u.id, voice::PeerPref::from_route(r, id_of))))
                 .collect(),
             None => HashMap::new(),
         };
@@ -973,6 +1021,14 @@ impl App {
     /// 诊断信息（给别人排查问题用）：版本、系统、网络、声卡、编解码器。
     /// 不含聊天、密钥、授权码、服务器地址和任何人的 IP。
     fn diagnostics(&self) -> String {
+        // 路径里的 Windows 用户名换成 %USERPROFILE%（诊断信息会发给别人）
+        fn log_path_for_diag(p: &std::path::Path) -> String {
+            let s = p.display().to_string();
+            match std::env::var("USERPROFILE") {
+                Ok(home) if !home.is_empty() && s.to_lowercase().starts_with(&home.to_lowercase()) => format!("%USERPROFILE%{}", &s[home.len()..]),
+                _ => s,
+            }
+        }
         use std::fmt::Write;
         let mut d = String::new();
         let _ = writeln!(d, "VOC 诊断信息");
@@ -1015,6 +1071,7 @@ impl App {
                 }
                 let (now, avg, peak) = l.upload_kbps();
                 let _ = writeln!(d, "上行：当前 {now} kbps · 最近 30 秒平均 {avg} · 峰值 {peak}");
+                let _ = writeln!(d, "本次流量：{}", crate::traffic::summary());
                 match &self.sharer {
                     Some(sh) => {
                         let st = &sh.stats;
@@ -1191,6 +1248,18 @@ impl App {
             let _ = writeln!(d, "
 [最近日志]
 {log}");
+        }
+        if let Some(p) = crate::applog::path() {
+            let _ = writeln!(d, "日志文件：{}", log_path_for_diag(&p));
+        }
+        // 用户勾了才附：日志和上面都只写编号
+        if self.diag_names {
+            if let Screen::Main(s) = &self.screen {
+                let _ = writeln!(d, "\n[编号 ↔ 昵称]");
+                for u in &s.users {
+                    let _ = writeln!(d, "#{} = {}{}", u.id, u.name, if u.id == s.user_id { "（我）" } else { "" });
+                }
+            }
         }
         d
     }
@@ -1734,6 +1803,11 @@ impl App {
                             l.set_relays(routes);
                         }
                     }
+                    ServerMsg::VoiceFallback { ids } => {
+                        if let Some(l) = self.voice.current_link() {
+                            l.set_server_fallback(ids);
+                        }
+                    }
                     ServerMsg::VideoRelays { routes } => {
                         if let Some(l) = self.voice.current_link() {
                             l.set_video_relays(routes);
@@ -1875,6 +1949,7 @@ impl App {
             share_audio: false,
             simulcast: sharing.is_some(),
             rtx: false,
+            share_p2p_only: false,
         };
         let (_tx, events) = mpsc::channel();
         let mut s = Session {

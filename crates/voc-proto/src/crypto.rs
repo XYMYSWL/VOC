@@ -56,6 +56,16 @@ pub const KIND_VOICE: u8 = 1;
 pub const KIND_VIDEO: u8 = 2;
 /// 图片分块（端到端加密的密文，见 file.rs）
 pub const KIND_FILE: u8 = 3;
+/// UDP 不通时的伴奏 / 共享声音 / 鼠标（0.6 起）：`UDP 包类型 u8（udp::MUSIC / SHARE_AUDIO / CURSOR）| 和 UDP 里一样的内容`
+pub const KIND_STREAM: u8 = 4;
+
+/// 拼一个 KIND_STREAM 帧的内容
+pub fn stream_frame(udp_kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + payload.len());
+    v.push(udp_kind);
+    v.extend_from_slice(payload);
+    v
+}
 
 #[derive(Clone)]
 pub struct SessionKeys {

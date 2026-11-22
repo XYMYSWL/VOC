@@ -15,7 +15,30 @@ pub mod file;
 pub mod p2p;
 pub mod udp;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+/// 7 = 0.6.0（和 0.5.x 不兼容：0.6 的服务器只让 0.6 的客户端登录）
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// 服务器拒绝协议版本不对的客户端时说的话（旧客户端照原样显示）
+pub fn version_mismatch_text(server: u32, client: u32) -> String {
+    if client < server {
+        format!("服务器已经升级（协议 {server}），你的 VOC 太旧（协议 {client}），请点「检查更新」或到 GitHub 下载新版")
+    } else {
+        format!("服务器版本太旧（协议 {server}，你的 VOC 是 {client}），请管理员在服务器上运行 sudo voc upgrade")
+    }
+}
+
+/// 客户端看到登录失败消息时换成更准确的说法：旧服务器对比它新的客户端也只会说「请更新客户端」
+pub fn explain_login_error(message: &str) -> String {
+    // 旧服务器的原话：「协议版本不匹配（服务器 6，客户端 7），请更新客户端」
+    let server = message
+        .strip_prefix("协议版本不匹配（服务器 ")
+        .and_then(|r| r.split('，').next())
+        .and_then(|n| n.trim().parse::<u32>().ok());
+    match server {
+        Some(s) if s < PROTOCOL_VERSION => version_mismatch_text(s, PROTOCOL_VERSION),
+        _ => message.to_string(),
+    }
+}
 pub const DEFAULT_PORT: u16 = 7878;
 /// 语音编解码 / 混音的采样率。Opus 码流和采样率无关：16 kHz 的旧版客户端和 48 kHz 的新版可以互相解码。
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -97,6 +120,9 @@ pub enum ClientMsg {
         /// 原画码率（bps），服务器安排观看者互相转发时估算上行用
         #[serde(default)]
         bps: u32,
+        /// 只走 P2P（0.6 起）：画面、补发、鼠标、共享声音都不经服务器；打不通直连、也没有观看者能转给他的人看不了
+        #[serde(default)]
+        p2p_only: bool,
     },
     /// 开始 / 停止伴奏（name = 程序名，None = 停止）
     SetMusic {
@@ -157,6 +183,19 @@ pub enum ClientMsg {
         /// 还能拿出来帮别人转发屏幕共享画面的上行（bps）；0 = 不当画面中继
         #[serde(default)]
         video_relay_bps: u32,
+        /// 0.6 语音优先：我最近 2 秒在说话（发出了语音）
+        #[serde(default)]
+        talking: bool,
+        /// 0.6 语音优先：最近 3 秒实际听到了（解出了）谁的语音。服务器发现「他在说、名单上说是直连 / 中转、我却没听到」
+        /// 就让说话的人改经服务器发给我（VoiceFallback），不依赖链路判断正确
+        #[serde(default)]
+        heard: Vec<u32>,
+        /// 0.6 用户手动指定的语音中转：[对方, 经谁]（两个方向都经这个人；服务器安排不了就走服务器）
+        #[serde(default)]
+        manual_via: Vec<[u32; 2]>,
+        /// 0.6 按听众保护语音：我经服务器收语音的丢包率（%）。高的话服务器只给我多发一份，不把开销摊给所有人
+        #[serde(default)]
+        voice_loss: u8,
     },
 }
 
@@ -274,6 +313,10 @@ pub enum ServerMsg {
     Relays {
         routes: Vec<RelayRoute>,
     },
+    /// 0.6 语音优先：这些人在你说话时没听到你（直连 / 中转那条路实际不通），先把给他们的语音改经服务器发（有变化才发）
+    VoiceFallback {
+        ids: Vec<u32>,
+    },
 }
 
 /// 端到端身份公告（字段均为 base64）。服务器不验证，由各客户端验签。
@@ -358,6 +401,9 @@ pub struct UserInfo {
     /// 屏幕共享支持丢包补发和冗余校验包
     #[serde(default)]
     pub rtx: bool,
+    /// 屏幕共享只走 P2P（画面不经服务器）
+    #[serde(default)]
+    pub share_p2p_only: bool,
 }
 
 /// 服务器功能：私聊发图（FileTarget）
@@ -383,6 +429,18 @@ pub fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_mismatch_explained() {
+        // 旧客户端连新服务器：服务器的话里说「你的 VOC 太旧」
+        assert!(version_mismatch_text(PROTOCOL_VERSION, 6).contains("太旧"));
+        assert!(version_mismatch_text(6, PROTOCOL_VERSION).contains("voc upgrade"));
+        // 新客户端连旧服务器：旧服务器说「请更新客户端」，客户端改成「服务器太旧」
+        let old = format!("协议版本不匹配（服务器 6，客户端 {PROTOCOL_VERSION}），请更新客户端");
+        assert!(explain_login_error(&old).contains("voc upgrade"), "{}", explain_login_error(&old));
+        // 其他错误原样
+        assert_eq!(explain_login_error("该昵称已被使用"), "该昵称已被使用");
+    }
 
     #[test]
     fn json_roundtrip() {

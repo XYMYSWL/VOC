@@ -225,8 +225,12 @@ impl App {
         let mut close_dm: Option<String> = None;
         let mut switch_tab: Option<Option<String>> = None;
         // 手动线路（按昵称）和这次在右键菜单里改的
-        let routes_by_name: HashMap<String, voice::RoutePref> = self.cfg.routes.get(&s.server_key).cloned().unwrap_or_default();
-        let mut route_change: Option<(String, voice::RoutePref)> = None;
+        let routes_by_name: HashMap<String, voice::PeerRoute> = self.cfg.peer_routes.get(&s.server_key).cloned().unwrap_or_default();
+        let mut route_change: Option<(String, voice::PeerRoute)> = None;
+        let lnk = self.voice.current_link();
+        // 能选来「经他中转」的人：同频道的其他人
+        let relay_choices: Vec<String> =
+            s.users.iter().filter(|x| x.id != s.user_id && my_channel.is_some() && x.channel_id == my_channel).map(|x| x.name.clone()).collect();
         let mic_silent = self.settings.mic_silent.load(Ordering::Relaxed) && my_channel.is_some();
         // 正在看的私聊：清未读；对话已不存在就回到频道聊天
         if let Some(p) = s.chat_tab.clone() {
@@ -508,10 +512,17 @@ impl App {
                                     ui.add_space(48.0);
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     let voice_direct = alloc_voice.contains(&u.id);
-                                    let pref = if is_me { voice::RoutePref::Auto } else { routes_by_name.get(&u.name).copied().unwrap_or_default() };
-                                    if pref == voice::RoutePref::Server {
-                                        th::pill(ui, "⇄ 走服务器（手动）", th::TEXT_DIM, th::BG_ELEVATED)
-                                            .on_hover_text("你选了和他之间走服务器；右键他的名字可以改回自动");
+                                    let pref = if is_me { voice::PeerRoute::default() } else { routes_by_name.get(&u.name).cloned().unwrap_or_default() };
+                                    let fallback = !is_me && lnk.as_ref().is_some_and(|l| l.in_server_fallback(u.id));
+                                    if pref.hide_ip {
+                                        th::pill(ui, "🔒 不透露 IP（手动）", th::TEXT_DIM, th::BG_ELEVATED)
+                                            .on_hover_text("你选了不和他直连、互相不透露 IP：语音、画面都经服务器（语音可以经队友中转）。右键他的名字可以改");
+                                    } else if pref.voice == voice::VoiceRoute::Server {
+                                        th::pill(ui, "⇄ 语音走服务器（手动）", th::TEXT_DIM, th::BG_ELEVATED)
+                                            .on_hover_text("你选了和他之间的语音走服务器（画面照常）；右键他的名字可以改回自动");
+                                    } else if fallback {
+                                        th::pill(ui, "⇄ 语音暂走服务器", th::YELLOW, th::BG_ELEVATED)
+                                            .on_hover_text("语音优先：你说话时他没听到（直连 / 中转那条路不通），先改经服务器发给他，一分钟后再试回直连");
                                     } else {
                                         match (via, q) {
                                             (Some(r), q) if !q.is_some_and(|q| voice_direct && !q.unstable) => {
@@ -525,9 +536,17 @@ impl App {
                                             }
                                         }
                                     }
-                                    if pref == voice::RoutePref::Direct {
+                                    if !pref.hide_ip && (pref.voice == voice::VoiceRoute::Direct || pref.video == voice::RoutePref::Direct) {
                                         th::pill(ui, "手动直连", th::ACCENT_HOVER, th::ACCENT_SOFT)
-                                            .on_hover_text("你选了强制 P2P 直连：打通了就一直直连；打不通时仍走服务器。右键可以改回自动");
+                                            .on_hover_text(format!("你选了：{}。打通了就一直直连；打不通时仍走服务器。右键可以改回自动", pref.label()));
+                                    }
+                                    if let voice::VoiceRoute::Via(n) = &pref.voice {
+                                        if !pref.hide_ip && lnk.as_ref().is_some_and(|l| l.manual_via_unmet(u.id).is_some()) {
+                                            th::pill(ui, format!("经 {n} 中转暂不可用"), th::YELLOW, th::BG_ELEVATED).on_hover_text(format!(
+                                                "你选了语音经 {n} 中转，但现在安排不了：{n} 不在频道、关了「帮队友中转」、和你们俩没打通，\
+                                                 或者对方选了走服务器 / 选了别的中转人。冲突时按更保守的，现在先走服务器"
+                                            ));
+                                        }
                                     }
                                     if relaying > 0 {
                                         let me = me_id.unwrap_or_default();
@@ -604,17 +623,45 @@ impl App {
                                         ui.close();
                                     }
                                     {
-                                        use voice::RoutePref as R;
-                                        let cur = routes_by_name.get(&u.name).copied().unwrap_or_default();
-                                        let mut r = cur;
+                                        use voice::{RoutePref as R, VoiceRoute as V};
+                                        let cur = routes_by_name.get(&u.name).cloned().unwrap_or_default();
+                                        let mut r = cur.clone();
                                         ui.separator();
-                                        ui.label(RichText::new("和他之间的线路").size(12.0).color(th::TEXT_DIM));
-                                        ui.radio_value(&mut r, R::Auto, "自动（推荐）")
-                                            .on_hover_text("能直连就直连；不稳、绕远或超出上行预算时自动走服务器或队友中转");
-                                        ui.radio_value(&mut r, R::Direct, "强制 P2P 直连")
-                                            .on_hover_text("打通了就一直直连，不因丢包、绕远或上行预算切走；打不通时仍走服务器，保证听得到");
-                                        ui.radio_value(&mut r, R::Server, "走服务器")
-                                            .on_hover_text("不和他直连，也不经队友中转，两边的声音都经服务器。\n「我能听到他、他听不到我」时可以先试这个");
+                                        ui.add_enabled_ui(!r.hide_ip, |ui| {
+                                            ui.label(RichText::new("语音线路（两个方向都按这个）").size(12.0).color(th::TEXT_DIM));
+                                            ui.radio_value(&mut r.voice, V::Auto, "自动（推荐）")
+                                                .on_hover_text("能直连就直连；不稳、绕远或超出上行预算时自动走服务器或队友中转。\n你说话他却没听到时会自动先改走服务器");
+                                            ui.radio_value(&mut r.voice, V::Direct, "强制 P2P 直连")
+                                                .on_hover_text("打通了就一直直连，不因丢包、绕远或上行预算切走；打不通时仍走服务器，保证听得到");
+                                            ui.radio_value(&mut r.voice, V::Server, "走服务器")
+                                                .on_hover_text("语音不直连、也不经队友中转（画面照常）。「我能听到他、他听不到我」时可以先试这个");
+                                            let others: Vec<&String> = relay_choices.iter().filter(|n| **n != u.name).collect();
+                                            if !others.is_empty() {
+                                                ui.horizontal(|ui| {
+                                                    let via_now = matches!(r.voice, V::Via(_));
+                                                    let label = match &r.voice {
+                                                        V::Via(n) => format!("经 {n} 中转"),
+                                                        _ => "经某个队友中转…".into(),
+                                                    };
+                                                    egui::ComboBox::from_id_salt(("via", u.id)).selected_text(RichText::new(label).color(if via_now { th::ACCENT_HOVER } else { th::TEXT_DIM })).show_ui(ui, |ui| {
+                                                        for n in others {
+                                                            ui.selectable_value(&mut r.voice, V::Via(n.clone()), format!("经 {n} 中转"));
+                                                        }
+                                                    })
+                                                    .response
+                                                    .on_hover_text("你说给他、他说给你都经这个队友转（他要开着「帮队友中转」、和你们俩都打通）。\n安排不了时走服务器，不会换别人");
+                                                });
+                                            }
+                                            ui.label(RichText::new("画面线路（共享 / 观看）").size(12.0).color(th::TEXT_DIM));
+                                            ui.horizontal(|ui| {
+                                                ui.radio_value(&mut r.video, R::Auto, "自动");
+                                                ui.radio_value(&mut r.video, R::Direct, "强制直连");
+                                                ui.radio_value(&mut r.video, R::Server, "走服务器");
+                                            });
+                                        });
+                                        ui.checkbox(&mut r.hide_ip, "完全不透露 IP（不和他直连）").on_hover_text(
+                                            "你们俩互相看不到对方的 IP：不打洞，语音、画面都不直连（语音可以经队友中转）。\n改语音或画面线路只影响那一项，不会断开其他人",
+                                        );
                                         if r != cur {
                                             route_change = Some((u.name.clone(), r));
                                         }
@@ -1012,8 +1059,8 @@ impl App {
             s.chat_tab = tab;
         }
         if let Some((name, r)) = route_change {
-            let m = self.cfg.routes.entry(s.server_key.clone()).or_default();
-            if r == voice::RoutePref::Auto {
+            let m = self.cfg.peer_routes.entry(s.server_key.clone()).or_default();
+            if r.is_default() {
                 m.remove(&name);
             } else {
                 m.insert(name, r);
@@ -1337,6 +1384,18 @@ impl App {
                                 l.set_relay_enabled(self.cfg.relay);
                             }
                         }
+                        ui.label(RichText::new(format!("本次流量（从登录起）：{}", crate::traffic::summary())).size(12.0).color(th::TEXT_DIM))
+                            .on_hover_text("按量计费的校园网、手机流量可以参考。按收发的包计（含包头估算），不额外发包；退出重新登录后从 0 算");
+                        ui.horizontal(|ui| {
+                            let n = crate::pathcache::count();
+                            ui.label(RichText::new(format!("记住的直连地址：{n} 位队友")).size(12.0).color(th::TEXT_DIM)).on_hover_text(
+                                "和队友打通直连后，把用过的地址加密存在本机（Windows 凭据保护，只有你的 Windows 账户能解开），\n\
+                                 下次上线先试这些地址，打洞更快。按队友的身份指纹记，30 天没用自动删。",
+                            );
+                            if n > 0 && ui.small_button("清除").clicked() {
+                                crate::pathcache::clear();
+                            }
+                        });
                         let summary = match self.voice.current_link() {
                             Some(l) => {
                                 let (v, d) = l.allocation();
@@ -1455,11 +1514,36 @@ impl App {
                             ui.label(RichText::new("已复制").color(th::GREEN));
                         }
                     });
+                    ui.checkbox(&mut self.diag_names, "附上编号 ↔ 昵称对照")
+                        .on_hover_text("诊断信息和运行日志里队友都写成编号（例如 #12），不写昵称。\n勾上后会在诊断信息末尾附一份「编号是谁」的对照，方便对方看懂；不勾就不带。");
                     ui.label(
-                        RichText::new("包含版本、系统、网络质量、声卡和编解码器信息；不含聊天、密钥、授权码、服务器地址和任何人的 IP。")
+                        RichText::new("包含版本、系统、网络质量、声卡和编解码器信息、最近的运行日志；不含聊天、密钥、授权码、服务器地址和任何人的 IP，队友只写编号。")
                             .size(11.5)
                             .color(th::TEXT_FAINT),
                     );
+                    match crate::applog::path() {
+                        Some(p) => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("运行日志：").size(12.0).color(th::TEXT_DIM));
+                                ui.label(RichText::new(p.display().to_string()).size(12.0).monospace());
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("📂 打开日志文件夹").on_hover_text("在资源管理器里打开，选中日志文件").clicked() {
+                                    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
+                                }
+                                if ui.button("📋 复制日志路径").clicked() {
+                                    ctx.copy_text(p.display().to_string());
+                                    self.log_path_copied = Some(std::time::Instant::now());
+                                }
+                                if self.log_path_copied.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3)) {
+                                    ui.label(RichText::new("已复制").color(th::GREEN));
+                                }
+                            });
+                        }
+                        None => {
+                            ui.label(RichText::new("运行日志没有开（设置了 VOC_NO_LOG，或者没有可写的位置）").size(12.0).color(th::TEXT_DIM));
+                        }
+                    }
                     ui.add_space(8.0);
                     th::section(ui, "更新");
                     ui.checkbox(&mut self.cfg.auto_update, "启动时自动检查更新");
@@ -1605,7 +1689,11 @@ impl App {
                             ui.label(format!("{}×{}", st.width.load(Ordering::Relaxed), st.height.load(Ordering::Relaxed)));
                             ui.end_row();
                             ui.label(RichText::new("帧率").color(th::TEXT_DIM));
-                            ui.label(format!("{} fps（采集 {}）", st.fps.load(Ordering::Relaxed), st.capture_fps.load(Ordering::Relaxed)));
+                            ui.label(format!("{} fps（采集 {}）", st.fps.load(Ordering::Relaxed), st.capture_fps.load(Ordering::Relaxed)))
+                                .on_hover_text(format!(
+                                    "系统这一秒给了 {} 帧画面。系统只在屏幕内容变化时给帧：比所选帧率低，说明屏幕 / 游戏本身就没那么多帧，不是 VOC 丢的",
+                                    st.source_fps.load(Ordering::Relaxed)
+                                ));
                             ui.end_row();
                             ui.label(RichText::new("码率").color(th::TEXT_DIM));
                             let mbps = st.kbps.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -1713,6 +1801,15 @@ impl App {
                 ui.add_enabled(can_audio, egui::Checkbox::new(&mut self.cfg.share_audio, "同时共享电脑声音（不含 VOC 自己的声音）"))
                     .on_hover_text("游戏、视频的声音会一起发给正在看的人；队友的说话声、提示音不会被录进去。")
                     .on_disabled_hover_text("共享电脑声音需要 Windows 11");
+                ui.checkbox(&mut self.cfg.share.delay_bwe, "按延迟变化提前降码率").on_hover_text(
+                    "画面走的线路往返时间开始变大（排队了、还没丢包）就先降码率，线路空了再升回来，减少卡顿。\n\
+                     打开后「原画」的码率也会跟着调（默认原画固定码率、保证清楚）。",
+                );
+                ui.checkbox(&mut self.cfg.share.p2p_only, "只通过 P2P 直连发送（不经服务器）").on_hover_text(
+                    "画面、补发、鼠标、共享声音都不发给服务器，服务器带宽小时有用。\n\
+                     能打通直连的人全部直连发，不受「直连上行预算」限制：看的人多时可能占满你的上行。\n\
+                     和你打不通、也没有别的观看者能转给他的人看不了（他那边会看到原因）。",
+                );
                 ui.add_space(8.0);
                 start = th::primary_button(ui, "开始共享", ui.available_width(), true).clicked();
             });
@@ -1726,6 +1823,7 @@ impl App {
                         simulcast: true,
                         rtx: true,
                         bps: eff.bitrate(),
+                        p2p_only: eff.p2p_only,
                     });
                     self.sharer = Some(sh);
                     self.share_confirmed = false;
@@ -1768,6 +1866,8 @@ impl App {
         let mut close = Vec::new();
         // 观看中改了画质或线路：重新告诉服务器
         let mut relayer: Vec<(u32, bool, u8)> = Vec::new();
+        // 改了播放方式：记住，下次看别人也用这个
+        let mut smooth_change: Option<bool> = None;
         let voice = self.voice.clone();
         let mut go_full: Option<u32> = None;
         let mut exit_full = false;
@@ -1871,12 +1971,39 @@ impl App {
                             if v.route != before {
                                 relayer.push((*id, v.low, v.route));
                             }
+                            // 播放方式：流畅优先（匀速，默认）/ 延迟优先（到了就显示）
+                            ui.separator();
+                            let mut smooth = v.view.smooth.load(Ordering::Relaxed);
+                            let was = smooth;
+                            ui.selectable_value(&mut smooth, true, "流畅优先")
+                                .on_hover_text("画面成串到达时按原来的间隔匀速显示，看着更顺；网络稳时只多一两帧的延迟");
+                            ui.selectable_value(&mut smooth, false, "延迟优先").on_hover_text("画面一到就显示，延迟最低；网络抖时会一顿一顿的");
+                            if smooth != was {
+                                v.view.smooth.store(smooth, Ordering::Relaxed);
+                                smooth_change = Some(smooth);
+                            }
+                            let p2p_only = user.is_some_and(|u| u.share_p2p_only);
                             match voice.video_direct(*id) {
                                 Some(true) => th::pill(ui, "⇄ 直连中", th::GREEN, th::GREEN_SOFT),
+                                // 经别的观看者转来的（只走 P2P 时不会经服务器）
+                                Some(false) if p2p_only => th::pill(ui, "经队友转发", th::TEXT_DIM, th::BG_ELEVATED),
                                 Some(false) => th::pill(ui, "经服务器", th::TEXT_DIM, th::BG_ELEVATED),
                                 None => th::pill(ui, "没收到画面", th::YELLOW, th::BG_ELEVATED),
                             }
                             .on_hover_text("现在画面实际走的线路（最近 2 秒）");
+                            if p2p_only {
+                                th::pill(ui, "共享者只走 P2P", th::TEXT_DIM, th::BG_ELEVATED)
+                                    .on_hover_text("共享者设置了画面不经服务器：和他打不通直连、也没有别的观看者能转给你时看不了");
+                            }
+                        }
+                        // 选项冲突时以更保守的一方为准，并说明原因（第 46 / 44 项）
+                        if user.is_some_and(|u| u.share_p2p_only) && voice.video_direct(*id).is_none() {
+                            let why = if v.route == 2 {
+                                "共享者设置了「只走 P2P」，而你选了画面「服务器」：两边都按更保守的来，这样看不了。改选「自动」或「P2P」试试。"
+                            } else {
+                                "共享者设置了「只走 P2P」（画面不经服务器），你和他之间还没打通直连，也没有别的观看者能转给你。打洞成功后会自动出画面。"
+                            };
+                            ui.label(RichText::new(why).size(12.0).color(th::YELLOW));
                         }
                         // 共享声音的音量：只影响你自己听到的大小，和他说话的音量分开调
                         {
@@ -1934,6 +2061,10 @@ impl App {
             if !open {
                 close.push(*id);
             }
+        }
+        if let Some(sm) = smooth_change {
+            self.cfg.smooth_playback = sm;
+            video::SMOOTH_PLAYBACK.store(sm, Ordering::Relaxed);
         }
         for (id, low, route) in relayer {
             s.send(ClientMsg::Watch { target: id, on: true, low, route, cursor: true });

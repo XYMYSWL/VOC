@@ -1,20 +1,84 @@
 //! 客户端运行日志：连接、断线、屏幕共享、更新、出错、崩溃这类事件写进本机文件，
 //! 「导出诊断信息」时带上最后一段，查问题不用再让用户复现。
 //!
-//! 不记聊天内容、授权码、密钥、IP 地址。文件超过 1 MB 就换一个（只留一个旧文件）。
-//! 位置：%LOCALAPPDATA%\VOC\voc.log（安装版由系统重定向到应用自己的目录）。
+//! 不记聊天内容、授权码、密钥、IP 地址、昵称（成员用编号 #12 表示）。文件超过 1 MB 就换一个（只留一个旧文件）。
+//! 位置（0.6 起）：
+//! - 绿色版：程序所在文件夹下的 `logs\voc.log`（那里写不进去时，例如放在 Program Files 里，改用 %LOCALAPPDATA%\VOC）
+//! - 安装版：应用私有目录 %LOCALAPPDATA%\Packages\<包名>\LocalCache\Local\VOC\voc.log，所有安装版路径一样
+//!   （安装目录 WindowsApps 是系统只读的，写不进去；以前靠系统重定向，用过绿色版的电脑上位置会不一样）
+//! 设置 → 关于里能看到实际路径、打开文件夹、复制路径。
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const MAX_BYTES: u64 = 1024 * 1024;
 
 static PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+fn local_appdata() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).or_else(|| std::env::var_os("TEMP").map(PathBuf::from))
+}
+
+/// 0.5.x 的位置（安装版被系统重定向，绿色版就在这里）
+fn old_dir() -> Option<PathBuf> {
+    Some(local_appdata()?.join("VOC"))
+}
+
+/// 安装版：包的家族名（例如 VOC.VoiceChat_v6je519s3qkf6），没有包身份返回 None
+#[cfg(windows)]
+fn package_family_name() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFamilyName;
+    let mut len = 0u32;
+    unsafe {
+        let _ = GetCurrentPackageFamilyName(&mut len, None);
+        if len == 0 || len > 1024 {
+            return None;
+        }
+        let mut buf = vec![0u16; len as usize];
+        if GetCurrentPackageFamilyName(&mut len, Some(PWSTR(buf.as_mut_ptr()))).0 != 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]))
+    }
+}
+
+#[cfg(not(windows))]
+fn package_family_name() -> Option<String> {
+    None
+}
+
+/// 能不能在这个文件夹里写文件
+fn writable(d: &Path) -> bool {
+    if std::fs::create_dir_all(d).is_err() {
+        return false;
+    }
+    let probe = d.join(".voc-write-test");
+    let ok = std::fs::write(&probe, b"x").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
 fn dir() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
-    Some(base.join("VOC"))
+    if let Some(fam) = package_family_name() {
+        let d = local_appdata()?.join("Packages").join(fam).join("LocalCache").join("Local").join("VOC");
+        if writable(&d) {
+            return Some(d);
+        }
+    } else if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        let d = exe_dir.join("logs");
+        if writable(&d) {
+            return Some(d);
+        }
+    }
+    let d = old_dir()?;
+    writable(&d).then_some(d)
+}
+
+/// 日志文件的实际位置（界面上显示、打开文件夹用）
+pub fn path() -> Option<PathBuf> {
+    PATH.lock().unwrap().clone()
 }
 
 /// 启动时调用：定好日志位置，装上崩溃记录
@@ -23,10 +87,14 @@ pub fn init() {
         return;
     }
     let Some(d) = dir() else { return };
-    if std::fs::create_dir_all(&d).is_err() {
-        return;
+    let file = d.join("voc.log");
+    // 第一次换到新位置：把旧位置的日志接过来（只做一次）
+    if !file.exists() {
+        if let Some(old) = old_dir().map(|o| o.join("voc.log")).filter(|o| *o != file && o.exists()) {
+            let _ = std::fs::copy(&old, &file);
+        }
     }
-    *PATH.lock().unwrap() = Some(d.join("voc.log"));
+    *PATH.lock().unwrap() = Some(file);
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let bt = std::backtrace::Backtrace::force_capture();

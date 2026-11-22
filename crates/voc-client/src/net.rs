@@ -23,6 +23,8 @@ pub enum Outgoing {
     Video(Vec<u8>),
     /// 图片分块（file::client_chunk 格式）
     File(Vec<u8>),
+    /// UDP 不可用时的伴奏 / 共享声音 / 鼠标：(UDP 包类型, udp::client_voice 格式)
+    Stream(u8, Vec<u8>),
 }
 
 pub struct Conn {
@@ -122,7 +124,7 @@ pub fn connect(
     let first = read_frame(&mut stream, &mut opener).ok_or("登录失败：服务器断开了连接")?;
     let first: ServerMsg = serde_json::from_slice(&first.1).map_err(|_| "服务器回复格式错误")?;
     if let ServerMsg::Error { message } = first {
-        return Err(message);
+        return Err(voc_proto::explain_login_error(&message));
     }
     stream.set_read_timeout(None).map_err(|e| e.to_string())?;
 
@@ -140,7 +142,11 @@ pub fn connect(
                     Outgoing::Msg(m) => sealer.seal(KIND_JSON, serde_json::to_string(&m).unwrap().as_bytes()),
                     Outgoing::Voice(v) => sealer.seal(KIND_VOICE, &v),
                     Outgoing::Video(v) => sealer.seal(KIND_VIDEO, &v),
-                    Outgoing::File(v) => sealer.seal(KIND_FILE, &v),
+                    Outgoing::File(v) => {
+                        crate::traffic::sent(crate::traffic::Cat::Image, v.len());
+                        sealer.seal(KIND_FILE, &v)
+                    }
+                    Outgoing::Stream(k, v) => sealer.seal(KIND_STREAM, &stream_frame(k, &v)),
                 };
                 if w.write_all(&f).is_err() {
                     break;
@@ -156,8 +162,9 @@ pub fn connect(
         .spawn(move || {
             while let Some((kind, data)) = read_frame(&mut r, &mut opener) {
                 match kind {
-                    KIND_VOICE | KIND_VIDEO => on_media(kind, &data),
+                    KIND_VOICE | KIND_VIDEO | KIND_STREAM => on_media(kind, &data),
                     KIND_FILE => {
+                        crate::traffic::received(crate::traffic::Cat::Image, data.len());
                         if evt_tx.send(NetEvent::File(data)).is_err() {
                             return;
                         }

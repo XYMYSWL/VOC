@@ -40,6 +40,23 @@ pub struct CodeStore {
     pub entries: Vec<CodeEntry>,
     /// 与 entries 一一对应（握手试解用）
     pub psks: Vec<[u8; 32]>,
+    /// 密钥损坏、已停用的授权码 ID
+    pub broken: Vec<String>,
+}
+
+/// 分出密钥完好的授权码（和 PSK 一一对应）与损坏的（只返回 ID）
+fn split_valid(all: Vec<CodeEntry>) -> (Vec<CodeEntry>, Vec<[u8; 32]>, Vec<String>) {
+    let (mut entries, mut psks, mut broken) = (Vec::new(), Vec::new(), Vec::new());
+    for e in all {
+        match from_hex32(&e.psk) {
+            Some(k) => {
+                psks.push(k);
+                entries.push(e);
+            }
+            None => broken.push(e.id),
+        }
+    }
+    (entries, psks, broken)
 }
 
 pub fn read_file(path: &Path) -> Result<Vec<CodeEntry>, String> {
@@ -60,15 +77,20 @@ pub fn write_file(path: &Path, entries: &[CodeEntry]) -> Result<(), String> {
 
 impl CodeStore {
     pub fn open(path: PathBuf) -> Result<Self, String> {
-        let mut s = Self { path, mtime: None, entries: Vec::new(), psks: Vec::new() };
+        let mut s = Self { path, mtime: None, entries: Vec::new(), psks: Vec::new(), broken: Vec::new() };
         s.reload()?;
         Ok(s)
     }
 
     fn reload(&mut self) -> Result<(), String> {
-        let entries = read_file(&self.path)?;
-        self.psks = entries.iter().map(|e| from_hex32(&e.psk).unwrap_or([0; 32])).collect();
+        let (entries, psks, broken) = split_valid(read_file(&self.path)?);
+        // PSK 损坏（文件被改坏 / 迁移出错）的授权码直接停用：绝不能拿固定值（例如全 0）当密钥，那样谁都能冒充
+        for id in &broken {
+            eprintln!("[VOC] 授权码 {id} 在 {} 里的密钥损坏，已停用（重新生成一个给这个人）", self.path.display());
+        }
+        self.psks = psks;
         self.entries = entries;
+        self.broken = broken;
         self.mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
         Ok(())
     }
@@ -117,4 +139,29 @@ pub fn set_revoked(path: &Path, id: &str, revoked: bool) -> Result<(), String> {
     let e = entries.iter_mut().find(|e| e.id == id).ok_or_else(|| format!("找不到授权码 ID {id}"))?;
     e.revoked = revoked;
     write_file(path, &entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, psk: &str) -> CodeEntry {
+        CodeEntry { id: id.into(), psk: psk.into(), note: String::new(), created: 0, expires: None, revoked: false }
+    }
+
+    #[test]
+    fn broken_psk_is_disabled_not_zeroed() {
+        let good = to_hex(&AuthCode::generate().psk());
+        let (entries, psks, broken) = split_valid(vec![
+            entry("AAAAAAAA", &good),
+            entry("BBBBBBBB", "zz"),
+            entry("CCCCCCCC", ""),
+            entry("DDDDDDDD", &good[..62]),
+        ]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(psks.len(), 1);
+        assert_eq!(entries[0].id, "AAAAAAAA");
+        assert_eq!(broken, vec!["BBBBBBBB", "CCCCCCCC", "DDDDDDDD"]);
+        assert!(!psks.contains(&[0u8; 32]), "never fall back to a fixed key");
+    }
 }

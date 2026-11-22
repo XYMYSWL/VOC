@@ -21,6 +21,8 @@ use voc_proto::udp::{self, VIDEO_KEY};
 
 /// 观看时用硬件解码（DXVA）；否则 CPU 软解
 pub static HW_DECODE: AtomicBool = AtomicBool::new(false);
+/// 新开的观看窗口默认的播放方式：true = 流畅优先（默认），false = 延迟优先（设置里记住上次的选择）
+pub static SMOOTH_PLAYBACK: AtomicBool = AtomicBool::new(true);
 
 // ------------------------------------------------------------ 配置
 
@@ -40,11 +42,17 @@ pub struct ShareConfig {
     pub skip_static: bool,
     /// 网络差时自动降分辨率（原画层也会跟着降）
     pub auto_res: bool,
+    /// 只走 P2P：画面、补发、鼠标、共享声音都不发给服务器；打不通直连、也没有观看者能转给他的人看不了。
+    /// 不受直连上行预算限制，能打通的观看者都直连发（人多时可能占满上行）
+    pub p2p_only: bool,
+    /// 按延迟变化提前降码率（第 36 项，默认关）：画面走的路往返时间在涨（排队了、还没丢包）就先降码率，空了再升。
+    /// 打开才会调「原画」层的码率（第 20 项：原画默认不调）
+    pub delay_bwe: bool,
 }
 
 impl Default for ShareConfig {
     fn default() -> Self {
-        Self { height: 720, fps: 30, monitor: 0, encoder: "auto".into(), quality: 1, skip_static: true, auto_res: false }
+        Self { height: 720, fps: 30, monitor: 0, encoder: "auto".into(), quality: 1, skip_static: true, auto_res: false, p2p_only: false, delay_bwe: false }
     }
 }
 
@@ -575,6 +583,10 @@ impl VideoEncoder {
 pub struct ShareStats {
     /// 实际采集到的帧率
     pub capture_fps: AtomicU32,
+    /// 系统实际给了多少帧（限帧之前；比所选帧率低说明屏幕 / 游戏本身就没那么多帧）
+    pub source_fps: AtomicU32,
+    /// 最近一秒判断为拥塞（延迟在涨 / 发送队列积压）
+    pub congested: AtomicBool,
     /// 编码发送的帧率
     pub fps: AtomicU32,
     /// 平均每帧编码耗时（毫秒，含色彩转换）
@@ -639,8 +651,10 @@ struct CapFlags {
 
 struct CapHandler {
     flags: CapFlags,
-    last: Option<Instant>,
-    sec: (Instant, u32),
+    /// 下一帧的预定时间（按时间表限帧）
+    next_due: Option<Instant>,
+    /// 这一秒：(开始, 收下的帧, 系统给的帧)
+    sec: (Instant, u32, u32),
     scratch: Vec<u8>,
     side: crate::mf::gpu::CaptureSide,
     /// 系统确实在报告变化区域（报告过非空的才信「没变化」）
@@ -648,6 +662,21 @@ struct CapHandler {
     /// 上次真正发出一帧的时间
     last_sent: Option<Instant>,
     skipped: u32,
+}
+
+/// 按时间表限帧：下一帧的预定时间 = 上一帧的**预定**时间 + 间隔（不是实际收到的时间 + 间隔）。
+/// 系统给帧的时间是一格一格的（对齐显示器刷新、只在画面变化时给），「离上一帧太近就丢」每次都要多等一格，
+/// 实际帧率总比所选的低（选 30 只有 20 多、选 60 只有 50 多）；按时间表取，早一点晚一点互相抵消，平均正好是所选帧率。
+/// 提前半个间隔以内到的也收；落后超过一个间隔（画面静止了一阵）就从现在重新排，不会一下子补一串。
+fn pace_accept(next_due: &mut Option<Instant>, now: Instant, interval: Duration) -> bool {
+    let due = match *next_due {
+        None => now,
+        Some(d) if now + interval / 2 < d => return false,
+        Some(d) if now > d + interval => now,
+        Some(d) => d,
+    };
+    *next_due = Some(due + interval);
+    true
 }
 
 /// 变化面积小于这个比例（千分之几）算「变化很小」（时钟、托盘图标、光标、打字）
@@ -671,8 +700,8 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
     fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
             flags: ctx.flags,
-            last: None,
-            sec: (Instant::now(), 0),
+            next_due: None,
+            sec: (Instant::now(), 0, 0),
             scratch: Vec::new(),
             side: Default::default(),
             dirty_works: false,
@@ -690,19 +719,21 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
             control.stop();
             return Ok(());
         }
-        // 按目标帧率限速
-        if self.last.is_some_and(|t| t.elapsed() < self.flags.interval.mul_f32(0.9)) {
-            return Ok(());
-        }
-        self.last = Some(Instant::now());
-        self.sec.1 += 1;
+        // 按时间表限帧（平均正好是所选帧率，见 pace_accept）
+        let now = Instant::now();
+        self.sec.2 += 1;
         if self.sec.0.elapsed() >= Duration::from_secs(1) {
-            let fps = (self.sec.1 as f64 / self.sec.0.elapsed().as_secs_f64()).round() as u32;
-            self.flags.stats.capture_fps.store(fps, Ordering::Relaxed);
+            let secs = self.sec.0.elapsed().as_secs_f64();
+            self.flags.stats.capture_fps.store((self.sec.1 as f64 / secs).round() as u32, Ordering::Relaxed);
+            self.flags.stats.source_fps.store((self.sec.2 as f64 / secs).round() as u32, Ordering::Relaxed);
             self.flags.stats.static_skipped.store(self.skipped, Ordering::Relaxed);
-            self.sec = (Instant::now(), 0);
+            self.sec = (now, 0, 0);
             self.skipped = 0;
         }
+        if !pace_accept(&mut self.next_due, now, self.flags.interval) {
+            return Ok(());
+        }
+        self.sec.1 += 1;
         // 画面不动时少发：系统报告这一帧没有变化区域就跳过
         if self.flags.skip_static {
             let total = (frame.width() as i64 * frame.height() as i64).max(1);
@@ -784,7 +815,8 @@ impl CaptureCfg {
             if with_cursor { CursorCaptureSettings::WithCursor } else { CursorCaptureSettings::WithoutCursor },
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Custom(self.interval.mul_f32(0.9)),
+            // 系统这边只挡住远超所选帧率的部分，具体取哪帧由 pace_accept 按时间表决定（两道门槛叠加会少帧）
+            MinimumUpdateIntervalSettings::Custom(self.interval / 2),
             if skip { DirtyRegionSettings::ReportOnly } else { DirtyRegionSettings::Default },
             ColorFormat::Bgra8,
             CapFlags {
@@ -976,6 +1008,7 @@ impl Sharer {
         if let Some(l) = state.current_link() {
             l.set_video_bps(cfg.bitrate());
         }
+        crate::voice::SHARE_P2P_ONLY.store(cfg.p2p_only, Ordering::Relaxed);
         let (st, fk, sp, stx, c2, kr) = (state.clone(), force_key.clone(), stop.clone(), stats.clone(), cfg.clone(), key_requests.clone());
         let wc = want_cursor_in_video.clone();
         std::thread::Builder::new()
@@ -997,6 +1030,7 @@ impl Drop for Sharer {
         if let Some(l) = self.state.current_link() {
             l.set_video_bps(0);
         }
+        crate::voice::SHARE_P2P_ONLY.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1009,7 +1043,10 @@ pub fn fec_ratio(loss_permille: u16) -> f32 {
         30..80 => 0.35,
         80..150 => 0.6,
         150..250 => 0.9,
-        _ => 1.2,
+        // 0.6：丢包更高时冗余继续往上加（以前最多 120%，丢一半时整组常常救不回）。拥塞时不加（见 congestion_cap）
+        250..350 => 1.2,
+        350..450 => 1.5,
+        _ => 2.0,
     }
 }
 
@@ -1096,6 +1133,9 @@ const KEY_REQUEST_GAP: Duration = Duration::from_millis(500);
 
 /// 码率自适应：每秒看一次。观看者频繁要关键帧（≥2 次 / 秒）或匀速队列丢包 → 降到 70%（最低 30%）；
 /// 连续 4 秒正常 → 每秒回升 10%，直到设定值
+/// 拥塞时冗余比例最多这么多
+const CONGESTED_FEC_CAP: f32 = 0.35;
+
 pub fn adapt_rate(scale: f32, calm_secs: &mut u32, key_requests: u32, pace_drops: u32) -> f32 {
     if key_requests >= 2 || pace_drops > 0 {
         *calm_secs = 0;
@@ -1124,7 +1164,7 @@ fn encode_loop(
 ) {
     let pref = cfg.encoder.clone();
     let (main_bps, low_bps) = (cfg.bitrate(), cfg.low_layer().bitrate());
-    let (cfg_auto_res, cfg_height) = (cfg.auto_res, cfg.height);
+    let (cfg_auto_res, cfg_height, cfg_delay_bwe) = (cfg.auto_res, cfg.height, cfg.delay_bwe);
     // 冗余校验包：按观看者请求补发的比例（≈丢包率）决定每几片加一个校验包，0 = 不加
     let (mut fec_main, mut fec_low) = (0.0f32, 0.0f32);
     let mut ltr = LtrState::new();
@@ -1334,6 +1374,11 @@ fn encode_loop(
                 last_key = Instant::now();
             }
             let sealed = e2e.lock().unwrap().encrypt_video(&with_dims(&ef));
+            if sealed.len() > udp::MAX_FRAGS as usize * udp::VIDEO_FRAG {
+                // 接收端不收超过上限的帧，发了也白发（正常码率下不会出现）
+                crate::applog::log(format!("屏幕共享：一帧 {} 字节超过上限，丢弃", sealed.len()));
+                continue;
+            }
             // 两层各自编帧号（接收端按帧号判断丢帧）
             let mut flags = udp::video_flags(ef.key, ef.codec.id());
             if !low {
@@ -1376,12 +1421,16 @@ fn encode_loop(
             let (sent, nacked) = link.take_video_loss();
             // 补发比例 ≥ 5% 也算拥堵
             let lossy = sent >= 50 && nacked as f32 / sent as f32 >= 0.05;
-            let keys = key_requests.swap(0, Ordering::Relaxed) + if lossy { 2 } else { 0 };
+            // 延迟在涨（排队）：选了「按延迟提前降码率」才据此降码率（还没丢包就先降）
+            let congested = link.congested();
+            stats.congested.store(congested, Ordering::Relaxed);
+            let early = cfg_delay_bwe && congested;
+            let keys = key_requests.swap(0, Ordering::Relaxed) + if lossy || early { 2 } else { 0 };
             let new_scale = adapt_rate(scale, &mut calm, keys, link.take_pace_drops());
             if (new_scale - scale).abs() > 0.01 {
                 scale = new_scale;
                 low_enc.set_rate_scale(scale);
-                if cfg_auto_res {
+                if cfg_auto_res || cfg_delay_bwe {
                     enc.set_rate_scale(scale);
                 }
             }
@@ -1390,14 +1439,19 @@ fn encode_loop(
                 enc.set_height(h);
                 stats.auto_height.store(if h < cfg_height { h } else { 0 }, Ordering::Relaxed);
             }
-            let main_now = if cfg_auto_res { (main_bps as f32 * scale) as u32 } else { main_bps };
+            let main_now = if cfg_auto_res || cfg_delay_bwe { (main_bps as f32 * scale) as u32 } else { main_bps };
             link.set_video_bps(if want_main { main_now } else { 0 } + if want_low { (low_bps as f32 * scale) as u32 } else { 0 });
             // 观看者都会自己画鼠标：截屏不带鼠标、单独发；有人不会（旧版本）就画进画面
             want_cursor_in_video.store(!link.all_watchers_draw_cursor(), Ordering::Relaxed);
             // 冗余比例按各层观看者回报的丢包率；丢包很高的直连观看者两条路同时发
             let (loss_main, loss_low) = (link.layer_loss(false), link.layer_loss(true));
             (fec_main, fec_low) = (fec_ratio(loss_main), fec_ratio(loss_low));
+            // 拥塞时不加冗余（冗余也占带宽，越加越堵；第 40-2 项）：最多保持中等冗余，先靠降码率 / 控速
+            if congested {
+                (fec_main, fec_low) = (fec_main.min(CONGESTED_FEC_CAP), fec_low.min(CONGESTED_FEC_CAP));
+            }
             stats.fec_pct.store((fec_main * 100.0).round() as u32, Ordering::Relaxed);
+            link.set_fec_pct((fec_main.max(fec_low) * 100.0).round() as u32);
             stats.viewer_loss.store(loss_main.max(loss_low) as u32, Ordering::Relaxed);
             stats.dual_viewers.store(link.update_dual_video(DUAL_PATH_LOSS) as u32, Ordering::Relaxed);
             stats.resent_total.fetch_add(nacked, Ordering::Relaxed);
@@ -1458,7 +1512,13 @@ pub struct View {
     pub decoder: Mutex<String>,
     /// 共享者单独发来的鼠标：(x, y 0–1, 形状, 显示着, 收到时间)
     pub cursor: Mutex<Option<(f32, f32, u8, bool, Instant)>>,
+    /// 播放方式（第 36 项）：true = 流畅优先（默认）：帧成串到达时按原来的间隔匀速显示，缓冲自动伸缩（网络稳时一两帧）；
+    /// false = 延迟优先：到了就显示，积压时直接跳到最新一帧（0.5.x 的做法）
+    pub smooth: AtomicBool,
 }
+
+/// 流畅优先时最多攒几帧匀速放（再多就跳过旧的，延迟不会越积越大）
+const SMOOTH_MAX_BACKLOG: usize = 4;
 
 struct Stream {
     /// 帧重组缓冲（乱序、补发、冗余校验包都在这里处理）
@@ -1524,6 +1584,7 @@ impl VideoRx {
             return Some(st.view.clone());
         }
         let view = Arc::new(View::default());
+        view.smooth.store(SMOOTH_PLAYBACK.load(Ordering::Relaxed), Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel::<(u8, Vec<u8>)>(64);
         let (v, ctx) = (view.clone(), self.ctx.lock().unwrap().clone());
         std::thread::Builder::new().name("video-decode".into()).spawn(move || decode_loop(rx, v, ctx)).ok()?;
@@ -1701,11 +1762,26 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
     // 硬解连续出错这么多次：这一路改用软解（有的显卡驱动对某些码流解不了）
     const HW_FAIL_LIMIT: u32 = 5;
     let (mut hw_fails, mut hw_broken) = (0u32, false);
+    // 匀速播放：帧间隔的估计（按收到的节奏）、下一帧最早什么时候显示
+    let mut interval = Duration::from_millis(33);
+    let mut last_arrival: Option<Instant> = None;
+    let mut next_present: Option<Instant> = None;
     while let Ok(first) = rx.recv() {
-        // 必须每帧都解码（P 帧依赖前一帧），但积压时只把最新一帧转成 RGBA 显示
+        // 必须每帧都解码（P 帧依赖前一帧）。延迟优先：积压时只把最新一帧转成 RGBA 显示；
+        // 流畅优先：最后几帧按间隔匀速显示，更早的跳过
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
         let last = batch.len() - 1;
+        let now = Instant::now();
+        if let Some(t) = last_arrival {
+            let dt = now.duration_since(t).as_secs_f32() / batch.len() as f32;
+            if dt < 0.2 {
+                let est = interval.as_secs_f32() * 0.9 + dt * 0.1;
+                interval = Duration::from_secs_f32(est.clamp(0.005, 0.1));
+            }
+        }
+        last_arrival = Some(now);
+        let smooth = view.smooth.load(Ordering::Relaxed);
         for (i, (cid, bits)) in batch.iter().enumerate() {
             let codec = Codec::from_id(*cid);
             let Some((w0, h0, bits)) = split_dims(codec, bits) else { continue };
@@ -1721,11 +1797,21 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
                 view.decode_failed.store(true, Ordering::Relaxed); // 新解码器要从关键帧开始
             }
             let Some((_, _, _, d)) = dec.as_mut() else { continue };
-            let show = i == last;
+            let show = if smooth { i + SMOOTH_MAX_BACKLOG > last } else { i == last };
             let mut publish = |w: usize, h: usize, fill: &mut dyn FnMut(&mut Vec<u8>)| {
                 let mut rgba = std::mem::take(&mut spare);
                 rgba.resize(w * h * 4, 0);
                 fill(&mut rgba);
+                if smooth {
+                    // 按估计的帧间隔匀速放（略快一点，缓冲会慢慢消掉、延迟不会越积越多）
+                    if let Some(p) = next_present {
+                        let now = Instant::now();
+                        if p > now {
+                            std::thread::sleep(p - now);
+                        }
+                    }
+                    next_present = Some(Instant::now() + interval.mul_f32(0.85));
+                }
                 let seq = view.seq.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Some(o) = view.frame.lock().unwrap().replace(DecodedFrame { width: w, height: h, rgba, seq }) {
                     spare = o.rgba; // 复用缓冲
@@ -1972,7 +2058,42 @@ mod tests {
         // 关键帧更高，但有上限
         assert_eq!(key_fec_ratio(0.0), 0.1);
         assert!((key_fec_ratio(0.6) - 0.9).abs() < 1e-6);
-        assert_eq!(key_fec_ratio(1.2), voc_proto::udp::RS_MAX_RATIO);
+        assert_eq!(key_fec_ratio(2.0), voc_proto::udp::RS_MAX_RATIO);
+        assert_eq!(fec_ratio(500), 2.0);
+    }
+
+    /// 系统给帧的间隔是一格一格的（这里模拟 144 / 70 / 60 帧的源，带一点抖动），按时间表限帧后平均帧率要接近所选值
+    #[test]
+    fn pacing_reaches_target_fps() {
+        let run = |source_hz: f64, target: u32| -> f64 {
+            let interval = Duration::from_secs_f64(1.0 / target as f64);
+            let t0 = Instant::now();
+            let mut due = None;
+            let mut n = 0u32;
+            let mut seed = 12345u32;
+            for i in 0..(source_hz as u32 * 10) {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let jitter = (seed >> 16) as f64 / 65536.0 * 0.002; // 0～2 ms 线程调度抖动
+                let t = t0 + Duration::from_secs_f64(i as f64 / source_hz + jitter);
+                if super::pace_accept(&mut due, t, interval) {
+                    n += 1;
+                }
+            }
+            n as f64 / 10.0
+        };
+        for (src, target) in [(144.0, 60), (144.0, 30), (70.0, 30), (180.0, 60), (60.0, 60), (60.0, 30), (61.0, 60)] {
+            let fps = run(src, target);
+            assert!(fps >= target as f64 * 0.97 && fps <= target as f64 * 1.02, "source {src} target {target}: got {fps}");
+        }
+        // 源本身不够快时：有多少给多少
+        assert!(run(40.0, 60) >= 39.0);
+        // 画面静止一阵后恢复：不会一下子补一串
+        let interval = Duration::from_millis(33);
+        let t0 = Instant::now();
+        let mut due = None;
+        assert!(super::pace_accept(&mut due, t0, interval));
+        assert!(super::pace_accept(&mut due, t0 + Duration::from_secs(5), interval));
+        assert!(!super::pace_accept(&mut due, t0 + Duration::from_secs(5) + Duration::from_millis(7), interval));
     }
 
     #[test]

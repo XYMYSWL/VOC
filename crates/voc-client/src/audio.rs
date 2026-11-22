@@ -352,6 +352,13 @@ impl Mixer {
         }
     }
 
+    /// 对方换了密钥、序号从头开始：忘掉上一包的序号（缓冲里已有的声音照常播完）
+    pub fn restart_seq(&mut self, user: u32) {
+        if let Some(s) = self.streams.get_mut(&user) {
+            s.last_seq = None;
+        }
+    }
+
     /// 某人当前的抖动缓冲目标（ms），显示延迟用
     pub fn buffer_ms(&self, user: u32) -> Option<u32> {
         self.streams.get(&user).map(|s| s.jitter.target_ms().round() as u32)

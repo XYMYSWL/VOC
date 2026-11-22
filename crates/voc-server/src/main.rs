@@ -22,6 +22,8 @@ enum Out {
     Json(ServerMsg),
     Voice(Vec<u8>),
     Video(Vec<u8>),
+    /// 伴奏 / 共享声音 / 鼠标（UDP 包类型, 内容）
+    Stream(u8, Vec<u8>),
     /// 图片分块（端到端加密的密文），只转发不保存
     File(Vec<u8>),
 }
@@ -88,12 +90,18 @@ struct User {
     music: Option<String>,
     /// 屏幕共享带声音
     share_audio: bool,
+    /// 屏幕共享只走 P2P：服务器不转发也不缓存这个人的画面 / 共享声音 / 鼠标
+    share_p2p_only: bool,
     /// 最近一次链路质量上报（成员中继用）
     stats: Option<LinkReport>,
     /// 上次发给我的中继路线
     last_relays: Vec<RelayRoute>,
     /// 还在发送队列里的图片字节数
     pending_file: Arc<std::sync::atomic::AtomicUsize>,
+    /// 还在 TCP 发送队列里的语音 / 画面 / 伴奏字节数
+    pending_media: Arc<std::sync::atomic::AtomicUsize>,
+    /// 因为队列满丢掉的媒体包数（状态里显示）
+    media_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// 我正在上传的图片：id → (块数, 已收块数, 最后一次收到的时间, 私聊对象)
     uploads: HashMap<u64, (u32, u32, Instant, Option<u32>)>,
     /// 还没开始上传的私聊图片：id → 接收者
@@ -164,7 +172,23 @@ struct LinkReport {
     via_server: HashSet<u32>,
     /// 还能帮别人转发画面的上行（bps）
     video_relay_bps: u32,
+    /// 最近 2 秒在说话
+    talking: bool,
+    /// 最近 3 秒实际听到了谁
+    heard: HashSet<u32>,
+    /// 手动指定的语音中转：对方 → 经谁
+    manual_via: HashMap<u32, u32>,
+    /// 他经服务器收语音的丢包率（%）
+    voice_loss: u8,
 }
+
+/// 听众经服务器收语音丢包到这个程度（%），服务器给他的语音每包多发一份（只给他，第 42-5 项）
+const VOICE_DUP_LOSS: u8 = 10;
+
+/// 语音优先：连续这么多次上报「他在说、我没听到」就改经服务器转发
+const FALLBACK_MISSES: u8 = 2;
+/// 改经服务器转发后保持这么久，再试回直连 / 中转（还不行会再改回来）
+const FALLBACK_HOLD: Duration = Duration::from_secs(60);
 
 /// 链路上报超过这么久没更新就不再采信
 const STATS_TTL: Duration = Duration::from_secs(6);
@@ -173,7 +197,31 @@ impl User {
     fn send(&self, m: ServerMsg) {
         let _ = self.tx.send(Out::Json(m));
     }
+
+    /// 经 TCP 发语音 / 画面 / 伴奏给这个人（他的 UDP 不通）。对方收得慢时队列有上限：
+    /// 排队超过 MAX_PENDING_VIDEO 先丢画面，超过 MAX_PENDING_MEDIA 连声音也丢——宁可丢包也不让服务器内存一直涨（0.5.x 不限）
+    fn send_media(&self, o: Out) {
+        let len = match &o {
+            Out::Voice(v) | Out::Video(v) | Out::Stream(_, v) => v.len(),
+            _ => 0,
+        };
+        let cap = if matches!(o, Out::Video(_)) { MAX_PENDING_VIDEO } else { MAX_PENDING_MEDIA };
+        let pending = self.pending_media.load(std::sync::atomic::Ordering::Relaxed);
+        if pending + len > cap {
+            self.media_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        self.pending_media.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        if self.tx.send(o).is_err() {
+            self.pending_media.fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
+
+/// 经 TCP 排队等发给一个人的画面最多这么多字节（约 1 秒 8 Mbps）
+const MAX_PENDING_VIDEO: usize = 1024 * 1024;
+/// 语音 / 伴奏可以多排一点（画面已经在丢了，声音尽量保住）
+const MAX_PENDING_MEDIA: usize = MAX_PENDING_VIDEO + 256 * 1024;
 
 struct State {
     server_name: String,
@@ -191,6 +239,10 @@ struct State {
     relays: HashMap<(u32, u32), u32>,
     /// 屏幕共享画面中继：(共享者, 观看者) → 帮忙转发的观看者
     video_relays: HashMap<(u32, u32), u32>,
+    /// 语音优先：(说话的人, 听的人) 连续几次「在说却没听到」
+    voice_misses: HashMap<(u32, u32), u8>,
+    /// 语音优先：(说话的人, 听的人) 改经服务器转发到什么时候
+    voice_fallback: HashMap<(u32, u32), Instant>,
     /// 这一秒转发的语音 / 画面字节数；上一秒的（状态文件和带宽上限用）
     sec_bytes: (u64, u64),
     last_sec_bytes: (u64, u64),
@@ -258,6 +310,7 @@ impl State {
                 share_audio: u.sharing.is_some() && u.share_audio,
                 simulcast: u.sharing.is_some() && u.simulcast,
                 rtx: u.sharing.is_some() && u.rtx,
+                share_p2p_only: u.sharing.is_some() && u.share_p2p_only,
             })
             .collect();
         users.sort_by_key(|u| u.id);
@@ -287,7 +340,6 @@ impl State {
     fn push_peers(&mut self) {
         struct Cand {
             id: u32,
-            ch: Option<u32>,
             public: SocketAddr,
             local: Vec<String>,
             nat: Option<NatInfo>,
@@ -298,15 +350,17 @@ impl State {
             .iter()
             .filter_map(|(id, u)| {
                 let local = u.p2p.as_ref()?;
-                Some(Cand { id: *id, ch: u.channel, public: u.udp?, local: local.iter().take(8).cloned().collect(), nat: u.nat, hide: u.p2p_hide.clone() })
+                Some(Cand { id: *id, public: u.udp?, local: local.iter().take(8).cloned().collect(), nat: u.nat, hide: u.p2p_hide.clone() })
             })
             .collect();
         for (id, u) in self.users.iter_mut() {
             let my_public = u.udp.map(|a| a.ip().to_canonical());
-            let mut peers: Vec<PeerInfo> = match (&u.p2p, u.channel) {
-                (Some(_), Some(ch)) => cands
+            // 0.6：不只同频道——服务器上所有开了 P2P 的人都先打好洞（进频道那一刻就是直连）；
+            // 选了不透露 IP 的照旧互相不给
+            let mut peers: Vec<PeerInfo> = match &u.p2p {
+                Some(_) => cands
                     .iter()
-                    .filter(|c| c.id != *id && c.ch == Some(ch) && !c.hide.contains(id) && !u.p2p_hide.contains(&c.id))
+                    .filter(|c| c.id != *id && !c.hide.contains(id) && !u.p2p_hide.contains(&c.id))
                     .map(|c| {
                         let same_lan = my_public == Some(c.public.ip().to_canonical());
                         let mut addrs = vec![c.public.to_string()];
@@ -314,7 +368,7 @@ impl State {
                         PeerInfo { id: c.id, addrs, nat: c.nat }
                     })
                     .collect(),
-                _ => Vec::new(),
+                None => Vec::new(),
             };
             peers.sort_by_key(|p| p.id);
             if peers != u.last_peers {
@@ -383,7 +437,7 @@ impl State {
         let Some(ch) = u.channel else { return Vec::new() };
         let music = kind == udp::MUSIC;
         // 伴奏要在放；共享声音要在共享且带声音；鼠标只要在共享
-        if music && u.music.is_none() || !music && (u.sharing.is_none() || (kind == udp::SHARE_AUDIO && !u.share_audio)) {
+        if music && u.music.is_none() || !music && (u.sharing.is_none() || (kind == udp::SHARE_AUDIO && !u.share_audio) || u.share_p2p_only) {
             return Vec::new();
         }
         let direct = if music { u.direct.clone() } else { u.direct_video.clone() };
@@ -396,11 +450,14 @@ impl State {
             if !music && !other.watching.contains(&from) {
                 continue;
             }
-            // 走 TCP 隧道的人收不到（TCP 帧里没有这两种类型）
-            if let (true, Some(addr)) = (other.voice_udp, other.udp) {
-                let mut pkt = Vec::with_capacity(payload.len() + 64);
-                other.udp_seal.seal(kind, &payload, &mut pkt);
-                out.push((addr, pkt));
+            match (other.voice_udp, other.udp) {
+                (true, Some(addr)) => {
+                    let mut pkt = Vec::with_capacity(payload.len() + 64);
+                    other.udp_seal.seal(kind, &payload, &mut pkt);
+                    out.push((addr, pkt));
+                }
+                // UDP 不通的人走 TCP（0.6 起有 KIND_STREAM；以前这种人收不到伴奏和共享声音）
+                _ => other.send_media(Out::Stream(kind, payload.clone())),
             }
         }
         out
@@ -452,6 +509,67 @@ impl State {
         }
     }
 
+    /// 语音优先（0.6）：listener 刚上报了「最近听到了谁」。同频道里正在说话、名单上说是直连或经队友中转给他的人，
+    /// 他却连续几次都没听到 → 那条路实际不通，让说话的人先改经服务器发给他（不依赖链路判断正确）
+    fn check_voice_heard(&mut self, listener: u32) {
+        let now = Instant::now();
+        let Some(l) = self.users.get(&listener) else { return };
+        let (Some(ch), false) = (l.channel, l.deafened) else { return };
+        let Some(heard) = l.stats.as_ref().filter(|r| now.duration_since(r.at) < STATS_TTL).map(|r| r.heard.clone()) else { return };
+        let mut changed: Vec<u32> = Vec::new();
+        for (tid, t) in &self.users {
+            if *tid == listener || t.channel != Some(ch) || t.muted {
+                continue;
+            }
+            let talking = t.stats.as_ref().is_some_and(|r| r.talking && now.duration_since(r.at) < STATS_TTL);
+            let bypass = t.direct.contains(&listener) || self.relays.contains_key(&(*tid, listener));
+            let key = (*tid, listener);
+            if heard.contains(tid) || !talking || !bypass {
+                if heard.contains(tid) {
+                    self.voice_misses.remove(&key);
+                }
+                continue;
+            }
+            let n = self.voice_misses.entry(key).or_default();
+            *n = n.saturating_add(1);
+            if *n >= FALLBACK_MISSES && !self.voice_fallback.contains_key(&key) {
+                self.voice_fallback.insert(key, now + FALLBACK_HOLD);
+                self.voice_misses.remove(&key);
+                println!("[VOC] 语音优先：#{tid} 在说话但 #{listener} 没听到（直连 / 中转不通），改经服务器转发 {} 秒", FALLBACK_HOLD.as_secs());
+                changed.push(*tid);
+            }
+        }
+        for t in changed {
+            self.push_voice_fallback(t);
+        }
+    }
+
+    /// 把「哪些人要改经服务器发」告诉说话的人
+    fn push_voice_fallback(&self, talker: u32) {
+        let mut ids: Vec<u32> = self.voice_fallback.keys().filter(|(t, _)| *t == talker).map(|(_, l)| *l).collect();
+        ids.sort();
+        if let Some(u) = self.users.get(&talker) {
+            u.send(ServerMsg::VoiceFallback { ids });
+        }
+    }
+
+    /// 改经服务器转发到期的：撤销，通知说话的人（之后再试直连 / 中转，还不行会再改回来）
+    fn expire_voice_fallback(&mut self) {
+        let now = Instant::now();
+        let gone: Vec<(u32, u32)> =
+            self.voice_fallback.iter().filter(|(k, until)| now >= **until || !self.users.contains_key(&k.0) || !self.users.contains_key(&k.1)).map(|(k, _)| *k).collect();
+        let mut talkers: Vec<u32> = gone.iter().map(|k| k.0).collect();
+        talkers.sort();
+        talkers.dedup();
+        for k in gone {
+            self.voice_fallback.remove(&k);
+        }
+        self.voice_misses.retain(|k, _| self.users.contains_key(&k.0) && self.users.contains_key(&k.1));
+        for t in talkers {
+            self.push_voice_fallback(t);
+        }
+    }
+
     /// 重新规划各频道的成员中继路线，有变化就通知频道成员
     fn push_relays(&mut self) {
         let now = Instant::now();
@@ -470,7 +588,10 @@ impl State {
                 m.links = r.peers.iter().map(|p| (p.id, (p.rtt, p.loss, p.jitter))).collect();
                 m.slots = r.slots;
                 m.server_only = r.via_server.clone();
+                m.manual_via = r.manual_via.clone();
             }
+            // 语音优先改经服务器的人：这段时间不安排中转
+            m.no_relay_to = self.voice_fallback.keys().filter(|(t, _)| t == id).map(|(_, l)| *l).collect();
             by_channel.entry(ch).or_default().push(m);
         }
         let mut all: HashMap<(u32, u32), u32> = HashMap::new();
@@ -563,6 +684,9 @@ impl State {
     fn forward_video(&mut self, from: u32, frag: &[u8]) -> Vec<(SocketAddr, Vec<u8>)> {
         let Some(u) = self.users.get(&from) else { return Vec::new() };
         let (Some(ch), Some(_)) = (u.channel, &u.sharing) else { return Vec::new() };
+        if u.share_p2p_only {
+            return Vec::new(); // 共享者选了只走 P2P：服务器不转发也不缓存（正常客户端这时也不会发上来）
+        }
         let Some((f, _)) = udp::read_video_frag(frag) else { return Vec::new() };
         // 有低画质层时按层转发：要低画质的只收低画质层，其他人只收原画
         let layer_low = f.flags & udp::VIDEO_LOW != 0;
@@ -588,9 +712,7 @@ impl State {
                     other.udp_seal.seal(udp::VIDEO, &payload, &mut pkt);
                     out.push((addr, pkt));
                 }
-                _ => {
-                    let _ = other.tx.send(Out::Video(payload.clone()));
-                }
+                _ => other.send_media(Out::Video(payload.clone())),
             }
             self.sec_bytes.1 += payload.len() as u64 + 60;
         }
@@ -753,10 +875,12 @@ impl State {
         let payload = udp::server_voice(from, seq, frame);
         let mut out = Vec::new();
         for (id, other) in self.users.iter_mut() {
-            if *id == from || other.channel != Some(ch) || other.deafened || direct.contains(id) {
+            // 语音优先改经服务器的：不管名单上怎么说都转（说话的人那边也会改发给服务器）
+            let fallback = self.voice_fallback.contains_key(&(from, *id));
+            if *id == from || other.channel != Some(ch) || other.deafened || (direct.contains(id) && !fallback) {
                 continue;
             }
-            if relayed.contains(id) {
+            if relayed.contains(id) && !fallback {
                 continue; // 由成员中继转发
             }
             self.sec_bytes.0 += payload.len() as u64 + 60;
@@ -765,10 +889,15 @@ impl State {
                     let mut pkt = Vec::with_capacity(payload.len() + 64);
                     other.udp_seal.seal(udp::VOICE, &payload, &mut pkt);
                     out.push((addr, pkt));
+                    // 这个听众经服务器收语音丢包高：只给他多发一份（另封一次，接收端按序号去重）
+                    if other.stats.as_ref().is_some_and(|r| r.voice_loss >= VOICE_DUP_LOSS && r.at.elapsed() < STATS_TTL) {
+                        let mut dup = Vec::with_capacity(payload.len() + 64);
+                        other.udp_seal.seal(udp::VOICE, &payload, &mut dup);
+                        out.push((addr, dup));
+                        self.sec_bytes.0 += payload.len() as u64 + 60;
+                    }
                 }
-                _ => {
-                    let _ = other.tx.send(Out::Voice(payload.clone()));
-                }
+                _ => other.send_media(Out::Voice(payload.clone())),
             }
         }
         out
@@ -989,6 +1118,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         replay: ReplayCache::default(),
         relays: HashMap::new(),
         video_relays: HashMap::new(),
+        voice_misses: HashMap::new(),
+        voice_fallback: HashMap::new(),
         sec_bytes: (0, 0),
         last_sec_bytes: (0, 0),
         max_video_bps: cfg.max_video_bps,
@@ -1015,24 +1146,32 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     }
     tokio::spawn(revocation_loop(state.clone()));
     tokio::spawn(relay_loop(state.clone()));
+    let pre_auth = PreAuth::default();
 
     loop {
         tokio::select! {
             r = tcp.accept() => {
                 let Ok((stream, addr)) = r else { continue };
+                // 未认证（还在握手 / 被吞数据）的连接总数和每个 IP 的数量有上限：
+                // 大量并发握手不会把服务器拖垮；正常用户握手很快就认证完、不占名额，同一公网 IP 下多人也不会被误伤
+                let Some(guard) = pre_auth.enter(addr.ip()) else {
+                    drop(stream);
+                    continue;
+                };
                 // 被封的 IP：不做任何处理，吞掉数据后关闭（和探测得到的反应一样）
                 if state.lock().unwrap().banned(addr.ip()) {
                     tokio::spawn(async move {
                         let (rd, wr) = stream.into_split();
                         sink(rd).await;
                         drop(wr);
+                        drop(guard);
                     });
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
                 let (st, us) = (state.clone(), udp_sock.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(st, us, stream, addr).await {
+                    if let Err(e) = handle_client(st, us, stream, addr, guard).await {
                         eprintln!("[{addr}] {e}");
                     }
                 });
@@ -1040,6 +1179,51 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             _ = tokio::signal::ctrl_c() => {
                 println!("[VOC] 正在关闭");
                 return Ok(());
+            }
+        }
+    }
+}
+
+/// 未认证连接最多同时这么多个（全服务器）
+const MAX_PRE_AUTH: usize = 256;
+/// 同一个 IP 最多同时这么多个未认证连接（同一公网 IP 下的正常用户握手很快，不会同时占这么多）
+const MAX_PRE_AUTH_PER_IP: usize = 16;
+
+/// 未认证连接计数
+#[derive(Default, Clone)]
+struct PreAuth(Arc<Mutex<(usize, HashMap<std::net::IpAddr, usize>)>>);
+
+/// 占着一个未认证连接名额，drop 时归还
+struct PreAuthGuard {
+    owner: PreAuth,
+    ip: std::net::IpAddr,
+}
+
+impl PreAuth {
+    fn enter(&self, ip: std::net::IpAddr) -> Option<PreAuthGuard> {
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6)),
+            v4 => v4,
+        };
+        let mut g = self.0.lock().unwrap();
+        let per_ip = g.1.get(&ip).copied().unwrap_or(0);
+        if g.0 >= MAX_PRE_AUTH || per_ip >= MAX_PRE_AUTH_PER_IP {
+            return None;
+        }
+        g.0 += 1;
+        *g.1.entry(ip).or_default() += 1;
+        Some(PreAuthGuard { owner: self.clone(), ip })
+    }
+}
+
+impl Drop for PreAuthGuard {
+    fn drop(&mut self) {
+        let mut g = self.owner.0.lock().unwrap();
+        g.0 = g.0.saturating_sub(1);
+        if let Some(n) = g.1.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                g.1.remove(&self.ip);
             }
         }
     }
@@ -1095,8 +1279,10 @@ async fn read_frame(rd: &mut OwnedReadHalf, op: &mut FrameOpener) -> Option<(u8,
     op.open_body(&b)
 }
 
-async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStream, addr: SocketAddr) -> Result<(), String> {
+async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStream, addr: SocketAddr, pre_auth: PreAuthGuard) -> Result<(), String> {
     let (mut rd, mut wr) = stream.into_split();
+    // 握手完成前一直占着「未认证连接」的名额（无法认证的连接在 sink 里耗到超时才放）
+    let pre_auth = Some(pre_auth);
 
     // ---- 握手 ----
     let mut prefix = [0u8; CLIENT_PREFIX_LEN];
@@ -1142,6 +1328,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         return Ok(());
     };
     wr.write_all(&reply).await.map_err(|e| e.to_string())?;
+    drop(pre_auth); // 已认证：不再占未认证连接的名额
 
     let mut sealer = FrameSealer::new(&keys.tcp_s2c);
     let mut opener = FrameOpener::new(&keys.tcp_c2s);
@@ -1167,7 +1354,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     let err = {
         let st = state.lock().unwrap();
         if version != PROTOCOL_VERSION {
-            Some(format!("协议版本不匹配（服务器 {PROTOCOL_VERSION}，客户端 {version}），请更新客户端"))
+            Some(voc_proto::version_mismatch_text(PROTOCOL_VERSION, version))
         } else if name.is_empty() || name.chars().count() > MAX_NAME_LEN {
             Some(format!("昵称长度需在 1~{MAX_NAME_LEN} 个字符之间"))
         } else if st.users.values().any(|u| u.name == name && u.code_id != entry.id) {
@@ -1184,6 +1371,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
     let kick = Arc::new(Notify::new());
     let pending_file = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pending_media = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let user_id = {
         let mut st = state.lock().unwrap();
         // 同一授权码只允许一个在线：踢掉旧的
@@ -1238,9 +1426,12 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 decoders: Vec::new(),
                 music: None,
                 share_audio: false,
+                share_p2p_only: false,
                 stats: None,
                 last_relays: Vec::new(),
                 pending_file: pending_file.clone(),
+                pending_media: pending_media.clone(),
+                media_dropped: Default::default(),
                 uploads: HashMap::new(),
                 upload_to: HashMap::new(),
             },
@@ -1253,13 +1444,24 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     println!("[{addr}] {name} (#{user_id}, 授权码 {} {}) 已连接", entry.id, entry.note);
 
     let pending_writer = pending_file.clone();
+    let media_writer = pending_media.clone();
     let writer = tokio::spawn(async move {
         while let Some(o) = rx.recv().await {
-            let mut file_len = 0;
+            let (mut file_len, mut media_len) = (0, 0);
             let f = match o {
                 Out::Json(m) => sealer.seal(KIND_JSON, serde_json::to_string(&m).unwrap().as_bytes()),
-                Out::Voice(v) => sealer.seal(KIND_VOICE, &v),
-                Out::Video(v) => sealer.seal(KIND_VIDEO, &v),
+                Out::Voice(v) => {
+                    media_len = v.len();
+                    sealer.seal(KIND_VOICE, &v)
+                }
+                Out::Video(v) => {
+                    media_len = v.len();
+                    sealer.seal(KIND_VIDEO, &v)
+                }
+                Out::Stream(k, v) => {
+                    media_len = v.len();
+                    sealer.seal(KIND_STREAM, &stream_frame(k, &v))
+                }
                 Out::File(v) => {
                     file_len = v.len();
                     sealer.seal(KIND_FILE, &v)
@@ -1268,6 +1470,9 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
             let ok = wr.write_all(&f).await.is_ok();
             if file_len > 0 {
                 pending_writer.fetch_sub(file_len, std::sync::atomic::Ordering::Relaxed);
+            }
+            if media_len > 0 {
+                media_writer.fetch_sub(media_len, std::sync::atomic::Ordering::Relaxed);
             }
             if !ok {
                 break;
@@ -1301,6 +1506,18 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 }
             }
             KIND_FILE => state.lock().unwrap().forward_file(user_id, &data),
+            // UDP 不通的人经 TCP 发来的伴奏 / 共享声音 / 鼠标
+            KIND_STREAM => {
+                let Some((&k, rest)) = data.split_first() else { continue };
+                if !matches!(k, udp::MUSIC | udp::SHARE_AUDIO | udp::CURSOR) {
+                    continue;
+                }
+                let Some((seq, f)) = udp::read_client_voice(rest) else { continue };
+                let pkts = state.lock().unwrap().forward_stream(user_id, k, seq, f);
+                for (a, p) in pkts {
+                    let _ = udp_sock.send_to(&p, a).await;
+                }
+            }
             _ => {}
         }
     }
@@ -1508,10 +1725,11 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::ShareStart { desc, audio, simulcast, rtx, bps } => {
+        ClientMsg::ShareStart { desc, audio, simulcast, rtx, bps, p2p_only } => {
             let desc: String = desc.trim().chars().take(16).collect();
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.channel.is_some() {
+                    u.share_p2p_only = p2p_only;
                     u.share_audio = audio;
                     u.simulcast = simulcast;
                     u.rtx = rtx;
@@ -1589,7 +1807,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 }
             }
         }
-        ClientMsg::LinkStats { server_rtt, peers, relay_slots, via_server, video_relay_bps } => {
+        ClientMsg::LinkStats { server_rtt, peers, relay_slots, via_server, video_relay_bps, talking, heard, manual_via, voice_loss } => {
             let Some(u) = st.users.get_mut(&uid) else { return };
             let allowed: HashSet<u32> = u.last_peers.iter().map(|p| p.id).collect();
             let peers: Vec<PeerStat> = peers.into_iter().filter(|p| allowed.contains(&p.id)).take(32).collect();
@@ -1601,7 +1819,12 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 slots: relay_slots.min(16),
                 via_server,
                 video_relay_bps,
+                talking,
+                heard: heard.into_iter().take(64).collect(),
+                manual_via: manual_via.into_iter().take(32).map(|[p, v]| (p, v)).collect(),
+                voice_loss: voice_loss.min(100),
             });
+            st.check_voice_heard(uid);
         }
         ClientMsg::DirectPeers { ids, video } => {
             let Some(u) = st.users.get(&uid) else { return };
@@ -1661,6 +1884,7 @@ async fn relay_loop(state: Shared) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let mut st = state.lock().unwrap();
+        st.expire_voice_fallback();
         st.push_relays();
         st.push_video_relays();
         st.balance_video_cap();
@@ -1777,6 +2001,26 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
 #[cfg(test)]
 mod tests {
     use super::is_public;
+
+    #[test]
+    fn pre_auth_connections_are_limited() {
+        use super::{PreAuth, MAX_PRE_AUTH, MAX_PRE_AUTH_PER_IP};
+        let p = PreAuth::default();
+        let a: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        let mapped: std::net::IpAddr = "::ffff:1.2.3.4".parse().unwrap();
+        let mut held: Vec<_> = (0..MAX_PRE_AUTH_PER_IP).map(|_| p.enter(a).unwrap()).collect();
+        assert!(p.enter(a).is_none(), "per-IP limit");
+        assert!(p.enter(mapped).is_none(), "IPv4-mapped IPv6 counts as the same IP");
+        assert!(p.enter("5.6.7.8".parse().unwrap()).is_some(), "other IPs are not affected");
+        held.pop(); // 一个认证完了
+        assert!(p.enter(a).is_some());
+        // 全局上限
+        let p = PreAuth::default();
+        let all: Vec<_> = (0..MAX_PRE_AUTH).map(|i| p.enter(std::net::IpAddr::from([10, 0, (i / 250) as u8, (i % 250) as u8])).unwrap()).collect();
+        assert!(p.enter("9.9.9.9".parse().unwrap()).is_none(), "global limit");
+        drop(all);
+        assert!(p.enter("9.9.9.9".parse().unwrap()).is_some(), "released on drop");
+    }
 
     #[test]
     fn repeated_auth_failures_ban_the_ip_for_a_while() {

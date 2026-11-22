@@ -43,6 +43,10 @@ pub struct Member {
     pub slots: u16,
     /// 他手动选了「走服务器」的人：两人之间不安排成员中继
     pub server_only: HashSet<u32>,
+    /// 他手动指定的语音中转（0.6）：对方 → 经谁。两个方向都按这个；安排不了就走服务器（不改用别人）
+    pub manual_via: HashMap<u32, u32>,
+    /// 他说话时这些人没听到、已改经服务器转发（语音优先）：这段时间不给他们安排中转
+    pub no_relay_to: HashSet<u32>,
 }
 
 impl Member {
@@ -69,22 +73,32 @@ pub fn plan(members: &[Member], current: &HashMap<(u32, u32), u32>) -> Vec<Relay
             continue; // 闭麦的人不发语音
         }
         for b in members {
-            if b.id == a.id || b.deafened || a.direct.contains(&b.id) {
+            if b.id == a.id || b.deafened || a.direct.contains(&b.id) || a.no_relay_to.contains(&b.id) {
                 continue;
             }
             if a.server_only.contains(&b.id) || b.server_only.contains(&a.id) {
-                continue; // 有一方手动选了走服务器
+                continue; // 有一方手动选了走服务器（冲突时按更保守的）
             }
             let (Some(sa), Some(sb)) = (a.server_rtt, b.server_rtt) else { continue };
             let server_ms = sa + sb;
+            // 手动指定了经谁中转（任一方指定都算，两个方向都经他）；两人指定的不一样 → 冲突，走服务器
+            let manual = match (a.manual_via.get(&b.id), b.manual_via.get(&a.id)) {
+                (Some(x), Some(y)) if x != y => continue,
+                (Some(x), _) | (_, Some(x)) => Some(*x),
+                _ => None,
+            };
             let mut cands: Vec<(u32, u32)> = members
                 .iter()
                 .filter(|r| r.id != a.id && r.id != b.id && r.slots > 0 && a.direct.contains(&r.id))
+                .filter(|r| manual.is_none_or(|x| r.id == x))
                 .filter_map(|r| {
-                    let ms = r.good_link(a.id)? + r.good_link(b.id)? + FORWARD_COST_MS;
+                    // 手动指定的：链路只要通着就用（不看丢包、抖动门槛）；自动的：两边都要稳定
+                    let link = |to: u32| if manual.is_some() { r.links.get(&to).map(|l| l.0.max(1)) } else { r.good_link(to) };
+                    let ms = link(a.id)? + link(b.id)? + FORWARD_COST_MS;
                     Some((ms, r.id))
                 })
-                .filter(|(ms, _)| ms + MIN_GAIN_MS <= server_ms)
+                // 手动指定的不要求比服务器快
+                .filter(|(ms, _)| manual.is_some() || ms + MIN_GAIN_MS <= server_ms)
                 .collect();
             if cands.is_empty() {
                 continue;
@@ -226,6 +240,50 @@ mod tests {
         }
         assert!(per.values().all(|&n| n <= 1), "{r:?}");
         assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn manual_via_is_used_both_ways_or_falls_back_to_server() {
+        // 1、2 打不通；3、4 都能中转，4 更快。1 手动指定经 3
+        let base = || {
+            let mut a = m(1, 200, &[3, 4], &[(3, 40, 0, 2), (4, 20, 0, 2)], 0);
+            a.manual_via.insert(2, 3);
+            vec![
+                a,
+                m(2, 200, &[3, 4], &[(3, 40, 0, 2), (4, 20, 0, 2)], 0),
+                m(3, 100, &[1, 2], &[(1, 40, 6, 2), (2, 40, 0, 2)], 8), // 3 到 1 有点丢包：自动不会选，手动照用
+                m(4, 100, &[1, 2], &[(1, 20, 0, 2), (2, 20, 0, 2)], 8),
+            ]
+        };
+        let r = plan(&base(), &HashMap::new());
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r.iter().all(|x| x.via == 3), "both directions via the chosen member: {r:?}");
+        // 两人指定的不一样：冲突，走服务器
+        let mut ms = base();
+        ms[1].manual_via.insert(1, 4);
+        assert!(plan(&ms, &HashMap::new()).is_empty());
+        // 指定的人关了中转：不改用别人，走服务器
+        let mut ms = base();
+        ms[2].slots = 0;
+        assert!(plan(&ms, &HashMap::new()).is_empty());
+        // 对方选了走服务器：更保守的为准
+        let mut ms = base();
+        ms[1].server_only.insert(1);
+        assert!(plan(&ms, &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn no_relay_to_fallback_listeners() {
+        let mut ms = vec![
+            m(1, 200, &[3], &[(3, 30, 0, 2)], 8),
+            m(2, 200, &[3], &[(3, 30, 0, 2)], 8),
+            m(3, 100, &[1, 2], &[(1, 30, 0, 2), (2, 30, 0, 2)], 8),
+        ];
+        assert_eq!(plan(&ms, &HashMap::new()).len(), 2);
+        ms[0].no_relay_to.insert(2); // 1 说话时 2 没听到 → 1→2 改经服务器
+        let r = plan(&ms, &HashMap::new());
+        assert!(r.iter().all(|x| !(x.from == 1 && x.to == 2)), "{r:?}");
+        assert!(r.iter().any(|x| x.from == 2 && x.to == 1), "the other direction is unaffected");
     }
 
     #[test]

@@ -55,6 +55,8 @@ pub const NACK_MAX: usize = 256;
 
 /// 视频分片数据最大长度（加上各层包头后单个 UDP 包 < 1200 字节，避免 IP 分片）
 pub const VIDEO_FRAG: usize = 1080;
+/// 一帧最多多少个数据分片（约 8.8 MB；25 Mbps 的关键帧也远小于这个）。超过的帧发送端不发、接收端不收
+pub const MAX_FRAGS: u16 = 8192;
 /// 视频分片 flags：bit0 = 关键帧，bit1-2 = 编码格式（0 H.264，1 HEVC，2 AV1），bit3 = 低画质层（360P）
 pub const VIDEO_KEY: u8 = 1;
 pub const VIDEO_LOW: u8 = 8;
@@ -151,8 +153,13 @@ pub fn read_video_frag(b: &[u8]) -> Option<(VideoFrag, &[u8])> {
         count: u16::from_le_bytes([b[6], b[7]]),
         flags: b[8],
     };
-    // idx ≥ count 是冗余校验包：异或校验最多 count 个，Reed-Solomon 校验在 2·count 之后、最多 2·count 个
-    (f.count > 0 && (f.idx as u32) < f.count as u32 * 4).then_some((f, &b[VIDEO_HDR..]))
+    // idx ≥ count 是冗余校验包：异或校验最多 count 个，Reed-Solomon 校验在 2·count 之后、最多 4·count 个（0.6 起；以前 2·count）。
+    // 分片数和每片长度都有上限（坏包 / 恶意包不能让接收端按很大的数分配内存）
+    let ok = f.count > 0
+        && f.count <= MAX_FRAGS
+        && (f.idx as u32) < f.count as u32 * 6
+        && b.len() - VIDEO_HDR <= VIDEO_FRAG + RS_HDR;
+    ok.then_some((f, &b[VIDEO_HDR..]))
 }
 
 impl VideoFrag {
@@ -169,8 +176,20 @@ impl VideoFrag {
 
 /// Reed-Solomon：每组最多多少个数据分片（GF(2^8) 一组数据 + 校验最多 255 片）
 pub const RS_GROUP: usize = 64;
-/// 校验片数最多是数据片数的多少倍
-pub const RS_MAX_RATIO: f32 = 1.5;
+/// 校验片数最多是数据片数的多少倍（一般的组；0.6 起 2.0，以前 1.5）
+pub const RS_MAX_RATIO: f32 = 2.0;
+/// 片数很少的组（小帧，码率低时很常见）同样丢包率下整组救不回的概率高得多（丢 50%、4 片一组、200% 冗余仍有约 7% 救不回），
+/// 丢包高时按片数加倍冗余，上限更高（复查 34-1）
+pub fn rs_small_group_ratio(k: usize, ratio: f32) -> f32 {
+    if ratio < 0.9 {
+        return ratio.min(RS_MAX_RATIO);
+    }
+    match k {
+        0..=4 => (ratio * 2.0).min(4.0),
+        5..=8 => (ratio * 1.5).min(3.0),
+        _ => ratio.min(RS_MAX_RATIO),
+    }
+}
 const RS_HDR: usize = 11;
 
 /// 一帧的数据分片怎么分组：[(第一片, 片数)]，尽量平均
@@ -196,7 +215,7 @@ pub fn rs_parity_count(k: usize, ratio: f32) -> usize {
     if ratio <= 0.0 || k == 0 {
         return 0;
     }
-    ((k as f32 * ratio.min(RS_MAX_RATIO) - 1e-3).ceil() as usize).clamp(1, 255 - k)
+    ((k as f32 * rs_small_group_ratio(k, ratio) - 1e-3).ceil() as usize).clamp(1, (255 - k).min(4 * k))
 }
 
 fn rs_shard(c: &[u8]) -> Vec<u8> {
@@ -375,16 +394,38 @@ pub fn fec_recover(parity: &[u8], others: &[&[u8]]) -> Option<Vec<u8>> {
     })
 }
 
-/// 补发请求：target（或服务器转给共享者时的请求者）| 画质层 | 帧号 | 缺的分片
+/// NACK 的画质层字节里这一位 = 缺片用「起始编号 + 位图」表示（0.6，大帧缺很多片时用）
+const NACK_BITMAP: u8 = 0x80;
+
+/// 补发请求：target（或服务器转给共享者时的请求者）| 画质层 | 帧号 | 缺的分片。
+/// 缺的片不多：逐个列出（最多 NACK_MAX 个）；很多（大帧）：`起始编号 u16 | 位图字节数 u16 | 位图`，
+/// 只补缺的那些，不用整帧重发（0.5.x 超过 256 片就整帧重发，第 42-4 项）
 pub fn nack_payload(target: u32, layer: u8, frame: u32, idxs: &[u16]) -> Vec<u8> {
-    let idxs = &idxs[..idxs.len().min(NACK_MAX)];
-    let mut v = Vec::with_capacity(11 + idxs.len() * 2);
+    let mut v = Vec::with_capacity(11 + idxs.len().min(NACK_MAX) * 2);
     v.extend_from_slice(&target.to_le_bytes());
-    v.push(layer);
+    let list = idxs.len() <= NACK_MAX || idxs.contains(&NACK_WHOLE);
+    v.push(if list { layer } else { layer | NACK_BITMAP });
     v.extend_from_slice(&frame.to_le_bytes());
-    v.extend_from_slice(&(idxs.len() as u16).to_le_bytes());
-    for i in idxs {
-        v.extend_from_slice(&i.to_le_bytes());
+    if list {
+        let idxs = &idxs[..idxs.len().min(NACK_MAX)];
+        v.extend_from_slice(&(idxs.len() as u16).to_le_bytes());
+        for i in idxs {
+            v.extend_from_slice(&i.to_le_bytes());
+        }
+    } else {
+        let start = *idxs.iter().min().unwrap();
+        let end = *idxs.iter().max().unwrap();
+        let nbytes = ((end - start) as usize / 8 + 1).min(MAX_FRAGS as usize / 8);
+        let mut bm = vec![0u8; nbytes];
+        for i in idxs {
+            let o = (i - start) as usize;
+            if o / 8 < nbytes {
+                bm[o / 8] |= 1 << (o % 8);
+            }
+        }
+        v.extend_from_slice(&start.to_le_bytes());
+        v.extend_from_slice(&(nbytes as u16).to_le_bytes());
+        v.extend_from_slice(&bm);
     }
     v
 }
@@ -396,6 +437,18 @@ pub fn read_nack(b: &[u8]) -> Option<(u32, u8, u32, Vec<u16>)> {
     let target = u32::from_le_bytes(b[..4].try_into().ok()?);
     let layer = b[4] & VIDEO_LOW;
     let frame = u32::from_le_bytes(b[5..9].try_into().ok()?);
+    if b[4] & NACK_BITMAP != 0 {
+        if b.len() < 13 {
+            return None;
+        }
+        let start = u16::from_le_bytes([b[9], b[10]]) as usize;
+        let nbytes = u16::from_le_bytes([b[11], b[12]]) as usize;
+        if nbytes > MAX_FRAGS as usize / 8 || b.len() < 13 + nbytes {
+            return None;
+        }
+        let idxs = (0..nbytes * 8).filter(|o| b[13 + o / 8] & (1 << (o % 8)) != 0).map(|o| start + o).filter(|i| *i < MAX_FRAGS as usize).map(|i| i as u16).collect();
+        return Some((target, layer, frame, idxs));
+    }
     let n = u16::from_le_bytes([b[9], b[10]]) as usize;
     if n > NACK_MAX || b.len() < 11 + n * 2 {
         return None;
@@ -478,6 +531,70 @@ mod tests {
         assert!(read_video_frag(&[0; 4]).is_none());
     }
 
+    /// 丢 50%、冗余 200%：小帧（片数少）也要大概率救回来——按二项分布算失败率
+    #[test]
+    fn small_groups_get_more_parity_under_heavy_loss() {
+        // n 片里至少收到 k 片的概率（每片独立丢 50%）
+        let ok_prob = |k: usize, m: usize| {
+            let n = k + m;
+            let mut c = 1.0f64; // C(n, i)
+            let mut fail = 0.0;
+            for i in 0..k {
+                if i > 0 {
+                    c = c * (n - i + 1) as f64 / i as f64;
+                }
+                fail += c;
+            }
+            1.0 - fail / 2f64.powi(n as i32)
+        };
+        for k in [1usize, 2, 4, 8, 16, 64] {
+            let m = rs_parity_count(k, 2.0);
+            assert!(m <= 4 * k);
+            // 1 片的帧发 5 份：96.9%；2 片以上都在 98.9% 以上（0.5.1 的 120% 下 4 片一组只有约 75%）
+            assert!(ok_prob(k, m) > 0.965, "k={k} m={m}: {}", ok_prob(k, m));
+        }
+        // 丢包不高时不加倍（省带宽）
+        assert_eq!(rs_parity_count(4, 0.35), 2);
+        // 编号范围装得下：一帧最多 4·count 个校验片
+        let data = vec![7u8; VIDEO_FRAG * 3];
+        let par = rs_parities(1, 0, &data, 2.0);
+        assert_eq!(par.len(), 12);
+        assert!(par.iter().all(|p| read_video_frag(p).is_some()));
+    }
+
+    #[test]
+    fn nack_list_and_bitmap() {
+        // 少：逐个列出
+        let p = nack_payload(7, VIDEO_LOW, 99, &[1, 5, 9]);
+        assert_eq!(read_nack(&p), Some((7, VIDEO_LOW, 99, vec![1, 5, 9])));
+        // 整帧
+        assert_eq!(read_nack(&nack_payload(7, 0, 1, &[NACK_WHOLE])).unwrap().3, vec![NACK_WHOLE]);
+        // 多（大帧缺 600 片）：位图，一个都不少，包也不大
+        let many: Vec<u16> = (100..1300).filter(|i| i % 2 == 0).collect();
+        let p = nack_payload(7, 0, 5, &many);
+        assert!(p.len() < 200, "bitmap is compact: {}", p.len());
+        assert_eq!(read_nack(&p), Some((7, 0, 5, many)));
+        // 坏包不认
+        let mut bad = nack_payload(7, 0, 5, &(0..400).collect::<Vec<u16>>());
+        bad.truncate(20);
+        assert!(read_nack(&bad).is_none());
+    }
+
+    #[test]
+    fn fragment_limits() {
+        let mut f = video_fragments(1, 0, b"abc")[0].clone();
+        assert!(read_video_frag(&f).is_some());
+        // 分片数超过上限：不认
+        f[6..8].copy_from_slice(&(MAX_FRAGS + 1).to_le_bytes());
+        assert!(read_video_frag(&f).is_none());
+        f[6..8].copy_from_slice(&MAX_FRAGS.to_le_bytes());
+        assert!(read_video_frag(&f).is_some());
+        // 一片的数据超长：不认
+        let mut long = video_fragments(1, 0, b"abc")[0].clone();
+        long.resize(9 + VIDEO_FRAG + RS_HDR + 1, 0);
+        assert!(read_video_frag(&long).is_none());
+    }
+
     #[test]
     fn fec_recovers_one_lost_fragment_per_group() {
         let data: Vec<u8> = (0..(VIDEO_FRAG * 7 + 123) as u32).map(|i| (i * 7) as u8).collect();
@@ -497,7 +614,7 @@ mod tests {
         }
         // 超出范围的校验包号不认
         let mut bad = par[0].clone();
-        bad[4..6].copy_from_slice(&32u16.to_le_bytes());
+        bad[4..6].copy_from_slice(&48u16.to_le_bytes()); // count = 8：校验包号要 < 6·count
         assert!(read_video_frag(&bad).is_none());
     }
 
@@ -565,8 +682,9 @@ mod tests {
         let p = nack_payload(9, VIDEO_LOW, 77, &[1, 5, NACK_WHOLE]);
         assert_eq!(read_nack(&p), Some((9, VIDEO_LOW, 77, vec![1, 5, NACK_WHOLE])));
         assert!(read_nack(&p[..12]).is_none());
+        // 0.6：超过 NACK_MAX 个改用位图，一个都不丢（以前截到 NACK_MAX 个）
         let many: Vec<u16> = (0..1000).collect();
-        assert_eq!(read_nack(&nack_payload(1, 0, 2, &many)).unwrap().3.len(), NACK_MAX);
+        assert_eq!(read_nack(&nack_payload(1, 0, 2, &many)).unwrap().3, many);
     }
 
     #[test]

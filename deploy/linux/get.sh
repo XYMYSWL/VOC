@@ -9,6 +9,10 @@
 # 环境变量：
 #   VOC_VERSION=v0.2.1      安装指定版本（默认最新版）
 #   VOC_TARBALL_URL=...     从指定地址下载安装包（仍用 GitHub 公布的 SHA-256 校验）
+#   VOC_SHA256=...          手动给安装包的 SHA-256（服务器连不上 GitHub 接口、又要经镜像下载时用）
+#   VOC_INSECURE=1          经镜像下载又没有校验值时，确认跳过校验（不建议）
+#
+# 安全：经镜像 / 自定义地址下载时必须能校验 SHA-256，否则停止安装（0.6 起；以前会跳过校验继续装）。
 #
 # 直连 GitHub 下载失败时自动改走国内加速镜像（ghfast.top、gh-proxy.org、gh-proxy.com）。
 # 服务器连不上 GitHub 时，脚本本身也可以经镜像下载：
@@ -70,10 +74,17 @@ SHA="$(printf '%s' "$META" | tr ',{}' '\n\n\n' | awk -v a="$ASSET" -F'"' '
     $2 == "name" { n = $4 }
     $2 == "digest" && n == a && $4 ~ /^sha256:/ { sub(/^sha256:/, "", $4); print $4; exit }' || true)"
 
+SHA="${VOC_SHA256:-$SHA}"
+SHA="$(printf '%s' "$SHA" | tr 'A-F' 'a-f')"
+
 info "下载 VOC 服务器 ${TAG:-$VERSION}"
 MIRRORS="https://ghfast.top/ https://gh-proxy.org/ https://gh-proxy.com/"
+# 是不是直接从 GitHub 下的（镜像 / 自己指定的地址都是第三方，必须有校验值）
+TRUSTED=1
+[ -n "${VOC_TARBALL_URL:-}" ] && TRUSTED=0
 if ! fetch "$URL" "$TMP/$ASSET"; then
     ok=0
+    TRUSTED=0
     # 没指定下载地址时，直连失败就依次试国内加速镜像（镜像只负责传文件，下面照样按 GitHub 公布的 SHA-256 校验）
     if [ -z "${VOC_TARBALL_URL:-}" ]; then
         for m in $MIRRORS; do
@@ -92,8 +103,18 @@ if [ -n "$SHA" ] && command -v sha256sum >/dev/null 2>&1; then
     GOT="$(sha256sum "$TMP/$ASSET" | cut -d' ' -f1)"
     [ "$GOT" = "$SHA" ] || die "安装包校验失败（SHA-256 不一致），已停止。请稍后重试。"
     info "SHA-256 校验通过"
+elif [ "$TRUSTED" -eq 1 ]; then
+    # 直接从 GitHub（HTTPS）下的：没取到校验值也继续
+    info "跳过 SHA-256 校验（没取到 GitHub 公布的校验值；安装包是直接从 GitHub 下载的）"
+elif [ "${VOC_INSECURE:-}" = "1" ]; then
+    red "注意：安装包来自镜像 / 自定义地址，又没有校验值，按 VOC_INSECURE=1 跳过校验继续安装"
 else
-    info "跳过 SHA-256 校验（没取到 GitHub 公布的校验值；服务器连不上 GitHub 接口时会这样）"
+    # 经第三方镜像下载、又核对不了：镜像被篡改的话装上的就是别人的程序（以 root 运行），宁可停下
+    if [ -z "$SHA" ]; then why="取不到 GitHub 公布的校验值（服务器连不上 GitHub 接口）"; else why="系统没有 sha256sum"; fi
+    die "安装包是从镜像 / 自定义地址下载的，但$why，无法确认没被篡改，已停止。
+  办法一：在能上 GitHub 的电脑打开 https://github.com/$REPO/releases ，找到 $ASSET 旁边的 sha256，然后
+          curl -fsSL ... | sudo VOC_SHA256=<那串校验值> bash
+  办法二：确认要冒这个险：curl -fsSL ... | sudo VOC_INSECURE=1 bash"
 fi
 
 tar -xzf "$TMP/$ASSET" -C "$TMP"

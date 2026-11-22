@@ -64,8 +64,11 @@ impl AuthCode {
     }
 
     pub fn parse(s: &str) -> Result<Self, String> {
+        // 连同「授权码：」之类的前缀、结尾的引号句号一起粘贴进来也能认：去掉首尾不是字母数字的部分（含中文、全角标点）
+        let s = s.trim_matches(|c: char| !c.is_ascii_alphanumeric());
         let mut cleaned: String = s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
-        if cleaned.len() >= 2 && cleaned[..2].eq_ignore_ascii_case("KH") {
+        // 按字符边界取前两个（不能按字节切：开头可能是多字节字符）
+        if cleaned.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("KH")) {
             cleaned.drain(..2);
         }
         let mut chars = Vec::with_capacity(ID_LEN + SECRET_LEN);
@@ -128,6 +131,20 @@ mod tests {
         assert_eq!(AuthCode::parse(&messy).unwrap().psk(), c.psk());
         assert!(AuthCode::parse("KH-123").is_err());
         assert!(AuthCode::parse(&shown.replace('A', "U")).is_err() || !shown.contains('A'));
+    }
+
+    #[test]
+    fn non_ascii_input_does_not_panic() {
+        let c = AuthCode::generate();
+        let shown = c.display();
+        // 带中文前缀、全角冒号：能认出来
+        assert_eq!(AuthCode::parse(&format!("授权码：{shown}")).unwrap(), c);
+        assert_eq!(AuthCode::parse(&format!("「{shown}」")).unwrap(), c);
+        // 各种乱输入：报错，不崩溃
+        for s in ["中", "中文", "Ｋ", "ＫＨ-ABC", "K中", "é", "😀😀", "", "  ", "-", "KH", "k"] {
+            let _ = AuthCode::parse(s);
+        }
+        assert!(AuthCode::parse("中文").is_err());
     }
 
     #[test]
