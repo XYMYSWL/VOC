@@ -2079,7 +2079,9 @@ mod tests {
         assert!(a.keyframes.is_empty());
         let a = rx.on_packet(&udp::server_video(7, &f1[1]), |_| SenderInfo { rtx: true, rtt_hint: 0 }, |_, b| Some(b.to_vec()));
         assert_eq!(a, RxActions::default());
-        assert!(!rx.streams.lock().unwrap()[&7].need_key);
+        // 丢的那片靠补发收回，没有放弃帧（不看 need_key：测试喂的是假数据，解码线程解码失败时也会设它，和解码线程谁先跑完有关）
+        let st = rx.streams.lock().unwrap()[&7].asm.stats;
+        assert_eq!((st.gaps, st.rtx_recovered), (0, 1), "{st:?}");
     }
 
     #[test]

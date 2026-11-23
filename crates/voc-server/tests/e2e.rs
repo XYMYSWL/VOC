@@ -56,7 +56,12 @@ impl Server {
             let t = Instant::now();
             loop {
                 if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    return Server { child, port, codes };
+                    // 连上的也可能是别的测试同时在这个端口起的服务器（我们的绑不上、马上退出）：确认自己的还活着
+                    std::thread::sleep(Duration::from_millis(300));
+                    if child.try_wait().ok().flatten().is_none() {
+                        return Server { child, port, codes };
+                    }
+                    break;
                 }
                 if child.try_wait().ok().flatten().is_some() || t.elapsed() > Duration::from_secs(5) {
                     let _ = child.kill();
