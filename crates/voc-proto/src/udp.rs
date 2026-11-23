@@ -104,6 +104,8 @@ pub struct ShareInfo {
     pub rate_pct: u8,
     /// 共享声音：最近一秒录音「数据不连续」（录音线程没跟上）的次数
     pub audio_glitches: u8,
+    /// 共享的是窗口时：0 正常，1 被最小化，2 已关闭（第 60-1 项；旧版本没有这个字节，读出来是 0）
+    pub window_state: u8,
 }
 
 const SHARE_INFO_V1: u8 = 1;
@@ -117,6 +119,7 @@ pub fn cursor_with_info(x: u16, y: u16, shape: u8, visible: bool, i: &ShareInfo)
     v.extend_from_slice(&i.kbps.to_le_bytes());
     v.push(i.rate_pct);
     v.push(i.audio_glitches);
+    v.push(i.window_state);
     v
 }
 
@@ -137,6 +140,7 @@ pub fn read_share_info(b: &[u8]) -> Option<ShareInfo> {
         kbps: u16::from_le_bytes([t[9], t[10]]),
         rate_pct: t[11],
         audio_glitches: t[12],
+        window_state: t.get(13).copied().unwrap_or(0),
     })
 }
 
@@ -166,6 +170,8 @@ pub const VIDEO_LTR: u8 = 16;
 pub const VIDEO_RECOVER: u8 = 32;
 /// 跨帧交错（第 34-5 项）：这帧和相邻一帧的分片是交替发的，接收端等这一对都到齐（或超时）再要补发。旧客户端不看这一位
 pub const VIDEO_INTERLEAVED: u8 = 64;
+/// 帧内容前面带 4 字节截屏时间（共享者的毫秒计时，u32 小端，第 56-c 项）。只在所有观看者都认识时才带（旧版本会把它当成画面数据）
+pub const VIDEO_TS: u8 = 128;
 /// 分片包头里 flags 的位置（frame u32 | idx u16 | count u16 | flags u8）
 pub const VIDEO_FLAGS_AT: usize = 8;
 pub const CODEC_H264: u8 = 0;
@@ -643,7 +649,7 @@ mod tests {
     #[test]
     fn share_info_roundtrip() {
         use super::*;
-        let i = ShareInfo { target_fps: 60, source_fps: 58, capture_fps: 57, sent_fps: 50, static_skipped: 3, rate_skipped: 4, encode_ms: 6, congested: true, kbps: 12_345, rate_pct: 80, audio_glitches: 2 };
+        let i = ShareInfo { target_fps: 60, source_fps: 58, capture_fps: 57, sent_fps: 50, static_skipped: 3, rate_skipped: 4, encode_ms: 6, congested: true, kbps: 12_345, rate_pct: 80, audio_glitches: 2, window_state: 1 };
         let b = cursor_with_info(100, 200, CURSOR_HAND, true, &i);
         assert_eq!(read_cursor(&b), Some((100, 200, CURSOR_HAND, true)));
         assert_eq!(read_share_info(&b), Some(i));

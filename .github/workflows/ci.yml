@@ -25,6 +25,12 @@ jobs:
         run: cargo +stable-x86_64-pc-windows-msvc build --workspace --locked
       - name: 测试
         run: cargo +stable-x86_64-pc-windows-msvc test --workspace --locked
+      # 代码检查（第 60-5 项）：先只报告、不让 CI 失败；现有的提示修完后再去掉 continue-on-error
+      - name: 代码检查（clippy，只报告）
+        continue-on-error: true
+        run: |
+          rustup component add clippy --toolchain stable-x86_64-pc-windows-msvc
+          cargo +stable-x86_64-pc-windows-msvc clippy --workspace --locked --all-targets
 
   linux:
     name: Linux（服务端）
@@ -37,6 +43,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: 测试协议和服务端
         run: cargo test -p voc-proto -p voc-server --locked
+      - name: 代码检查（clippy，只报告）
+        continue-on-error: true
+        run: |
+          rustup component add clippy
+          cargo clippy -p voc-proto -p voc-server --locked --all-targets
       - name: 静态编译服务端（x86_64 / arm64）
         run: |
           cargo build --release -p voc-server --target x86_64-unknown-linux-musl --locked

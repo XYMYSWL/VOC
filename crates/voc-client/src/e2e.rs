@@ -113,7 +113,7 @@ impl E2e {
         // 刚建立加密的人：发一次能力公告
         let new: Vec<u32> = self.pairs.keys().copied().filter(|id| self.trusted(*id) && !self.hello_sent.contains(id)).collect();
         if !new.is_empty() {
-            let hello = serde_json::to_vec(&e2e::Hello { features: vec![e2e::FEATURE_CHAT2.into(), e2e::FEATURE_VOICE10.into(), e2e::FEATURE_VOICE_RED.into(), e2e::FEATURE_VIDEO_INTERLEAVE.into()] })
+            let hello = serde_json::to_vec(&e2e::Hello { features: vec![e2e::FEATURE_CHAT2.into(), e2e::FEATURE_VOICE10.into(), e2e::FEATURE_VOICE_RED.into(), e2e::FEATURE_VIDEO_INTERLEAVE.into(), e2e::FEATURE_VIDEO_TS.into()] })
                 .expect("hello json");
             for id in new {
                 let blob = e2e::seal_blob(&self.pairs[&id].blob, e2e::BLOB_HELLO, &hello);

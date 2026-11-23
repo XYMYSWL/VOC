@@ -64,6 +64,8 @@ pub const FEATURE_CHAT2: &str = "chat2";
 pub const FEATURE_VOICE10: &str = "voice10";
 /// 能力：认识画面的交错标记（udp::VIDEO_INTERLEAVED，第 34-5 项）
 pub const FEATURE_VIDEO_INTERLEAVE: &str = "video_il";
+/// 能力：认识画面帧里的截屏时间（udp::VIDEO_TS，第 56-c 项）
+pub const FEATURE_VIDEO_TS: &str = "video_ts";
 /// 能力：认识带冗余的语音包（udp::voice_red，上一两帧顺带塞进下一包），第 34-3 项
 pub const FEATURE_VOICE_RED: &str = "voice_red";
 

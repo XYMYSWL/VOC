@@ -6,7 +6,9 @@ mod applog;
 mod audio;
 mod autostart;
 mod denoise;
+mod glass;
 mod hotkey;
+mod icons;
 mod images;
 mod loopback;
 mod streams;
@@ -77,12 +79,17 @@ fn main() -> eframe::Result {
         .with_icon(window_icon())
         .with_inner_size([1180.0, 760.0])
         .with_min_inner_size([760.0, 480.0]);
-    if std::env::var("VOC_SHOT").is_ok() {
+    // VOC_TEST_OFFSCREEN=1：测试客户端放到屏幕外、不抢焦点（不打扰正在用电脑的人）
+    if std::env::var("VOC_SHOT").is_ok() || std::env::var_os("VOC_TEST_OFFSCREEN").is_some() {
         // 截图模式：窗口放到屏幕外、不抢焦点
         viewport = viewport.with_position([-4000.0, -4000.0]).with_active(false);
     } else if autostart::launched_at_startup() {
         // 开机自启：直接缩到托盘
         viewport = viewport.with_visible(false);
+    }
+    // 毛玻璃（第 59 项）：窗口要创建时就透明，云母背景才透得出来
+    if glass::startup_enabled() {
+        viewport = viewport.with_transparent(true);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("voc", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

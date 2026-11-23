@@ -48,11 +48,95 @@ pub struct ShareConfig {
     /// 按延迟变化提前降码率（第 36 项，默认关）：画面走的路往返时间在涨（排队了、还没丢包）就先降码率，空了再升。
     /// 打开才会调「原画」层的码率（第 20 项：原画默认不调）
     pub delay_bwe: bool,
+    /// 只共享这个窗口（None = 整个显示器，第 60-1 项）
+    #[serde(skip)]
+    pub window: Option<ShareWindow>,
+    /// 共享窗口时，共享声音只录这个窗口的程序（第 60-2 项）
+    pub audio_app_only: bool,
+    /// 强制用 AV1 编码（第 61 项）：不管观看者能不能解，两层都用 AV1；解不了 AV1 的人看不了（他那边会写原因）
+    pub force_av1: bool,
+}
+
+/// 共享说明里的「仅 AV1」标记：观看者靠它知道共享者强制了 AV1（不用改协议，旧服务器照样转发）
+pub const AV1_ONLY_TAG: &str = "仅 AV1";
+
+/// 共享者强制了 AV1（看共享说明里的标记）
+pub fn av1_only(desc: &str) -> bool {
+    desc.contains(AV1_ONLY_TAG)
+}
+
+/// 本机有 AV1 硬件编码器（没有就不能选「强制 AV1」：没有 AV1 软件编码）
+pub fn can_encode_av1() -> bool {
+    hw_encoders().iter().any(|e| e.codec == Codec::Av1)
+}
+
+/// 本机能解 AV1
+pub fn can_decode_av1() -> bool {
+    local_decoders().contains(&Codec::Av1)
 }
 
 impl Default for ShareConfig {
     fn default() -> Self {
-        Self { height: 720, fps: 30, monitor: 0, encoder: "auto".into(), quality: 1, skip_static: true, auto_res: false, p2p_only: false, delay_bwe: false }
+        Self {
+            height: 720,
+            fps: 30,
+            monitor: 0,
+            encoder: "auto".into(),
+            quality: 1,
+            skip_static: true,
+            auto_res: false,
+            p2p_only: false,
+            delay_bwe: false,
+            window: None,
+            audio_app_only: true,
+            force_av1: false,
+        }
+    }
+}
+
+/// 要共享的窗口（第 60-1 项）。窗口句柄每次启动都不一样，不存进配置
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ShareWindow {
+    pub hwnd: isize,
+    pub title: String,
+    pub pid: u32,
+    pub exe: String,
+}
+
+/// 能共享的窗口：看得见、有标题、不是 VOC 自己
+pub fn window_list() -> Vec<ShareWindow> {
+    let me = std::process::id();
+    windows_capture::window::Window::enumerate()
+        .map(|ws| {
+            ws.into_iter()
+                .filter(|w| w.is_valid())
+                .filter_map(|w| {
+                    let title = w.title().ok()?;
+                    let pid = w.process_id().ok()?;
+                    if title.trim().is_empty() || pid == me {
+                        return None;
+                    }
+                    Some(ShareWindow { hwnd: w.as_raw_hwnd() as isize, title, pid, exe: w.process_name().unwrap_or_default() })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 窗口还在不在、是不是最小化了：0 正常，1 最小化，2 已关闭
+#[cfg(windows)]
+pub fn window_state(hwnd: isize) -> u8 {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
+    let h = HWND(hwnd as *mut core::ffi::c_void);
+    unsafe {
+        if !IsWindow(Some(h)).as_bool() {
+            2
+        } else if IsIconic(h).as_bool() {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -93,7 +177,15 @@ impl ShareConfig {
     }
 
     pub fn desc(&self) -> String {
-        format!("{}p{}", self.height, self.fps)
+        let mut d = format!("{}p{}", self.height, self.fps);
+        if self.window.is_some() {
+            d += " · 窗口";
+        }
+        if self.force_av1 {
+            d += " · ";
+            d += AV1_ONLY_TAG;
+        }
+        d
     }
 
     /// 目标码率（bps）
@@ -146,8 +238,10 @@ pub fn local_decoders() -> &'static [Codec] {
     L.get_or_init(|| {
         std::thread::spawn(|| {
             let mut v = Vec::new();
+            // VOC_TEST_NO_AV1=1：模拟解不了 AV1 的电脑（第 61 项测试用）
+            let no_av1 = std::env::var_os("VOC_TEST_NO_AV1").is_some();
             if mfenc::mf_init().is_ok() {
-                if crate::mf::dec::decoder_available(Codec::Av1) && crate::mf::dec::gpu_av1_decode_supported() {
+                if !no_av1 && crate::mf::dec::decoder_available(Codec::Av1) && crate::mf::dec::gpu_av1_decode_supported() {
                     v.push(Codec::Av1);
                 }
                 if crate::mf::dec::decoder_available(Codec::Hevc) {
@@ -185,19 +279,25 @@ pub fn encoder_choices() -> Vec<(String, String)> {
 
 /// 按偏好和观看者能解的格式，决定用哪种格式、哪个编码器（None = openh264 软件编码）。
 /// capture_vendor：画面所在显卡的厂商号。同一种格式有好几块显卡能编时优先用它（才能走显卡直通）
-pub fn plan_encoder(pref: &str, allowed: &[Codec], hw: &[HwEncoderInfo], capture_vendor: Option<u32>) -> (Codec, Option<HwEncoderInfo>) {
-    if pref == "software" {
+/// force_av1（第 61 项）：不看观看者，只用 AV1；指定的显卡 / CPU 编不了 AV1 就用别的显卡的 AV1。
+/// 硬件编码器坏了（pref = "broken"）才退回 openh264
+pub fn plan_encoder(pref: &str, allowed: &[Codec], hw: &[HwEncoderInfo], capture_vendor: Option<u32>, force_av1: bool) -> (Codec, Option<HwEncoderInfo>) {
+    if pref == "broken" || (pref == "software" && !force_av1) {
         return (Codec::H264, None);
     }
+    let allowed: &[Codec] = if force_av1 { &[Codec::Av1] } else { allowed };
     let vendor = pref.strip_prefix("vendor:").and_then(|v| u32::from_str_radix(v, 16).ok());
-    for codec in [Codec::Av1, Codec::Hevc, Codec::H264] {
-        if !allowed.contains(&codec) {
-            continue;
-        }
-        let ok = |e: &&HwEncoderInfo| e.codec == codec && vendor.is_none_or(|v| e.vendor == v);
-        let same_gpu = hw.iter().filter(ok).find(|e| Some(e.vendor) == capture_vendor);
-        if let Some(e) = same_gpu.or_else(|| hw.iter().find(ok)) {
-            return (codec, Some(e.clone()));
+    let vendors: &[Option<u32>] = if force_av1 { &[vendor, None] } else { &[vendor] };
+    for &vendor in vendors {
+        for codec in [Codec::Av1, Codec::Hevc, Codec::H264] {
+            if !allowed.contains(&codec) {
+                continue;
+            }
+            let ok = |e: &&HwEncoderInfo| e.codec == codec && vendor.is_none_or(|v| e.vendor == v);
+            let same_gpu = hw.iter().filter(ok).find(|e| Some(e.vendor) == capture_vendor);
+            if let Some(e) = same_gpu.or_else(|| hw.iter().find(ok)) {
+                return (codec, Some(e.clone()));
+            }
         }
     }
     (Codec::H264, None)
@@ -786,6 +886,8 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
 /// 屏幕采集的参数（换「带不带鼠标」时用同样的参数重开）
 struct CaptureCfg {
     monitor_index: usize,
+    /// 只截这个窗口（第 60-1 项）
+    window: Option<isize>,
     interval: Duration,
     flags: CapFlags,
 }
@@ -806,28 +908,40 @@ impl CaptureCfg {
     fn start_with(&self, with_cursor: bool, skip: bool) -> Result<CapControl, String> {
         use windows_capture::capture::GraphicsCaptureApiHandler;
         use windows_capture::settings::*;
+        let f = &self.flags;
+        let flags = CapFlags {
+            tx: f.tx.clone(),
+            skip_static: skip,
+            force_key: f.force_key.clone(),
+            gpu: f.gpu.clone(),
+            stats: f.stats.clone(),
+            stop: f.stop.clone(),
+            interval: f.interval,
+        };
+        let cursor = if with_cursor { CursorCaptureSettings::WithCursor } else { CursorCaptureSettings::WithoutCursor };
+        let min_iv = MinimumUpdateIntervalSettings::Custom(self.interval / 2);
+        let dirty = if skip { DirtyRegionSettings::ReportOnly } else { DirtyRegionSettings::Default };
+        if let Some(h) = self.window {
+            let w = windows_capture::window::Window::from_raw_hwnd(h as *mut core::ffi::c_void);
+            if !w.is_valid() {
+                return Err("要共享的窗口已经关了或者看不见".into());
+            }
+            let settings = Settings::new(w, cursor, DrawBorderSettings::WithoutBorder, SecondaryWindowSettings::Default, min_iv, dirty, ColorFormat::Bgra8, flags);
+            return CapHandler::start_free_threaded(settings).map_err(|e| e.to_string());
+        }
         let monitor = windows_capture::monitor::Monitor::from_index(self.monitor_index + 1)
             .or_else(|_| windows_capture::monitor::Monitor::primary())
             .map_err(|e| format!("找不到显示器：{e}"))?;
-        let f = &self.flags;
         let settings = Settings::new(
             monitor,
-            if with_cursor { CursorCaptureSettings::WithCursor } else { CursorCaptureSettings::WithoutCursor },
+            cursor,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
             // 系统这边只挡住远超所选帧率的部分，具体取哪帧由 pace_accept 按时间表决定（两道门槛叠加会少帧）
-            MinimumUpdateIntervalSettings::Custom(self.interval / 2),
-            if skip { DirtyRegionSettings::ReportOnly } else { DirtyRegionSettings::Default },
+            min_iv,
+            dirty,
             ColorFormat::Bgra8,
-            CapFlags {
-                tx: f.tx.clone(),
-                skip_static: skip,
-                force_key: f.force_key.clone(),
-                gpu: f.gpu.clone(),
-                stats: f.stats.clone(),
-                stop: f.stop.clone(),
-                interval: f.interval,
-            },
+            flags,
         );
         CapHandler::start_free_threaded(settings).map_err(|e| e.to_string())
     }
@@ -929,8 +1043,32 @@ fn cursor_now() -> Option<(i32, i32, u8, bool)> {
 
 /// 截屏不带鼠标时，每 16 ms 看一次鼠标，有变化就发给观看者（没变化也每 250 ms 发一次，观看端据此知道还在）。
 /// 不管鼠标画没画进画面，每秒都附带一次共享状态（采集 / 编码帧数等，观看端用来说明为什么掉帧，第 53-1 项）
-fn cursor_loop(device: String, state: Arc<VoiceState>, stop: Arc<AtomicBool>, in_video: Arc<AtomicBool>, stats: Arc<ShareStats>, target_fps: u32) {
-    let mut rect = monitor_rect(&device);
+/// 鼠标位置按哪块区域换算：整个显示器，或者共享的窗口（第 60-1 项）
+#[derive(Clone)]
+enum CursorArea {
+    Monitor(String),
+    Window(isize),
+}
+
+fn area_rect(a: &CursorArea) -> Option<(i32, i32, i32, i32)> {
+    match a {
+        CursorArea::Monitor(d) => monitor_rect(d),
+        CursorArea::Window(h) => window_rect(*h),
+    }
+}
+
+/// 窗口在屏幕上的范围（不含阴影，和截到的画面一致）
+#[cfg(windows)]
+fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    let mut r = RECT::default();
+    unsafe { DwmGetWindowAttribute(HWND(hwnd as *mut core::ffi::c_void), DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut RECT as *mut _, std::mem::size_of::<RECT>() as u32) }.ok()?;
+    (r.right > r.left && r.bottom > r.top).then(|| (r.left, r.top, r.right - r.left, r.bottom - r.top))
+}
+
+fn cursor_loop(area: CursorArea, state: Arc<VoiceState>, stop: Arc<AtomicBool>, in_video: Arc<AtomicBool>, stats: Arc<ShareStats>, target_fps: u32) {
+    let mut rect = area_rect(&area);
     let (mut last, mut last_sent, mut rect_at) = (None, Instant::now(), Instant::now());
     let mut info_at = Instant::now();
     let mut glitches_prev = crate::loopback::GLITCHES.load(Ordering::Relaxed);
@@ -943,8 +1081,8 @@ fn cursor_loop(device: String, state: Arc<VoiceState>, stop: Arc<AtomicBool>, in
         }
         let info_due = info_at.elapsed() >= Duration::from_secs(1);
         let separate = !in_video.load(Ordering::Relaxed);
-        if rect_at.elapsed() > Duration::from_secs(5) {
-            rect = monitor_rect(&device); // 改了分辨率 / 显示器排列
+        if rect_at.elapsed() > Duration::from_secs(5) || matches!(area, CursorArea::Window(_)) {
+            rect = area_rect(&area); // 改了分辨率 / 显示器排列
             rect_at = Instant::now();
         }
         // 鼠标画在画面里时只发状态（visible = false：观看端不另外画鼠标）
@@ -967,6 +1105,9 @@ fn cursor_loop(device: String, state: Arc<VoiceState>, stop: Arc<AtomicBool>, in
             let g = crate::loopback::GLITCHES.load(Ordering::Relaxed);
             let mut info = share_info(&stats, target_fps);
             info.audio_glitches = g.wrapping_sub(glitches_prev).min(255) as u8;
+            if let CursorArea::Window(h) = area {
+                info.window_state = window_state(h);
+            }
             glitches_prev = g;
             udp::cursor_with_info(nx, ny, shape, vis, &info)
         } else {
@@ -997,6 +1138,7 @@ fn share_info(st: &ShareStats, target_fps: u32) -> udp::ShareInfo {
         kbps: st.kbps.load(Ordering::Relaxed).min(65_535) as u16,
         rate_pct: b(st.rate_pct.load(Ordering::Relaxed)),
         audio_glitches: 0,
+        window_state: 0,
     }
 }
 
@@ -1015,6 +1157,11 @@ impl Sharer {
         let monitor = windows_capture::monitor::Monitor::from_index(cfg.monitor + 1)
             .or_else(|_| windows_capture::monitor::Monitor::primary())
             .map_err(|e| format!("找不到显示器：{e}"))?;
+        if let Some(w) = &cfg.window {
+            if window_state(w.hwnd) == 2 {
+                return Err(format!("要共享的窗口「{}」已经关了", w.title));
+            }
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let force_key = Arc::new(AtomicBool::new(true));
         let stats = Arc::new(ShareStats::default());
@@ -1022,9 +1169,13 @@ impl Sharer {
         let gpu = Arc::new(AtomicBool::new(std::env::var_os("VOC_NO_GPU_PIPE").is_none()));
         let key_requests = Arc::new(AtomicU32::new(0));
         let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
-        let device = monitor.device_name().unwrap_or_default();
+        let area = match &cfg.window {
+            Some(w) => CursorArea::Window(w.hwnd),
+            None => CursorArea::Monitor(monitor.device_name().unwrap_or_default()),
+        };
         let cap = CaptureCfg {
             monitor_index: cfg.monitor,
+            window: cfg.window.as_ref().map(|w| w.hwnd),
             interval,
             flags: CapFlags { tx, skip_static: cfg.skip_static, force_key: force_key.clone(), gpu: gpu.clone(), stats: stats.clone(), stop: stop.clone(), interval },
         };
@@ -1041,7 +1192,7 @@ impl Sharer {
         }
         {
             let (stop, now, st, stats, fps) = (stop.clone(), cursor_in_video.clone(), state.clone(), stats.clone(), cfg.fps);
-            let _ = std::thread::Builder::new().name("cursor".into()).spawn(move || cursor_loop(device, st, stop, now, stats, fps));
+            let _ = std::thread::Builder::new().name("cursor".into()).spawn(move || cursor_loop(area, st, stop, now, stats, fps));
         }
 
         // 画面码率计入 P2P 上行预算
@@ -1210,6 +1361,7 @@ fn encode_loop(
     want_cursor_in_video: Arc<AtomicBool>,
 ) {
     let pref = cfg.encoder.clone();
+    let force_av1 = cfg.force_av1;
     let (main_bps, low_bps) = (cfg.bitrate(), cfg.low_layer().bitrate());
     let (cfg_auto_res, cfg_height, cfg_delay_bwe) = (cfg.auto_res, cfg.height, cfg.delay_bwe);
     // 冗余校验包：按观看者请求补发的比例（≈丢包率）决定每几片加一个校验包，0 = 不加
@@ -1229,8 +1381,12 @@ fn encode_loop(
     let (mut sec_enc, mut sec_skip, mut sec_all) = (Duration::ZERO, 0u32, 0u32);
     let mut last_key = Instant::now();
     let mut last_watchers = 0u32;
+    // 截屏时间（第 56-c 项）：从共享开始的毫秒数；所有观看者都认识才带
+    let t0 = Instant::now();
+    let mut ts_ok = false;
     while !stop.load(Ordering::Relaxed) {
         let Ok(frame) = rx.recv_timeout(Duration::from_millis(300)) else { continue };
+        let cap_ms = t0.elapsed().as_millis() as u32;
         // 不处理的显卡画面一定要把共享纹理还给采集端，否则采集端再也拿不到它，之后的画面全被丢掉
         //（以前「先开共享、过一会儿才有人看」时画面永远是「正在等待画面」就是这个原因）
         let skip = |enc: &mut VideoEncoder, frame: &CapFrame| {
@@ -1308,14 +1464,14 @@ fn encode_loop(
             let all = state.caps.lock().unwrap();
             ids.iter().map(|id| all.get(id).cloned().unwrap_or_default()).collect()
         };
-        let pref_now = if hw_broken { "software" } else { pref.as_str() };
-        let plan = plan_encoder(pref_now, &common_decoders(&caps_of(&main_ids)), hw_encoders(), cap_vendor);
+        let pref_now = if hw_broken { "broken" } else { pref.as_str() };
+        let plan = plan_encoder(pref_now, &common_decoders(&caps_of(&main_ids)), hw_encoders(), cap_vendor, force_av1);
         // 两层都有人看时，低画质层尽量和原画用同一种格式（同一块显卡上混用 H.264 和 AV1 两个硬件编码器时，实测低画质层解不出来）
         let low_allowed = common_decoders(&caps_of(&low_ids));
         let plan_low = if want_main && low_allowed.contains(&plan.0) {
             plan.clone()
         } else {
-            plan_encoder(pref_now, &low_allowed, hw_encoders(), cap_vendor)
+            plan_encoder(pref_now, &low_allowed, hw_encoders(), cap_vendor, force_av1)
         };
         let used: Vec<&(Codec, Option<HwEncoderInfo>)> =
             [(want_main, &plan), (want_low, &plan_low)].into_iter().filter(|x| x.0).map(|x| x.1).collect();
@@ -1397,7 +1553,11 @@ fn encode_loop(
         let frames = match r {
             Ok(f) => f,
             Err(e) => {
-                *stats.error.lock().unwrap() = Some(format!("{e}，已改用 CPU 编码"));
+                *stats.error.lock().unwrap() = Some(if force_av1 {
+                    format!("{e}，已改用 CPU 编码（H.264：CPU 编不了 AV1，「强制 AV1」暂时失效）")
+                } else {
+                    format!("{e}，已改用 CPU 编码")
+                });
                 crate::applog::log(format!("屏幕共享：{e}，改用 CPU 编码"));
                 hw_broken = true;
                 force_key.store(true, Ordering::Relaxed);
@@ -1420,7 +1580,14 @@ fn encode_loop(
             if ef.key {
                 last_key = Instant::now();
             }
-            let sealed = e2e.lock().unwrap().encrypt_video(&with_dims(&ef));
+            let payload = if ts_ok {
+                let mut p = cap_ms.to_le_bytes().to_vec();
+                p.extend_from_slice(&with_dims(&ef));
+                p
+            } else {
+                with_dims(&ef)
+            };
+            let sealed = e2e.lock().unwrap().encrypt_video(&payload);
             if sealed.len() > udp::MAX_FRAGS as usize * udp::VIDEO_FRAG {
                 // 接收端不收超过上限的帧，发了也白发（正常码率下不会出现）
                 crate::applog::log(format!("屏幕共享：一帧 {} 字节超过上限，丢弃", sealed.len()));
@@ -1428,6 +1595,9 @@ fn encode_loop(
             }
             // 两层各自编帧号（接收端按帧号判断丢帧）
             let mut flags = udp::video_flags(ef.key, ef.codec.id());
+            if ts_ok {
+                flags |= udp::VIDEO_TS;
+            }
             if !low {
                 if ef.key {
                     ltr.slots = [None; 2];
@@ -1512,6 +1682,11 @@ fn encode_loop(
                 }
             };
             link.set_interleave(inter);
+            ts_ok = state.e2e.lock().unwrap().clone().is_some_and(|e| {
+                let e = e.lock().unwrap();
+                let w = link.watcher_ids();
+                !w.is_empty() && w.iter().all(|w| e.member_has(*w, voc_proto::e2e::FEATURE_VIDEO_TS))
+            }) && std::env::var_os("VOC_TEST_NO_TS").is_none();
             if link.long_haul() && !congested {
                 (fec_main, fec_low) = (fec_main.max(LONG_HAUL_FEC), fec_low.max(LONG_HAUL_FEC));
             }
@@ -1575,6 +1750,8 @@ pub struct DecodedFrame {
     /// 硬解出来的 NV12，界面在显卡上转颜色（第 53-2 项）
     pub nv12: Option<Arc<Vec<u8>>>,
     pub seq: u64,
+    /// 交给界面的时间（算「从解码交出到画上屏幕」等了多久，第 56-a 项）
+    pub at: Instant,
 }
 
 /// 一路正在观看的视频（界面读取）
@@ -1593,6 +1770,8 @@ pub struct View {
     /// 观看端这一秒：收到完整的帧、解码失败 / 等不到放弃的帧、从收到到显示的平均耗时（ms）
     pub rx_fps: AtomicU32,
     pub show_ms: AtomicU32,
+    /// 弹出成独立窗口时那个窗口的编号：新帧到了直接唤醒它，不唤醒主窗口（第 56-b 项）
+    pub repaint_target: Mutex<Option<eframe::egui::ViewportId>>,
     /// 播放方式（第 36 项）：true = 流畅优先（默认）：帧成串到达时按原来的间隔匀速显示，缓冲自动伸缩（网络稳时一两帧）；
     /// false = 延迟优先：到了就显示，积压时直接跳到最新一帧（0.5.x 的做法）
     pub smooth: AtomicBool,
@@ -1615,7 +1794,7 @@ struct Stream {
     recovered: u32,
     /// 上次回报丢包率的时间
     last_report: Instant,
-    dec_tx: SyncSender<(u8, Vec<u8>)>,
+    dec_tx: SyncSender<(u8, Vec<u8>, Option<u32>)>,
     view: Arc<View>,
 }
 
@@ -1666,7 +1845,7 @@ impl VideoRx {
         }
         let view = Arc::new(View::default());
         view.smooth.store(SMOOTH_PLAYBACK.load(Ordering::Relaxed), Ordering::Relaxed);
-        let (tx, rx) = mpsc::sync_channel::<(u8, Vec<u8>)>(64);
+        let (tx, rx) = mpsc::sync_channel::<(u8, Vec<u8>, Option<u32>)>(64);
         let (v, ctx) = (view.clone(), self.ctx.lock().unwrap().clone());
         std::thread::Builder::new().name("video-decode".into()).spawn(move || decode_loop(rx, v, ctx)).ok()?;
         s.insert(
@@ -1781,7 +1960,13 @@ impl Stream {
                             self.recovered += 1;
                         }
                     }
-                    if self.dec_tx.try_send((udp::flags_codec(flags), bits)).is_err() {
+                    // 帧里带了截屏时间（第 56-c 项）：拆出来交给播放的节奏
+                    let (bits, cap) = if flags & udp::VIDEO_TS != 0 && bits.len() >= 4 {
+                        (bits[4..].to_vec(), Some(u32::from_le_bytes([bits[0], bits[1], bits[2], bits[3]])))
+                    } else {
+                        (bits, None)
+                    };
+                    if self.dec_tx.try_send((udp::flags_codec(flags), bits, cap)).is_err() {
                         self.need_key = true; // 解码跟不上，丢帧后要从关键帧重新开始
                     } else if flags & udp::VIDEO_LTR != 0 {
                         // 长期参考帧解了：告诉共享者，以后丢帧可以从它恢复
@@ -1839,7 +2024,7 @@ fn make_decoder(codec: Codec, hw: bool, w: u32, h: u32) -> Option<Dec> {
     }
 }
 
-fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe::egui::Context>) {
+fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: Option<eframe::egui::Context>) {
     let mut dec: Option<(Codec, bool, (u32, u32), Dec)> = None;
     let (mut sec_start, mut sec_frames) = (Instant::now(), 0u32);
     // 这一秒收到了几帧、显示的帧从交给解码到显示一共等了多久
@@ -1852,6 +2037,8 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
     let mut interval = Duration::from_millis(33);
     let mut last_arrival: Option<Instant> = None;
     let mut next_present: Option<Instant> = None;
+    // 按截屏时间放（第 56-c 项）：上一帧的截屏时间和显示时间
+    let mut last_cap: Option<(u32, Instant)> = None;
     while let Ok(first) = rx.recv() {
         // 必须每帧都解码（P 帧依赖前一帧）。延迟优先：积压时只把最新一帧转成 RGBA 显示；
         // 流畅优先：最后几帧按间隔匀速显示，更早的跳过
@@ -1859,7 +2046,8 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
         batch.extend(rx.try_iter());
         let last = batch.len() - 1;
         let now = Instant::now();
-        if let Some(t) = last_arrival {
+        let has_cap = batch.iter().all(|b| b.2.is_some());
+        if let (Some(t), false) = (last_arrival, has_cap) {
             let dt = now.duration_since(t).as_secs_f32() / batch.len() as f32;
             if dt < 0.2 {
                 let est = interval.as_secs_f32() * 0.9 + dt * 0.1;
@@ -1869,7 +2057,8 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
         last_arrival = Some(now);
         sec_rx += batch.len() as u32;
         let smooth = view.smooth.load(Ordering::Relaxed);
-        for (i, (cid, bits)) in batch.iter().enumerate() {
+        for (i, (cid, bits, cap)) in batch.iter().enumerate() {
+            let cap = *cap;
             let codec = Codec::from_id(*cid);
             let Some((w0, h0, bits)) = split_dims(codec, bits) else { continue };
             let hw = HW_DECODE.load(Ordering::Relaxed) && !hw_broken;
@@ -1892,7 +2081,13 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
                     fill(&mut rgba);
                 }
                 if smooth {
-                    // 按估计的帧间隔匀速放（略快一点，缓冲会慢慢消掉、延迟不会越积越多）
+                    // 按估计的帧间隔匀速放（略快一点，缓冲会慢慢消掉、延迟不会越积越多）。
+                    // 帧里有截屏时间时，帧间隔按截屏时间估（第 56-c 项）：网络一串一串到时，按到达时间估会被带偏
+                    if let (Some(c), Some((lc, _))) = (cap, last_cap) {
+                        let dt = (c.wrapping_sub(lc) as f32).clamp(5.0, 100.0) / 1000.0;
+                        let est = interval.as_secs_f32() * 0.9 + dt * 0.1;
+                        interval = Duration::from_secs_f32(est.clamp(0.005, 0.1));
+                    }
                     if let Some(p) = next_present {
                         let now = Instant::now();
                         if p > now {
@@ -1901,15 +2096,19 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
                     }
                     next_present = Some(Instant::now() + interval.mul_f32(0.85));
                 }
+                last_cap = cap.map(|c| (c, Instant::now()));
                 let seq = view.seq.fetch_add(1, Ordering::Relaxed) + 1;
                 let nv12 = nv12.map(Arc::new);
-                if let Some(o) = view.frame.lock().unwrap().replace(DecodedFrame { width: w, height: h, rgba, nv12, seq }) {
+                if let Some(o) = view.frame.lock().unwrap().replace(DecodedFrame { width: w, height: h, rgba, nv12, seq, at: Instant::now() }) {
                     spare = o.rgba; // 复用缓冲
                 }
                 sec_frames += 1;
                 sec_show += now.elapsed();
                 if let Some(c) = &ctx {
-                    c.request_repaint();
+                    match *view.repaint_target.lock().unwrap() {
+                        Some(vp) => c.request_repaint_of(vp),
+                        None => c.request_repaint(),
+                    }
                 }
             };
             match d {
@@ -2244,22 +2443,28 @@ mod tests {
         let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // 所有观看者都能解 AV1 → AV1
         let all = common_decoders(&[v(&["av1", "hevc", "h264"]), v(&["av1", "hevc", "h264"])]);
-        assert_eq!(plan_encoder("auto", &all, &hw, None).0, Codec::Av1);
+        assert_eq!(plan_encoder("auto", &all, &hw, None, false).0, Codec::Av1);
         // 有人不能解 AV1 → HEVC；有旧版客户端（没上报）→ 只能 H.264
         let some = common_decoders(&[v(&["av1", "hevc", "h264"]), v(&["hevc", "h264"])]);
-        assert_eq!(plan_encoder("auto", &some, &hw, None).0, Codec::Hevc);
+        assert_eq!(plan_encoder("auto", &some, &hw, None, false).0, Codec::Hevc);
         // 画面在 AMD 显卡上：同样是 HEVC，优先用 AMD 的（能走显卡直通）；格式优先级不变
-        assert_eq!(plan_encoder("auto", &some, &hw, Some(0x1002)).1.unwrap().name, "AMD HEVC");
-        assert_eq!(plan_encoder("auto", &some, &hw, Some(0x10de)).1.unwrap().name, "NV HEVC");
-        assert_eq!(plan_encoder("auto", &all, &hw, Some(0x1002)).1.unwrap().name, "NV AV1");
+        assert_eq!(plan_encoder("auto", &some, &hw, Some(0x1002), false).1.unwrap().name, "AMD HEVC");
+        assert_eq!(plan_encoder("auto", &some, &hw, Some(0x10de), false).1.unwrap().name, "NV HEVC");
+        assert_eq!(plan_encoder("auto", &all, &hw, Some(0x1002), false).1.unwrap().name, "NV AV1");
         let old = common_decoders(&[v(&["av1", "hevc", "h264"]), vec![]]);
         assert_eq!(old, vec![Codec::H264]);
-        assert_eq!(plan_encoder("auto", &old, &hw, None).1.unwrap().name, "AMD H264");
-        assert!(plan_encoder("vendor:10de", &old, &hw, Some(0x10de)).1.is_none(), "NVIDIA has no H.264 here -> software");
+        assert_eq!(plan_encoder("auto", &old, &hw, None, false).1.unwrap().name, "AMD H264");
+        assert!(plan_encoder("vendor:10de", &old, &hw, Some(0x10de), false).1.is_none(), "NVIDIA has no H.264 here -> software");
         // 指定 AMD：只用 AMD 的编码器
-        let (c, e) = plan_encoder("vendor:1002", &all, &hw, Some(0x10de));
+        let (c, e) = plan_encoder("vendor:1002", &all, &hw, Some(0x10de), false);
         assert_eq!((c, e.unwrap().name.as_str()), (Codec::Hevc, "AMD HEVC"));
-        assert_eq!(plan_encoder("software", &all, &hw, None), (Codec::H264, None));
+        assert_eq!(plan_encoder("software", &all, &hw, None, false), (Codec::H264, None));
+        // 强制 AV1（第 61 项）：观看者解不了也用 AV1；指定的显卡 / CPU 编不了 AV1 就用能编的那块；编码器坏了才退回 CPU
+        assert_eq!(plan_encoder("auto", &old, &hw, None, true).1.unwrap().name, "NV AV1");
+        assert_eq!(plan_encoder("vendor:1002", &some, &hw, Some(0x1002), true).1.unwrap().name, "NV AV1");
+        assert_eq!(plan_encoder("software", &old, &hw, None, true).0, Codec::Av1);
+        assert_eq!(plan_encoder("broken", &all, &hw, None, true), (Codec::H264, None));
+        assert_eq!(plan_encoder("auto", &all, &[], None, true), (Codec::H264, None), "no AV1 encoder at all");
         // 码率：AV1 比 H.264 省
         let cfg = ShareConfig { height: 1080, fps: 60, ..Default::default() };
         assert!(cfg.bitrate_for(Codec::Av1) < cfg.bitrate_for(Codec::Hevc));

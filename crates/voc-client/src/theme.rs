@@ -5,27 +5,157 @@ use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, Rich
 
 // ---------------------------------------------------------------- 配色
 
-pub const BG_BASE: Color32 = Color32::from_rgb(0x10, 0x12, 0x17);
-pub const BG_SIDEBAR: Color32 = Color32::from_rgb(0x15, 0x17, 0x1d);
-pub const BG_PANEL: Color32 = Color32::from_rgb(0x1b, 0x1e, 0x25);
-pub const BG_ELEVATED: Color32 = Color32::from_rgb(0x23, 0x27, 0x30);
-pub const BG_HOVER: Color32 = Color32::from_rgb(0x2a, 0x2f, 0x3a);
-pub const BG_ACTIVE: Color32 = Color32::from_rgb(0x31, 0x36, 0x44);
-pub const BORDER: Color32 = Color32::from_rgb(0x2c, 0x31, 0x3c);
+/// 一套配色（第 59 项：浅色 / 深色两套，颜色取自效果图——靛蓝强调色、绿色说话、红色闭麦 / 离开）
+pub struct Palette {
+    pub bg_base: Color32,
+    pub rail: Color32,
+    pub bg_sidebar: Color32,
+    pub bg_panel: Color32,
+    pub bg_elevated: Color32,
+    pub bg_hover: Color32,
+    pub bg_active: Color32,
+    pub border: Color32,
+    pub text: Color32,
+    pub text_dim: Color32,
+    pub text_faint: Color32,
+    pub accent: Color32,
+    pub accent_hover: Color32,
+    pub accent_soft: Color32,
+    pub green: Color32,
+    pub green_soft: Color32,
+    pub yellow: Color32,
+    pub yellow_soft: Color32,
+    pub red: Color32,
+    pub red_soft: Color32,
+}
 
-pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe8, 0xee);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0xa0, 0xa8, 0xb8);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6b, 0x73, 0x85);
+const fn c(hex: u32) -> Color32 {
+    Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+}
 
-pub const ACCENT: Color32 = Color32::from_rgb(0x7c, 0x6c, 0xf6);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x90, 0x82, 0xff);
-pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0x2e, 0x2a, 0x4f);
-pub const GREEN: Color32 = Color32::from_rgb(0x3e, 0xcf, 0x8e);
-pub const GREEN_SOFT: Color32 = Color32::from_rgb(0x1a, 0x3a, 0x2e);
-pub const YELLOW: Color32 = Color32::from_rgb(0xf2, 0xc1, 0x4e);
-pub const YELLOW_SOFT: Color32 = Color32::from_rgb(0x3d, 0x33, 0x1a);
-pub const RED: Color32 = Color32::from_rgb(0xf0, 0x61, 0x6d);
-pub const RED_SOFT: Color32 = Color32::from_rgb(0x42, 0x20, 0x25);
+pub const DARK: Palette = Palette {
+    bg_base: c(0x0F1115),
+    rail: c(0x0A0C0F),
+    bg_sidebar: c(0x14171C),
+    bg_panel: c(0x1A1D23),
+    bg_elevated: c(0x23272F),
+    bg_hover: c(0x2B3039),
+    bg_active: c(0x343A46),
+    border: c(0x2A2E36),
+    text: c(0xE8EAED),
+    text_dim: c(0xB4BAC4),
+    text_faint: c(0x8C94A1),
+    accent: c(0x6D72F0),
+    accent_hover: c(0xA5ABFF),
+    accent_soft: c(0x25284A),
+    green: c(0x4ADE80),
+    green_soft: c(0x123222),
+    yellow: c(0xFBBF24),
+    yellow_soft: c(0x3A2A10),
+    red: c(0xF87171),
+    red_soft: c(0x3A1717),
+};
+
+pub const LIGHT: Palette = Palette {
+    bg_base: c(0xF4F5F7),
+    rail: c(0xE9EBEF),
+    bg_sidebar: c(0xFAFAFB),
+    bg_panel: c(0xFFFFFF),
+    bg_elevated: c(0xF1F2F5),
+    bg_hover: c(0xE8EAEF),
+    bg_active: c(0xDFE2EA),
+    border: c(0xE3E5E9),
+    text: c(0x1F2328),
+    text_dim: c(0x4B5260),
+    text_faint: c(0x646B78),
+    accent: c(0x4F46E5),
+    accent_hover: c(0x3730A3),
+    accent_soft: c(0xEEF0FF),
+    green: c(0x15803D),
+    green_soft: c(0xE8F7EE),
+    yellow: c(0xB45309),
+    yellow_soft: c(0xFEF3E2),
+    red: c(0xDC2626),
+    red_soft: c(0xFDECEC),
+};
+
+static LIGHT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 窗口背景是云母（第 59 项）：大块底色改半透明，透出系统背景
+static TRANSLUCENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn tr(c: Color32) -> Color32 {
+    if TRANSLUCENT.load(std::sync::atomic::Ordering::Relaxed) {
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), if is_light() { 200 } else { 190 })
+    } else {
+        c
+    }
+}
+
+/// 现在用的是不是浅色
+pub fn is_light() -> bool {
+    LIGHT_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn p() -> &'static Palette {
+    if is_light() {
+        &LIGHT
+    } else {
+        &DARK
+    }
+}
+
+macro_rules! colors {
+    ($($name:ident => $field:ident),* $(,)?) => {
+        $(
+            #[allow(non_snake_case)]
+            pub fn $name() -> Color32 {
+                p().$field
+            }
+        )*
+    };
+}
+
+colors! {
+    BG_ELEVATED => bg_elevated, BG_HOVER => bg_hover, BG_ACTIVE => bg_active, BORDER => border, TEXT => text, TEXT_DIM => text_dim,
+    TEXT_FAINT => text_faint, ACCENT => accent, ACCENT_HOVER => accent_hover, ACCENT_SOFT => accent_soft,
+    GREEN => green, GREEN_SOFT => green_soft, YELLOW => yellow, YELLOW_SOFT => yellow_soft, RED => red, RED_SOFT => red_soft,
+}
+
+// 大块底色：云母窗口时半透明
+#[allow(non_snake_case)]
+pub fn BG_BASE() -> Color32 {
+    tr(p().bg_base)
+}
+#[allow(non_snake_case)]
+pub fn RAIL() -> Color32 {
+    tr(p().rail)
+}
+#[allow(non_snake_case)]
+pub fn BG_SIDEBAR() -> Color32 {
+    tr(p().bg_sidebar)
+}
+#[allow(non_snake_case)]
+pub fn BG_PANEL() -> Color32 {
+    tr(p().bg_panel)
+}
+
+/// 外观：0 跟随系统，1 浅色，2 深色。每帧调一次，变了才重设样式（第 59 项）。translucent = 云母窗口
+pub fn sync(ctx: &egui::Context, mode: u8, translucent: bool) {
+    TRANSLUCENT.store(translucent, std::sync::atomic::Ordering::Relaxed);
+    let light = match mode {
+        1 => true,
+        2 => false,
+        _ => ctx.system_theme().is_some_and(|t| t == egui::Theme::Light),
+    };
+    static APPLIED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let want = if light { 1 } else { 2 };
+    if APPLIED.swap(want, std::sync::atomic::Ordering::Relaxed) != want {
+        LIGHT_ON.store(light, std::sync::atomic::Ordering::Relaxed);
+        apply(ctx);
+        // 系统标题栏也跟着换颜色
+        ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(if light { egui::SystemTheme::Light } else { egui::SystemTheme::Dark }));
+    }
+}
 
 /// 应用全局样式
 pub fn apply(ctx: &egui::Context) {
@@ -51,53 +181,55 @@ pub fn apply(ctx: &egui::Context) {
 }
 
 fn visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    v.override_text_color = Some(TEXT);
-    v.panel_fill = BG_PANEL;
-    v.window_fill = BG_PANEL;
-    v.extreme_bg_color = BG_BASE;
-    v.faint_bg_color = BG_ELEVATED;
-    v.code_bg_color = BG_ELEVATED;
-    v.hyperlink_color = ACCENT_HOVER;
+    let mut v = if is_light() { egui::Visuals::light() } else { egui::Visuals::dark() };
+    v.override_text_color = Some(TEXT());
+    v.panel_fill = BG_PANEL();
+    v.window_fill = p().bg_panel;
+    v.extreme_bg_color = BG_BASE();
+    v.faint_bg_color = BG_ELEVATED();
+    v.code_bg_color = BG_ELEVATED();
+    v.hyperlink_color = ACCENT_HOVER();
     v.window_corner_radius = CornerRadius::same(14);
     v.menu_corner_radius = CornerRadius::same(10);
-    v.window_stroke = Stroke::new(1.0, BORDER);
-    v.window_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(140) };
-    v.popup_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(120) };
-    v.selection.bg_fill = ACCENT;
+    v.window_stroke = Stroke::new(1.0, BORDER());
+    let sh = if is_light() { 40 } else { 140 };
+    v.window_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(sh) };
+    v.popup_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(sh * 6 / 7) };
+    // 浅色：选中的底色用浅靛蓝（字是深色的，深靛蓝底上看不清）
+    v.selection.bg_fill = if is_light() { c(0xC7CBFF) } else { ACCENT() };
     v.slider_trailing_fill = true; // 滑条左侧用强调色填充，更容易看清
     v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
 
     let r = CornerRadius::same(8);
     let w = &mut v.widgets;
-    w.noninteractive.bg_fill = BG_PANEL;
-    w.noninteractive.weak_bg_fill = BG_PANEL;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
+    w.noninteractive.bg_fill = BG_PANEL();
+    w.noninteractive.weak_bg_fill = BG_PANEL();
+    w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER());
+    w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM());
     w.noninteractive.corner_radius = r;
 
-    w.inactive.bg_fill = BG_ELEVATED;
-    w.inactive.weak_bg_fill = BG_ELEVATED;
+    w.inactive.bg_fill = BG_ELEVATED();
+    w.inactive.weak_bg_fill = BG_ELEVATED();
     w.inactive.bg_stroke = Stroke::NONE;
-    w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    w.inactive.fg_stroke = Stroke::new(1.0, TEXT());
     w.inactive.corner_radius = r;
 
-    w.hovered.bg_fill = BG_HOVER;
-    w.hovered.weak_bg_fill = BG_HOVER;
-    w.hovered.bg_stroke = Stroke::new(1.0, BORDER);
-    w.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    w.hovered.bg_fill = BG_HOVER();
+    w.hovered.weak_bg_fill = BG_HOVER();
+    w.hovered.bg_stroke = Stroke::new(1.0, BORDER());
+    w.hovered.fg_stroke = Stroke::new(1.0, TEXT());
     w.hovered.corner_radius = r;
     w.hovered.expansion = 0.0;
 
-    w.active.bg_fill = BG_ACTIVE;
-    w.active.weak_bg_fill = BG_ACTIVE;
-    w.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    w.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    w.active.bg_fill = BG_ACTIVE();
+    w.active.weak_bg_fill = BG_ACTIVE();
+    w.active.bg_stroke = Stroke::new(1.0, ACCENT());
+    w.active.fg_stroke = Stroke::new(1.0, TEXT());
     w.active.corner_radius = r;
     w.active.expansion = 0.0;
 
-    w.open.bg_fill = BG_ACTIVE;
-    w.open.weak_bg_fill = BG_ACTIVE;
+    w.open.bg_fill = BG_ACTIVE();
+    w.open.weak_bg_fill = BG_ACTIVE();
     w.open.corner_radius = r;
     v
 }
@@ -117,16 +249,16 @@ pub fn pill(ui: &mut egui::Ui, text: impl Into<String>, fg: Color32, bg: Color32
 /// 分区标题（小号、偏灰）
 pub fn section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
-    ui.label(RichText::new(text).size(11.5).strong().color(TEXT_FAINT));
+    ui.label(RichText::new(text).size(11.5).strong().color(TEXT_FAINT()));
     ui.add_space(2.0);
 }
 
 /// 卡片容器
 pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
-        .fill(BG_ELEVATED)
+        .fill(BG_ELEVATED())
         .corner_radius(CornerRadius::same(14))
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0, BORDER()))
         .inner_margin(Margin::same(20))
         .show(ui, add)
         .inner
@@ -138,18 +270,80 @@ pub enum Tone {
     /// 开着某个「关闭」状态（例如闭麦）：红色
     Danger,
     /// 强调（例如正在共享）
+    #[allow(dead_code)]
     Accent,
 }
 
-/// 方形图标按钮
-pub fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, tone: Tone) -> egui::Response {
+/// 方形图标按钮（线条图标，第 59 项）
+pub fn icon_button(ui: &mut egui::Ui, icon: crate::icons::Icon, tooltip: &str, tone: Tone) -> egui::Response {
+    let size = Vec2::splat(34.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let hover = resp.hovered();
+    let (bg, fg) = match (tone, hover) {
+        (Tone::Danger, _) => (RED_SOFT(), RED()),
+        (Tone::Accent, _) => (ACCENT_SOFT(), ACCENT_HOVER()),
+        (Tone::Normal, true) => (BG_HOVER(), TEXT()),
+        (Tone::Normal, false) => (Color32::TRANSPARENT, TEXT_DIM()),
+    };
+    // 悬停时底色淡入（轻动画）
+    let t = ui.ctx().animate_bool_with_time(resp.id, hover || tone != Tone::Normal, 0.12);
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(8), bg.gamma_multiply(t.max(if tone == Tone::Normal { 0.0 } else { 1.0 })));
+    crate::icons::paint(p, rect.shrink(8.0), icon, fg);
+    resp.on_hover_text(tooltip)
+}
+
+/// 控制栏按钮：图标在上、字在下（语音房间底部，第 59 项）
+pub fn tool_button(ui: &mut egui::Ui, icon: crate::icons::Icon, label: &str, on: bool, danger: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(if danger { 84.0 } else { 72.0 }, 54.0), Sense::click());
+    let hover = resp.hovered();
+    let (bg, fg) = if danger {
+        (if hover { RED().gamma_multiply(0.85) } else { RED() }, Color32::WHITE)
+    } else if on {
+        (ACCENT_SOFT(), ACCENT_HOVER())
+    } else {
+        (if hover { BG_HOVER() } else { BG_ELEVATED() }, TEXT_DIM())
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(12), bg);
+    let ic = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 19.0), Vec2::splat(20.0));
+    crate::icons::paint(p, ic, icon, fg);
+    p.text(egui::pos2(rect.center().x, rect.bottom() - 13.0), egui::Align2::CENTER_CENTER, label, FontId::proportional(12.0), fg);
+    resp
+}
+
+/// 标签页按钮：图标 + 字，选中时强调色底（第 59 项）
+pub fn tab(ui: &mut egui::Ui, icon: crate::icons::Icon, text: &str, selected: bool, badge: u32) -> egui::Response {
+    let text = if badge > 0 { format!("{text} ({badge})") } else { text.to_string() };
+    let galley = ui.painter().layout_no_wrap(text, FontId::proportional(13.5), Color32::PLACEHOLDER);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(galley.size().x + 40.0, 30.0), Sense::click());
+    let fg = if selected {
+        ACCENT_HOVER()
+    } else if badge > 0 {
+        ACCENT_HOVER()
+    } else if resp.hovered() {
+        TEXT()
+    } else {
+        TEXT_DIM()
+    };
+    let p = ui.painter();
+    if selected || resp.hovered() {
+        p.rect_filled(rect, CornerRadius::same(8), if selected { ACCENT_SOFT() } else { BG_HOVER() });
+    }
+    crate::icons::paint(p, egui::Rect::from_center_size(egui::pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0)), icon, fg);
+    p.galley(egui::pos2(rect.left() + 30.0, rect.center().y - galley.size().y / 2.0), galley, fg);
+    resp
+}
+
+/// 文字当图标的方形按钮（少数没有对应线条图标的地方）
+pub fn glyph_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, tone: Tone) -> egui::Response {
     let size = Vec2::splat(34.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let (bg, fg) = match (tone, resp.hovered()) {
-        (Tone::Danger, _) => (RED_SOFT, RED),
-        (Tone::Accent, _) => (ACCENT_SOFT, ACCENT_HOVER),
-        (Tone::Normal, true) => (BG_HOVER, Color32::WHITE),
-        (Tone::Normal, false) => (Color32::TRANSPARENT, TEXT_DIM),
+        (Tone::Danger, _) => (RED_SOFT(), RED()),
+        (Tone::Accent, _) => (ACCENT_SOFT(), ACCENT_HOVER()),
+        (Tone::Normal, true) => (BG_HOVER(), TEXT()),
+        (Tone::Normal, false) => (Color32::TRANSPARENT, TEXT_DIM()),
     };
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(8), bg);
@@ -160,7 +354,7 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str, tone: Tone) -> 
 /// 主按钮（强调色，可指定宽度）
 pub fn primary_button(ui: &mut egui::Ui, text: &str, width: f32, enabled: bool) -> egui::Response {
     let btn = egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
-        .fill(if enabled { ACCENT } else { BG_ACTIVE })
+        .fill(if enabled { ACCENT() } else { BG_ACTIVE() })
         .corner_radius(CornerRadius::same(10))
         .min_size(Vec2::new(width, 38.0));
     ui.add_enabled(enabled, btn)
@@ -189,8 +383,8 @@ pub fn avatar(ui: &mut egui::Ui, name: &str, size: f32, speaking: bool) -> egui:
     let c = rect.center();
     let r = size / 2.0;
     if speaking {
-        p.circle_filled(c, r, GREEN_SOFT);
-        p.circle_stroke(c, r - 1.0, Stroke::new(2.0, GREEN));
+        p.circle_filled(c, r, GREEN_SOFT());
+        p.circle_stroke(c, r - 1.0, Stroke::new(2.0, GREEN()));
     }
     p.circle_filled(c, r - 3.0, name_color(name));
     let ch: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
@@ -202,21 +396,21 @@ pub fn avatar(ui: &mut egui::Ui, name: &str, size: f32, speaking: bool) -> egui:
 pub fn quality_chip(ui: &mut egui::Ui, q: &PeerQuality, voice_direct: bool, video_direct: bool) {
     let detail = format!("延迟 {} ms · 丢包 {}% · 抖动 {} ms", q.rtt_ms, q.loss_pct, q.jitter_ms);
     if q.unstable {
-        pill(ui, "⇄ 不稳·中转", YELLOW, YELLOW_SOFT).on_hover_text(format!(
+        pill(ui, "⇄ 不稳·中转", YELLOW(), YELLOW_SOFT()).on_hover_text(format!(
             "P2P 直连不稳定（{detail}），已自动改走服务器中转；连续稳定后会自动切回直连"
         ));
     } else if voice_direct {
         let (fg, bg) = if q.rtt_ms < 80 {
-            (GREEN, GREEN_SOFT)
+            (GREEN(), GREEN_SOFT())
         } else if q.rtt_ms < 200 {
-            (YELLOW, YELLOW_SOFT)
+            (YELLOW(), YELLOW_SOFT())
         } else {
-            (RED, RED_SOFT)
+            (RED(), RED_SOFT())
         };
         let tip = if video_direct { "P2P 直连：语音和你共享的画面都不经过服务器" } else { "P2P 直连：语音不经过服务器" };
         pill(ui, format!("⇄ {} ms", q.rtt_ms), fg, bg).on_hover_text(format!("{tip}\n{detail}"));
     } else {
-        pill(ui, format!("⇄ {} ms·中转", q.rtt_ms), TEXT_FAINT, BG_ELEVATED)
+        pill(ui, format!("⇄ {} ms·中转", q.rtt_ms), TEXT_FAINT(), BG_ELEVATED())
             .on_hover_text(format!("已打通 P2P，但超出你设置的上行带宽预算，你的语音经服务器中转给他\n{detail}"));
     }
 }
@@ -224,11 +418,11 @@ pub fn quality_chip(ui: &mut egui::Ui, q: &PeerQuality, voice_direct: bool, vide
 /// 按往返延迟选颜色（和直连徽章一致）
 fn latency_colors(ms: u32) -> (Color32, Color32) {
     if ms < 80 {
-        (GREEN, GREEN_SOFT)
+        (GREEN(), GREEN_SOFT())
     } else if ms < 200 {
-        (YELLOW, YELLOW_SOFT)
+        (YELLOW(), YELLOW_SOFT())
     } else {
-        (RED, RED_SOFT)
+        (RED(), RED_SOFT())
     }
 }
 
@@ -388,36 +582,36 @@ pub fn link_state_chip(ui: &mut egui::Ui, st: LinkState) -> egui::Response {
         LinkState::Punch(WaitingKeys) | LinkState::Preparing => (
             "⇄ 准备直连".to_string(),
             "正在交换端到端密钥和地址，马上开始打洞。现在语音走服务器。".to_string(),
-            TEXT_FAINT,
-            BG_ELEVATED,
+            TEXT_FAINT(),
+            BG_ELEVATED(),
         ),
         LinkState::Punch(Punching(s)) => (
             format!("⇄ 打洞中 {s}s"),
             format!("正在和他建立 P2P 直连（最多快速尝试 {fast} 秒）。打通前语音走服务器。"),
-            YELLOW,
-            YELLOW_SOFT,
+            YELLOW(),
+            YELLOW_SOFT(),
         ),
         LinkState::Punch(Failed(s)) => (
             "⇄ 打不通·走服务器".to_string(),
             format!(
                 "已经尝试 {s} 秒还没打通（通常是两边的路由器都比较严格），语音走服务器；有合适的队友时会改由队友中继。\n仍会每 2 秒重试一次。"
             ),
-            TEXT_FAINT,
-            BG_ELEVATED,
+            TEXT_FAINT(),
+            BG_ELEVATED(),
         ),
-        LinkState::Punch(Connected(_)) => ("⇄ 已打通".to_string(), String::new(), GREEN, GREEN_SOFT),
+        LinkState::Punch(Connected(_)) => ("⇄ 已打通".to_string(), String::new(), GREEN(), GREEN_SOFT()),
         LinkState::MeOff => (
             "⇄ 你未开直连".to_string(),
             "你关闭了 P2P 直连，语音走服务器。可以在 设置 → 网络 打开。".to_string(),
-            TEXT_FAINT,
-            BG_ELEVATED,
+            TEXT_FAINT(),
+            BG_ELEVATED(),
         ),
-        LinkState::ThemOff => ("⇄ 对方未开直连".to_string(), "对方关闭了 P2P 直连，语音走服务器。".to_string(), TEXT_FAINT, BG_ELEVATED),
+        LinkState::ThemOff => ("⇄ 对方未开直连".to_string(), "对方关闭了 P2P 直连，语音走服务器。".to_string(), TEXT_FAINT(), BG_ELEVATED()),
         LinkState::ThemTcp => (
             "⇄ 对方 UDP 不通".to_string(),
             "对方的网络封锁了 UDP，只能经服务器的加密 TCP 通道，无法直连，延迟会高一些。".to_string(),
-            TEXT_FAINT,
-            BG_ELEVATED,
+            TEXT_FAINT(),
+            BG_ELEVATED(),
         ),
     };
     let r = pill(ui, text, fg, bg);
@@ -431,13 +625,13 @@ pub fn link_state_chip(ui: &mut egui::Ui, st: LinkState) -> egui::Response {
 /// 分段选择（像一排胶囊按钮）
 pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let mut changed = false;
-    egui::Frame::new().fill(BG_BASE).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(3)).show(ui, |ui| {
+    egui::Frame::new().fill(BG_BASE()).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(3)).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (v, label) in options {
                 let sel = *value == *v;
-                let btn = egui::Button::new(RichText::new(*label).color(if sel { Color32::WHITE } else { TEXT_DIM }))
-                    .fill(if sel { ACCENT } else { Color32::TRANSPARENT })
+                let btn = egui::Button::new(RichText::new(*label).color(if sel { Color32::WHITE } else { TEXT_DIM() }))
+                    .fill(if sel { ACCENT() } else { Color32::TRANSPARENT })
                     .corner_radius(CornerRadius::same(8))
                     .min_size(Vec2::new(64.0, 28.0));
                 if ui.add(btn).clicked() && !sel {

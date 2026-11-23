@@ -111,8 +111,12 @@ pub struct Settings {
     pub transmitting: AtomicBool,
     /// 回声消除
     pub aec: AtomicBool,
-    /// 按键说话的按键（Windows 虚拟键码）；0 = 语音激活
-    pub ptt_vk: AtomicU32,
+    /// 按键说话的按键（hotkey::Hotkey::pack）；0 = 语音激活
+    pub ptt_key: AtomicU32,
+    /// 松开说话键后再多发多久（毫秒）
+    pub ptt_tail_ms: AtomicU32,
+    /// 正在录键：按键说话也暂停（第 58 项）
+    pub keys_paused: AtomicBool,
     /// 麦克风连续几秒完全没有声音（Windows 隐私设置关了麦克风等）
     pub mic_silent: AtomicBool,
 }
@@ -129,7 +133,9 @@ impl Default for Settings {
             input_level_db: AtomicF32::new(-100.0),
             transmitting: AtomicBool::new(false),
             aec: AtomicBool::new(true),
-            ptt_vk: AtomicU32::new(0),
+            ptt_key: AtomicU32::new(0),
+            ptt_tail_ms: AtomicU32::new(200),
+            keys_paused: AtomicBool::new(false),
             mic_silent: AtomicBool::new(false),
         }
     }
@@ -384,6 +390,10 @@ pub struct StreamStats {
     pub target_ms: u32,
     /// 当前播放速度偏差（千分之几，正 = 加快）
     pub rate_permille: i32,
+    /// 音量开得太大、峰值被限幅器压低的次数（压低超过 3 dB 算一次，第 57 项）和最近一次的时间
+    pub limited: u32,
+    #[doc(hidden)]
+    pub limited_recently: bool,
 }
 
 /// 一个立体声样本（左, 右）；单声道的声音两边一样
@@ -404,6 +414,8 @@ struct Stream {
     tail: Frame2,
     last_out: Frame2,
     stats: StreamStats,
+    /// 放大后的限幅器（第 57 项）：音量 > 100% 时不再把峰值削平
+    limiter: Limiter,
 }
 
 impl Stream {
@@ -425,6 +437,7 @@ impl Stream {
             tail: [0.0; 2],
             last_out: [0.0; 2],
             stats: StreamStats::default(),
+            limiter: Limiter::new(LIMIT_THRESHOLD),
         }
     }
 
@@ -586,6 +599,7 @@ impl Mixer {
         self.streams.get(&user).map(|s| StreamStats {
             buffered_ms: (s.buf.len() as f32 * 1000.0 / SAMPLE_RATE as f32).round() as u32,
             target_ms: s.jitter.target_ms().round() as u32,
+            limited_recently: s.limiter.limited_within(std::time::Duration::from_secs(2)),
             ..s.stats
         })
     }
@@ -631,13 +645,110 @@ impl Mixer {
                 s.tail = [0.0; 2];
                 continue;
             }
-            if let Some(x) = s.next() {
-                let v = self.volumes.get(id).copied().unwrap_or(1.0);
+            let v = self.volumes.get(id).copied().unwrap_or(1.0);
+            let x = s.next();
+            // 每一路先乘音量、再过限幅器（有 3 ms 预读：峰值到之前就平滑压下去，不削波形）。
+            // 这一路停了也要把限幅器里预读的那 3 ms 放完
+            if s.kind != Kind::Local && (x.is_some() || s.limiter.pending()) {
+                let x = x.unwrap_or([0.0; 2]);
+                let y = s.limiter.process([x[0] * v, x[1] * v]);
+                if s.limiter.take_event() {
+                    s.stats.limited += 1;
+                }
+                sum[0] += y[0];
+                sum[1] += y[1];
+            } else if let Some(x) = x {
                 sum[0] += x[0] * v;
                 sum[1] += x[1] * v;
             }
         }
         sum
+    }
+}
+
+/// 限幅器的门槛：每一路压到这以下；混音后总的再过一个，留一点余量给软削波兜底
+const LIMIT_THRESHOLD: f32 = 0.89;
+const MASTER_THRESHOLD: f32 = 0.79;
+/// 预读 3 ms、恢复约 120 ms
+const LIMIT_LOOKAHEAD: usize = 144;
+const LIMIT_RELEASE_S: f32 = 0.12;
+
+/// 带预读的限幅器（第 57 项）：信号先延迟 3 ms，同时看「接下来 3 ms 里最大的峰值」算要压多少，
+/// 增益在峰值到来之前平滑降下去，过后慢慢回升。和削波不同，波形形状不变，只是这一小段整体小一点，听不出破音。左右两路一起压
+pub struct Limiter {
+    thr: f32,
+    delay: VecDeque<Frame2>,
+    /// 接下来 LIMIT_LOOKAHEAD 个样本里需要的增益的滑动最小值（单调队列：(样本序号, 需要的增益)）
+    mins: VecDeque<(u64, f32)>,
+    n: u64,
+    gain: f32,
+    attack: f32,
+    release: f32,
+    /// 正在压（低于 -3 dB）：用来数「压了几次」
+    active: bool,
+    event: bool,
+    last_event: Option<std::time::Instant>,
+}
+
+impl Limiter {
+    pub fn new(thr: f32) -> Self {
+        let sr = SAMPLE_RATE as f32;
+        Self {
+            thr,
+            delay: VecDeque::with_capacity(LIMIT_LOOKAHEAD + 1),
+            mins: VecDeque::new(),
+            n: 0,
+            gain: 1.0,
+            // 预读窗口的四分之一内基本到位（3 ms 内一定压到）
+            attack: 1.0 - (-4.0 / LIMIT_LOOKAHEAD as f32).exp(),
+            release: 1.0 - (-1.0 / (LIMIT_RELEASE_S * sr)).exp(),
+            active: false,
+            event: false,
+            last_event: None,
+        }
+    }
+
+    /// 预读缓冲里还有没放完的声音
+    pub fn pending(&self) -> bool {
+        self.delay.iter().any(|x| x[0] != 0.0 || x[1] != 0.0) || self.gain < 0.999
+    }
+
+    pub fn process(&mut self, x: Frame2) -> Frame2 {
+        let peak = x[0].abs().max(x[1].abs());
+        let need = if peak > self.thr { self.thr / peak } else { 1.0 };
+        while self.mins.back().is_some_and(|&(_, g)| g >= need) {
+            self.mins.pop_back();
+        }
+        self.mins.push_back((self.n, need));
+        while self.mins.front().is_some_and(|&(i, _)| i + LIMIT_LOOKAHEAD as u64 <= self.n) {
+            self.mins.pop_front();
+        }
+        self.n += 1;
+        let target = self.mins.front().map_or(1.0, |m| m.1);
+        self.gain += (target - self.gain) * if target < self.gain { self.attack } else { self.release };
+        self.delay.push_back(x);
+        let out = if self.delay.len() > LIMIT_LOOKAHEAD { self.delay.pop_front().unwrap() } else { [0.0; 2] };
+        // 平滑追不上的极少数尖峰：硬性兜底（正常情况下不会触发）
+        let g = self.gain;
+        let y = [(out[0] * g).clamp(-1.0, 1.0), (out[1] * g).clamp(-1.0, 1.0)];
+        let now_active = self.gain < 0.708;
+        if now_active && !self.active {
+            self.event = true;
+            self.last_event = Some(std::time::Instant::now());
+        } else if now_active {
+            self.last_event = Some(std::time::Instant::now());
+        }
+        self.active = now_active;
+        y
+    }
+
+    /// 刚开始了一次「压低超过 3 dB」
+    pub fn take_event(&mut self) -> bool {
+        std::mem::take(&mut self.event)
+    }
+
+    pub fn limited_within(&self, d: std::time::Duration) -> bool {
+        self.last_event.is_some_and(|t| t.elapsed() < d)
     }
 }
 
@@ -991,6 +1102,7 @@ fn start_output_ll(name: Option<&str>, mixer: Arc<Mutex<Mixer>>, settings: Arc<S
     let rs = Arc::new(Mutex::new(None::<PullResampler>));
     let rs2 = rs.clone();
     let mut tap: Vec<f32> = Vec::with_capacity(crate::aec::AEC_FRAME);
+    let mut master = Limiter::new(MASTER_THRESHOLD);
     let (s, (rate, ch, period, dname)) = crate::wasapi_ll::start_render(
         name,
         move |out, ch| {
@@ -1014,7 +1126,8 @@ fn start_output_ll(name: Option<&str>, mixer: Arc<Mutex<Mixer>>, settings: Arc<S
                     }
                     x
                 });
-                let (l, r) = (soft_clip(l * vol), soft_clip(r * vol));
+                let [l, r] = master.process([l * vol, r * vol]);
+                let (l, r) = (soft_clip(l), soft_clip(r));
                 if ch >= 2 {
                     frame[0] = l;
                     frame[1] = r;
@@ -1081,6 +1194,7 @@ where
     let ch = cfg.channels.max(1) as usize;
     let mut rs = PullResampler::new(SAMPLE_RATE, cfg.sample_rate);
     let mut tap: Vec<f32> = Vec::with_capacity(crate::aec::AEC_FRAME);
+    let mut master = Limiter::new(MASTER_THRESHOLD);
     dev.build_output_stream::<T, _, _>(
         cfg,
         move |data: &mut [T], _| {
@@ -1104,7 +1218,8 @@ where
                     }
                     x
                 });
-                let (l, r) = (soft_clip(l * vol), soft_clip(r * vol));
+                let [l, r] = master.process([l * vol, r * vol]);
+                let (l, r) = (soft_clip(l), soft_clip(r));
                 // 两个以上声道：前两个放左右，其余放平均（单声道设备只放平均）
                 if ch >= 2 {
                     frame[0] = T::from_sample(l);
@@ -1223,7 +1338,10 @@ mod tests {
         m.push(5, 0, &f); // 旧包丢弃
         // 测试里两包是同时到的（真实网络约隔 20 ms），会算出一点抖动，所以攒到一帧多一点就开播
         m.push(5, 2, &f);
-        // 开播时淡入：几毫秒后到满音量
+        // 开播时淡入：几毫秒后到满音量；限幅器有 3 ms 预读（第 57 项），所以开头 144 个采样还是静音
+        for _ in 0..LIMIT_LOOKAHEAD {
+            assert_eq!(m.next_frame()[0], 0.0, "limiter lookahead");
+        }
         let first = m.next_frame()[0];
         assert!(first > 0.0 && first < 0.05, "{first}");
         let mut last = 0.0;
@@ -1232,6 +1350,33 @@ mod tests {
         }
         assert!((last - 0.5).abs() < 0.01, "{last}");
         assert!(m.buffer_ms(5).unwrap() <= 25);
+    }
+
+    /// 第 57 项：音量开到 173% 的满幅正弦，限幅后峰值不超过门槛，波形没有被削平（失真远小于削波）；小声原样通过（只晚 3 ms）
+    #[test]
+    fn limiter_keeps_peaks_without_clipping() {
+        let n = SAMPLE_RATE as usize;
+        let tone: Vec<f32> = (0..n).map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.9).collect();
+        let mut lim = Limiter::new(LIMIT_THRESHOLD);
+        let out: Vec<f32> = tone.iter().map(|&x| lim.process([x * 1.73, x * 1.73])[0]).collect();
+        let peak = out[n / 2..].iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak <= LIMIT_THRESHOLD + 0.01, "{peak}");
+        // 稳定后输出应该是一个干净的（被缩小的）正弦：和最佳拟合的正弦比，误差很小
+        let seg = &out[n / 2..];
+        let refs: Vec<f32> = (n / 2..n).map(|i| ((i - LIMIT_LOOKAHEAD) as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin()).collect();
+        let a = seg.iter().zip(&refs).map(|(x, r)| x * r).sum::<f32>() / refs.iter().map(|r| r * r).sum::<f32>();
+        let err = seg.iter().zip(&refs).map(|(x, r)| (x - a * r).powi(2)).sum::<f32>() / seg.iter().map(|x| x * x).sum::<f32>();
+        let clipped: Vec<f32> = tone[n / 2..].iter().map(|&x| soft_clip(x * 1.73)).collect();
+        let a2 = clipped.iter().zip(&tone[n / 2..]).map(|(x, r)| x * r).sum::<f32>() / tone[n / 2..].iter().map(|r| r * r).sum::<f32>();
+        let err2 = clipped.iter().zip(&tone[n / 2..]).map(|(x, r)| (x - a2 * r).powi(2)).sum::<f32>() / clipped.iter().map(|x| x * x).sum::<f32>();
+        println!("失真：限幅器 {:.1} dB，原来的软削波 {:.1} dB", 10.0 * err.log10(), 10.0 * err2.log10());
+        assert!(err < err2 / 100.0, "限幅器失真应比软削波小 20 dB 以上");
+        assert!(lim.limited_within(std::time::Duration::from_secs(1)));
+        // 小声：原样（晚 3 ms）通过、不算压过
+        let mut lim = Limiter::new(LIMIT_THRESHOLD);
+        let quiet: Vec<f32> = (0..2000).map(|i| lim.process([tone[i] * 0.3, 0.0])[0]).collect();
+        assert!((quiet[1000] - tone[1000 - LIMIT_LOOKAHEAD] * 0.3).abs() < 1e-6);
+        assert!(!lim.take_event());
     }
 
     /// 立体声：左右分开放

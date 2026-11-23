@@ -26,8 +26,6 @@ use voc_proto::{now_millis, udp, ClientMsg, NatInfo, PeerInfo, PeerStat, RelayRo
 
 /// VAD 关闭前的保持帧数（20 ms × 15 = 300 ms），避免句尾被截断
 const VAD_HANGOVER: u32 = 15;
-/// 松开说话键后再多发这么多帧（20 ms × 10 = 200 ms），避免句尾被截断
-const PTT_HANGOVER: u32 = 10;
 
 /// 某个键（或鼠标键）现在是否按着。用全局按键状态查询，游戏在前台时也有效，不装键盘钩子。
 pub fn key_down(vk: u32) -> bool {
@@ -212,6 +210,118 @@ fn send_dont_fragment(sock: &UdpSocket, dual: bool, pkts: &[(Vec<u8>, SocketAddr
     #[cfg(not(windows))]
     {
         let _ = (sock, dual, pkts);
+    }
+}
+
+/// 测试用的模拟路由器（第 60-4 项）：VOC_TEST_NAT=类型，在本机模拟各种 NAT，验证打洞。
+/// - full：完全锥形（谁都能进来）；restricted：只放行发过包的 IP；port：只放行发过包的 IP+端口；
+/// - strict：同 port，收到「不请自来」的包就把对方拉黑 30 秒（低 TTL 先发要防的那种）；
+/// - sym：对称型，每换一个目标换一个本地端口，按顺序分配（可预测）；symrand：对称型，端口随机。对称型都按 port 过滤
+pub struct NatEmu {
+    kind: NatKind,
+    sent: Mutex<std::collections::HashSet<SocketAddr>>,
+    banned: Mutex<HashMap<SocketAddr, Instant>>,
+    next_port: AtomicU16,
+    rng: AtomicU64,
+    /// 拦掉的包（测试日志）
+    pub dropped: AtomicU64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NatKind {
+    Full,
+    Restricted,
+    Port,
+    Strict,
+    Sym,
+    SymRand,
+}
+
+impl NatEmu {
+    pub fn from_env() -> Option<Self> {
+        let kind = match std::env::var("VOC_TEST_NAT").ok()?.as_str() {
+            "full" => NatKind::Full,
+            "restricted" => NatKind::Restricted,
+            "port" => NatKind::Port,
+            "strict" => NatKind::Strict,
+            "sym" => NatKind::Sym,
+            "symrand" => NatKind::SymRand,
+            _ => return None,
+        };
+        let seed = now_millis() ^ (std::process::id() as u64) << 20;
+        Some(Self {
+            kind,
+            sent: Mutex::new(Default::default()),
+            banned: Mutex::new(HashMap::new()),
+            next_port: AtomicU16::new(30000 + (seed % 20000) as u16),
+            rng: AtomicU64::new(seed | 1),
+            dropped: AtomicU64::new(0),
+        })
+    }
+
+    pub fn symmetric(&self) -> bool {
+        matches!(self.kind, NatKind::Sym | NatKind::SymRand)
+    }
+
+    pub fn note_sent(&self, to: SocketAddr) {
+        self.sent.lock().unwrap().insert(norm(to));
+    }
+
+    /// 这个包放不放进来
+    pub fn allow(&self, from: SocketAddr) -> bool {
+        let from = norm(from);
+        let now = Instant::now();
+        if self.banned.lock().unwrap().get(&from).is_some_and(|t| *t > now) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let sent = self.sent.lock().unwrap();
+        let ok = match self.kind {
+            NatKind::Full => true,
+            NatKind::Restricted => sent.iter().any(|a| a.ip() == from.ip()),
+            _ => sent.contains(&from),
+        };
+        drop(sent);
+        if !ok {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            if self.kind == NatKind::Strict {
+                self.banned.lock().unwrap().insert(from, now + Duration::from_secs(30));
+            }
+        }
+        ok
+    }
+
+    /// 对称型：给一个新目标开一个本地端口（按顺序 / 随机）
+    fn new_socket(&self, dual: bool) -> Option<Arc<UdpSocket>> {
+        for _ in 0..50 {
+            let port = match self.kind {
+                NatKind::SymRand => {
+                    let mut x = self.rng.load(Ordering::Relaxed);
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    self.rng.store(x, Ordering::Relaxed);
+                    20000 + (x % 40000) as u16
+                }
+                _ => self.next_port.fetch_add(1, Ordering::Relaxed),
+            };
+            // 和主端口一样：双栈（Windows 上 IPv6 套接字默认只收发 IPv6，发不了 IPv4 映射地址）
+            let made = (|| -> std::io::Result<UdpSocket> {
+                use socket2::{Domain, Protocol, Socket, Type};
+                if dual {
+                    let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                    s.set_only_v6(false)?;
+                    s.bind(&format!("[::]:{port}").parse::<SocketAddr>().unwrap().into())?;
+                    Ok(s.into())
+                } else {
+                    UdpSocket::bind(format!("0.0.0.0:{port}"))
+                }
+            })();
+            if let Ok(s) = made {
+                return Some(Arc::new(s));
+            }
+        }
+        None
     }
 }
 
@@ -927,6 +1037,8 @@ pub struct Link {
     /// 跨帧交错（第 34-5 项）：开着没有、先留着等下一帧的那一帧
     interleave: AtomicBool,
     held_video: Mutex<Option<(Vec<Vec<u8>>, Instant)>>,
+    /// 测试用的模拟路由器（第 60-4 项，VOC_TEST_NAT）
+    pub nat_emu: Option<NatEmu>,
     /// 上次看到的本机地址（换网络检测，第 37-2 项）
     last_local: Mutex<Vec<String>>,
     /// 低 TTL 先发时拿写锁，平时发包拿读锁（第 35-2 项）
@@ -1081,6 +1193,13 @@ impl Link {
         if pkts.is_empty() {
             return;
         }
+        // 模拟路由器：低 TTL 的包到不了对方，只在自己这边开口子（本机回环上真发的话对方会收到，不真实）
+        if let Some(emu) = &self.nat_emu {
+            for (_, to) in pkts {
+                emu.note_sent(*to);
+            }
+            return;
+        }
         let _w = self.ttl_lock.write().unwrap();
         if let Err(e) = send_low_ttl(&self.sock, self.dual, pkts, &LOW_TTLS) {
             crate::applog::log(format!("低 TTL 先发失败（{e}），跳过"));
@@ -1088,11 +1207,36 @@ impl Link {
     }
 
     fn send_raw(&self, buf: &[u8], to: SocketAddr) {
+        // 测试用的模拟路由器（第 60-4 项）：记下发给了谁（过滤用）；对称型每个新目标开一个新端口，从那个端口发
+        if let Some(emu) = &self.nat_emu {
+            emu.note_sent(to);
+            if emu.symmetric() && !self.alt_socks.lock().unwrap().contains_key(&norm(to)) {
+                if let Some(s) = emu.new_socket(self.dual) {
+                    self.alt_socks.lock().unwrap().insert(norm(to), s.clone());
+                    self.alt_active.store(true, Ordering::Relaxed);
+                    // 这个端口收到的包交给主接收循环（链路关了以后，下一个包到时线程退出；只在测试里用）
+                    let tx = self.alt_tx.lock().unwrap().clone();
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+                    let _ = std::thread::Builder::new().name("nat-emu-recv".into()).spawn(move || {
+                        let mut rb = [0u8; 2048];
+                        loop {
+                            if let Ok((n, from)) = s.recv_from(&mut rb) {
+                                if tx.send((norm(from), rb[..n].to_vec())).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
         // 生日攻击打通的对端：和他改用撞上的那个本地端口收发（第 35-1 项）
         if self.alt_active.load(Ordering::Relaxed) {
-            let alt = self.alt_socks.lock().unwrap().get(&to).cloned();
+            let alt = self.alt_socks.lock().unwrap().get(&norm(to)).cloned();
             if let Some(s) = alt {
-                if s.send_to(buf, to).is_ok() {
+                // 备用端口有两种：生日攻击开的是 IPv4 套接字（只能发 IPv4 地址），模拟路由器开的是双栈（要用映射地址）
+                let v6 = s.local_addr().is_ok_and(|a| a.is_ipv6());
+                if s.send_to(buf, if v6 { wire(to, true) } else { norm(to) }).is_ok() {
                     self.sent_bytes.fetch_add(buf.len() as u64 + 28, Ordering::Relaxed);
                 }
                 return;
@@ -1111,7 +1255,8 @@ impl Link {
     /// 备用端口收到一个包：记下「这个对端用这个端口」，交给主接收循环照常处理
     fn alt_received(&self, sock: &Arc<UdpSocket>, from: SocketAddr, pkt: &[u8]) {
         let from = norm(from);
-        self.alt_socks.lock().unwrap().entry(from).or_insert_with(|| sock.clone());
+        // 对方的包从哪个端口进来，就从哪个端口回（撞上的那个端口才有对方能进来的映射）
+        self.alt_socks.lock().unwrap().insert(from, sock.clone());
         self.alt_active.store(true, Ordering::Relaxed);
         let _ = self.alt_tx.lock().unwrap().send((from, pkt.to_vec()));
     }
@@ -1937,6 +2082,22 @@ impl Link {
         });
     }
 
+    /// 测试日志：每个人的候选地址
+    pub fn peer_cands_debug(&self) -> Vec<(u32, Vec<SocketAddr>)> {
+        let peers = self.peers.lock().unwrap();
+        let mut v: Vec<_> = peers.map.iter().map(|(id, p)| (*id, p.cands.clone())).collect();
+        v.sort();
+        v
+    }
+
+    /// 测试日志：每个人的生日攻击状态 (编号, 试过没有, 进行中, 开了几个端口, 发了几个探测)
+    pub fn bday_debug(&self) -> Vec<(u32, bool, bool, usize, usize)> {
+        let peers = self.peers.lock().unwrap();
+        let mut v: Vec<_> = peers.map.iter().map(|(id, p)| (*id, p.bday_tried, p.bday.is_some(), p.bday.as_ref().map_or(0, |b| b.socks.len()), p.bday.as_ref().map_or(0, |b| b.sent_ports.len()))).collect();
+        v.sort();
+        v
+    }
+
     /// 第二个探测点的结果（第 39-2 项，诊断用）；服务器没有第二个 IP 时为 None
     pub fn nat_detail(&self) -> Option<String> {
         self.probe2?;
@@ -2064,6 +2225,21 @@ impl Link {
             let targets = punch_targets(&p.cands, None, p.prev_path, &p.spare());
             let Some(s) = p.sealer.as_mut() else { continue };
             p.last_punch = now;
+            // 这一轮打洞的第一个包之前先低 TTL 发一遍（第 35-2 项）：快速打洞也要，不然它的包比低 TTL 先到，严格 NAT 会把对方拉黑
+            //（本机模拟严格 NAT 时发现的，第 60-4 项）
+            if p.low_ttl_for != Some(started) {
+                p.low_ttl_for = Some(started);
+                let emu = self.nat_emu.is_some();
+                let pkts: Vec<(Vec<u8>, SocketAddr)> = targets
+                    .iter()
+                    .filter(|t| matches!(t, SocketAddr::V4(v4) if emu || !crate::portmap::is_carrier_or_private(*v4.ip())))
+                    .map(|t| {
+                        s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
+                        (buf.clone(), *t)
+                    })
+                    .collect();
+                self.low_ttl_burst(&pkts);
+            }
             for t in targets {
                 s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
                 self.send_raw(buf, t);
@@ -2151,7 +2327,9 @@ impl Link {
             return false;
         }
         // 对方的公网地址（IPv4；生日攻击只对 IPv4 NAT 有意义）
-        let Some(public) = p.cands.iter().copied().find(|a| a.is_ipv4() && !is_private_or_local(a.ip())) else { return false };
+        // 测试用的模拟路由器（第 60-4 项）：本机测试的地址都是 127.0.0.1，当成公网地址
+        let emu = self.nat_emu.is_some();
+        let Some(public) = p.cands.iter().copied().find(|a| a.is_ipv4() && (emu || !is_private_or_local(a.ip()))) else { return false };
         if p.bday.is_none() {
             if p.bday_tried || now.duration_since(started) < BDAY_AFTER {
                 return false;
@@ -2332,7 +2510,7 @@ impl Link {
                         p.low_ttl_for = Some(started);
                         let pkts: Vec<(Vec<u8>, SocketAddr)> = targets
                             .iter()
-                            .filter(|t| matches!(t, SocketAddr::V4(v4) if !crate::portmap::is_carrier_or_private(*v4.ip())))
+                            .filter(|t| matches!(t, SocketAddr::V4(v4) if self.nat_emu.is_some() || !crate::portmap::is_carrier_or_private(*v4.ip())))
                             .map(|t| {
                                 s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
                                 (buf.clone(), *t)
@@ -3348,7 +3526,8 @@ pub fn connect(
         my_id,
         e2e: e2e.clone(),
         p2p_enabled: AtomicBool::new(false),
-        local_addrs: Mutex::new(local_candidates(port, dual)),
+        // 模拟路由器测试时不公布局域网地址（不然两个本机客户端直接走局域网，绕过模拟的 NAT）
+        local_addrs: Mutex::new(if std::env::var_os("VOC_TEST_NAT").is_some() { Vec::new() } else { local_candidates(port, dual) }),
         peers: Mutex::new(Peers::default()),
         unknown_trials: RateLimit::default(),
         unknown_dropped: AtomicU32::new(0),
@@ -3365,6 +3544,7 @@ pub fn connect(
         last_loss_burst: Mutex::new(None),
         ttl_lock: std::sync::RwLock::new(()),
         last_local: Mutex::new(local_candidates(port, dual)),
+        nat_emu: NatEmu::from_env(),
         interleave: AtomicBool::new(false),
         mtu_probes: Mutex::new(HashMap::new()),
         path_mtu: Mutex::new(HashMap::new()),
@@ -3574,6 +3754,10 @@ pub fn connect(
                 }
             };
             let from = norm(from);
+            // 测试用的模拟路由器：按过滤规则丢掉进不来的包（第 60-4 项）
+            if l.nat_emu.as_ref().is_some_and(|e| !e.allow(from)) {
+                continue;
+            }
             let pkt = &buf[..n];
             RECV_PKTS.fetch_add(1, Ordering::Relaxed);
             let _timer = RecvTimer(Instant::now());
@@ -4153,11 +4337,16 @@ impl Transmitter {
         self.zero_ms = if energy < 1e-12 { self.zero_ms.saturating_add(frame_ms) } else { 0 };
         s.mic_silent.store(self.zero_ms >= MIC_SILENT_FRAMES * 20, Ordering::Relaxed);
 
-        let ptt = s.ptt_vk.load(Ordering::Relaxed);
-        let speaking = if ptt != 0 { key_down(ptt) } else { db >= s.vad_threshold_db.get() };
+        let ptt = s.ptt_key.load(Ordering::Relaxed);
+        let speaking = if ptt != 0 {
+            // 按键说话：可以带修饰键、可以只在 VOC 前台时有效；录键时暂停（第 58 项）
+            !s.keys_paused.load(Ordering::Relaxed) && crate::hotkey::Hotkey::unpack(ptt).held_now()
+        } else {
+            db >= s.vad_threshold_db.get()
+        };
         if speaking {
-            // 拖尾按毫秒算（10 ms / 20 ms 一包都一样长）
-            self.hang = if ptt != 0 { PTT_HANGOVER } else { VAD_HANGOVER } * 20;
+            // 拖尾按毫秒算（10 ms / 20 ms 一包都一样长）；按键说话的拖尾可调（0～1 秒），至少把这一帧发出去
+            self.hang = if ptt != 0 { s.ptt_tail_ms.load(Ordering::Relaxed) } else { VAD_HANGOVER * 20 }.max(frame_ms);
         } else {
             self.hang = self.hang.saturating_sub(frame_ms);
         }

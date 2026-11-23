@@ -76,6 +76,11 @@ fn dir() -> Option<PathBuf> {
     writable(&d).then_some(d)
 }
 
+/// VOC 自己的数据文件夹（日志所在的地方；毛玻璃开关的标记文件也放这里）
+pub fn data_dir() -> Option<PathBuf> {
+    dir()
+}
+
 /// 日志文件的实际位置（界面上显示、打开文件夹用）
 pub fn path() -> Option<PathBuf> {
     PATH.lock().unwrap().clone()

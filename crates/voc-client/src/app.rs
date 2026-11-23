@@ -58,13 +58,25 @@ struct Persisted {
     voice_10ms: bool,
     /// 声卡低延迟模式（第 36 项语音第 1 条：IAudioClient3 最小周期，驱动不支持自动退回）
     low_latency_device: bool,
-    /// 按键说话：虚拟键码，0 = 语音激活
+    /// 0.6.2 及以前的按键说话键（虚拟键码，0 = 语音激活）：启动时迁移到 ptt_on / ptt_key 后清零
     ptt_vk: u32,
+    /// 说话方式：按键说话（false = 语音激活）。按键单独存，切回语音激活时不丢（第 58 项）
+    ptt_on: bool,
+    ptt_key: crate::hotkey::Hotkey,
+    /// 松开说话键后再多发多久（毫秒，0～1000）
+    ptt_tail_ms: u32,
     /// 被 @、收到私聊时弹 Windows 通知
     notify: bool,
+    /// 外观（第 59 项）：0 跟随系统，1 浅色，2 深色
+    theme: u8,
+    /// 毛玻璃效果（第 59 项，默认关）：窗口背景用 Windows 11 的云母，弹框后面的画面模糊
+    glass: bool,
     /// 全局快捷键：闭麦 / 静音（游戏里也有效）
     mute_key: crate::hotkey::Hotkey,
     deafen_key: crate::hotkey::Hotkey,
+    /// 开始 / 停止共享屏幕、弹出 / 收回观看窗口（第 58 项）
+    share_key: crate::hotkey::Hotkey,
+    pop_key: crate::hotkey::Hotkey,
     /// 低带宽模式（手机热点、流量少的网络）
     low_bandwidth: bool,
     /// 0.5.x 的手动线路（一个选择）：启动时迁移到 peer_routes 后清空
@@ -103,6 +115,35 @@ struct SavedServer {
 }
 
 impl Persisted {
+    /// 按键页上每个动作现在的按键（顺序见 hotkey::ACTIONS）
+    pub(crate) fn keys(&self) -> [crate::hotkey::Hotkey; 5] {
+        [self.ptt_key, self.mute_key, self.deafen_key, self.share_key, self.pop_key]
+    }
+
+    pub(crate) fn key_mut(&mut self, action: usize) -> &mut crate::hotkey::Hotkey {
+        match action {
+            crate::hotkey::PTT => &mut self.ptt_key,
+            crate::hotkey::MUTE => &mut self.mute_key,
+            crate::hotkey::DEAFEN => &mut self.deafen_key,
+            crate::hotkey::SHARE => &mut self.share_key,
+            _ => &mut self.pop_key,
+        }
+    }
+
+    /// 交给后台检测线程的切换类快捷键（第 i 位 = 动作 i+1）
+    fn toggle_keys(&self) -> Vec<crate::hotkey::Hotkey> {
+        self.keys()[1..].to_vec()
+    }
+
+    /// 音频线程用的按键说话键（0 = 语音激活）
+    pub(crate) fn ptt_packed(&self) -> u32 {
+        if self.ptt_on {
+            self.ptt_key.pack()
+        } else {
+            0
+        }
+    }
+
     /// 读配置后：解开用 Windows 凭据保护加密的身份种子、授权码（第 41-6 项）。返回解不开的项（换了电脑 / Windows 用户）
     fn unseal_secrets(&mut self) -> Vec<&'static str> {
         let mut lost = Vec::new();
@@ -173,9 +214,16 @@ impl Default for Persisted {
             voice_10ms: false,
             low_latency_device: false,
             ptt_vk: 0,
+            ptt_on: false,
+            ptt_key: Default::default(),
+            ptt_tail_ms: 200,
             notify: true,
-            mute_key: crate::hotkey::Hotkey::ctrl(0x4D),
-            deafen_key: crate::hotkey::Hotkey::ctrl(0x44),
+            theme: 0,
+            glass: false,
+            mute_key: crate::hotkey::default_key(crate::hotkey::MUTE),
+            deafen_key: crate::hotkey::default_key(crate::hotkey::DEAFEN),
+            share_key: Default::default(),
+            pop_key: Default::default(),
             low_bandwidth: false,
             routes: HashMap::new(),
             peer_routes: HashMap::new(),
@@ -532,8 +580,11 @@ pub struct App {
     share_confirmed: bool,
     show_share: bool,
     monitors: Vec<String>,
+    /// 共享窗口里选「一个窗口」时的候选窗口（第 60-1 项）
+    share_windows: Vec<video::ShareWindow>,
+    share_pick_window: bool,
     share_error: Option<String>,
-    views: HashMap<u32, Viewer>,
+    views: HashMap<u32, ViewerRef>,
     adding_channel: bool,
     settings_tab: u8,
     sfx_seq: u16,
@@ -564,11 +615,21 @@ pub struct App {
     last_device_check: std::time::Instant,
     /// 10 ms 小缓冲老是欠载：这次运行期间改用默认缓冲
     big_audio_buffer: bool,
-    /// 正在等用户按下新的说话键
-    ptt_capture: bool,
-    /// 全局快捷键检测；正在录哪个快捷键（0 闭麦，1 静音）
+    /// 全局快捷键检测
     hotkeys: crate::hotkey::Watcher,
-    hotkey_capture: Option<usize>,
+    /// 正在给哪个动作录键（按键页的录键框，第 58 项）
+    key_edit: Option<KeyEdit>,
+    /// 按键页上的一行提示（例如恢复默认时撞了别的键）
+    key_note: Option<String>,
+    /// 中间显示语音房间（否则显示文字聊天，第 59 项）；上次看到的语音频道（换频道时自动打开语音房间）
+    room_view: bool,
+    room_seen_ch: Option<u32>,
+    /// 毛玻璃（第 59 项）：这次启动窗口是透明的（云母）；云母已经设过；弹框后面的模糊背景；等截图回来
+    glass_window: bool,
+    mica_done: bool,
+    glass_backdrop: Option<crate::glass::Backdrop>,
+    glass_pending: Option<std::time::Instant>,
+    glass_shot: Arc<Mutex<Option<egui::ColorImage>>>,
     /// 窗口不在前台时收到的消息数（托盘显示，回到窗口清零）
     unread: u32,
     /// 这一轮收消息攒下的：新消息数、要弹的通知 (标题, 内容)
@@ -584,6 +645,8 @@ pub struct App {
     test_image_sent: bool,
     /// 测试模式：VOC_TEST_SHARE 已经开始过共享；VOC_TEST_LOG 上次写日志的时间
     test_share_started: bool,
+    /// 测试：共享者强制 AV1、本机解不了，没去看（第 61 项）
+    test_av1_blocked: bool,
     test_log_at: std::time::Instant,
     /// 测试模式：写了几行日志（VOC_TEST_CHAT 按它每 5 秒发一条）
     test_ticks: u32,
@@ -604,7 +667,36 @@ pub struct App {
     demo: Demo,
 }
 
-struct Viewer {
+/// 观看窗口要显示的共享者信息（每帧从成员列表更新一次）
+#[derive(Clone, Default)]
+pub(crate) struct ViewInfo {
+    pub name: String,
+    pub desc: String,
+    pub simulcast: bool,
+    pub share_audio: bool,
+    pub p2p_only: bool,
+}
+
+/// 观看窗口里点了什么（主循环下一次处理；弹出窗口独立刷新，所以不能直接改主界面的状态）
+#[derive(Default)]
+pub(crate) struct ViewOut {
+    pub relayer: bool,
+    pub smooth: Option<bool>,
+    pub go_full: bool,
+    pub toggle_pop: bool,
+    pub close: bool,
+}
+
+impl ViewOut {
+    pub fn any(&self) -> bool {
+        self.relayer || self.smooth.is_some() || self.go_full || self.toggle_pop || self.close
+    }
+}
+
+/// 弹出的观看窗口独立刷新（第 56-b 项）：主界面和那个窗口都要用，所以放在锁里
+pub(crate) type ViewerRef = Arc<Mutex<Viewer>>;
+
+pub(crate) struct Viewer {
     view: Arc<View>,
     tex: Option<egui::TextureHandle>,
     seq: u64,
@@ -621,6 +713,45 @@ struct Viewer {
     popped: bool,
     on_top: bool,
     rates: crate::theme::ViewRates,
+    /// 实际换上屏幕的帧（第 56-a 项）：最近 1 秒每一帧的时间；从解码交出到画上屏幕的平均等待（ms）
+    shown: std::collections::VecDeque<std::time::Instant>,
+    paint_ms: f32,
+    info: ViewInfo,
+    out: ViewOut,
+}
+
+impl Viewer {
+    pub(crate) fn new_ref(view: Arc<View>, low: bool, route: u8) -> ViewerRef {
+        Arc::new(Mutex::new(Viewer {
+            view,
+            tex: None,
+            seq: 0,
+            size: (0, 0),
+            low,
+            route,
+            rx_prev: None,
+            gpu: None,
+            popped: false,
+            on_top: false,
+            rates: Default::default(),
+            shown: Default::default(),
+            paint_ms: 0.0,
+            info: Default::default(),
+            out: Default::default(),
+        }))
+    }
+
+    /// 实际显示的帧数（最近 1 秒）和画面间隔的抖动（ms，间隔的标准差）
+    pub(crate) fn shown_stats(&self) -> (u32, f32) {
+        let n = self.shown.len();
+        if n < 3 {
+            return (n as u32, 0.0);
+        }
+        let iv: Vec<f32> = self.shown.iter().zip(self.shown.iter().skip(1)).map(|(a, b)| b.duration_since(*a).as_secs_f32() * 1000.0).collect();
+        let mean = iv.iter().sum::<f32>() / iv.len() as f32;
+        let var = iv.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / iv.len() as f32;
+        (n as u32, var.sqrt())
+    }
 }
 
 impl App {
@@ -652,7 +783,15 @@ impl App {
         let settings = Arc::new(Settings::default());
         settings.vad_threshold_db.set(cfg.vad_threshold_db);
         settings.aec.store(cfg.aec, Ordering::Relaxed);
-        settings.ptt_vk.store(cfg.ptt_vk, Ordering::Relaxed);
+        // 0.6.3：按键说话的键从一个虚拟键码改成可带修饰键的组合，模式单独存（第 58 项）
+        if cfg.ptt_vk != 0 {
+            cfg.ptt_key = crate::hotkey::Hotkey::key(cfg.ptt_vk);
+            cfg.ptt_on = true;
+            cfg.ptt_vk = 0;
+        }
+        cfg.ptt_tail_ms = cfg.ptt_tail_ms.min(1000);
+        settings.ptt_key.store(cfg.ptt_packed(), Ordering::Relaxed);
+        settings.ptt_tail_ms.store(cfg.ptt_tail_ms, Ordering::Relaxed);
         crate::audio::LOW_BANDWIDTH.store(cfg.low_bandwidth, Ordering::Relaxed);
         settings.input_gain.set(cfg.input_gain);
         settings.output_volume.set(cfg.output_volume);
@@ -685,7 +824,7 @@ impl App {
         let denoise: DenoiseSlot = Arc::new(Mutex::new(None));
         voice::spawn_encoder(frames_rx, settings.clone(), voice.clone(), mixer.clone(), denoise.clone());
 
-        let hotkeys = crate::hotkey::Watcher::spawn(vec![cfg.mute_key, cfg.deafen_key], cc.egui_ctx.clone());
+        let hotkeys = crate::hotkey::Watcher::spawn(cfg.toggle_keys(), cc.egui_ctx.clone());
         let mut app = Self {
             code_input: cfg.code.clone(),
             show_code: false,
@@ -708,6 +847,8 @@ impl App {
             share_confirmed: false,
             show_share: false,
             monitors: Vec::new(),
+            share_windows: Vec::new(),
+            share_pick_window: false,
             share_error: None,
             views: HashMap::new(),
             adding_channel: false,
@@ -731,9 +872,16 @@ impl App {
             devices: audio::watch_devices(cc.egui_ctx.clone()),
             last_device_check: std::time::Instant::now(),
             big_audio_buffer: false,
-            ptt_capture: false,
             hotkeys,
-            hotkey_capture: None,
+            key_edit: None,
+            key_note: None,
+            room_view: true,
+            room_seen_ch: None,
+            glass_window: crate::glass::startup_enabled(),
+            mica_done: false,
+            glass_backdrop: None,
+            glass_pending: None,
+            glass_shot: Default::default(),
             unread: 0,
             unread_new: 0,
             pending_notes: Vec::new(),
@@ -742,6 +890,7 @@ impl App {
             image_view: None,
             test_image_sent: false,
             test_share_started: false,
+            test_av1_blocked: false,
             test_log_at: std::time::Instant::now(),
             test_ticks: 0,
             music: None,
@@ -964,26 +1113,99 @@ impl App {
         if fired == 0 {
             return;
         }
-        for (bit, flag) in [(1u32, &self.settings.muted), (2, &self.settings.deafened)] {
-            if fired & bit == 0 {
+        // 第 i 位 = 动作 i+1（见 Persisted::toggle_keys）
+        let bit = |a: usize| fired & (1 << (a - 1)) != 0;
+        let st = self.settings.clone();
+        for (a, flag) in [(crate::hotkey::MUTE, &st.muted), (crate::hotkey::DEAFEN, &st.deafened)] {
+            if !bit(a) {
                 continue;
             }
             let on = !flag.fetch_xor(true, Ordering::Relaxed);
-            if self.cfg.sfx {
-                let mut m = self.mixer.lock().unwrap();
-                m.set_volume(SFX_ID, self.cfg.sfx_volume);
-                for f in audio::chime(if on { Chime::MuteOn } else { Chime::MuteOff }).chunks(voc_proto::FRAME_SAMPLES) {
-                    self.sfx_seq = self.sfx_seq.wrapping_add(1);
-                    m.push(SFX_ID, self.sfx_seq, f);
+            self.hotkey_chime(on);
+        }
+        if bit(crate::hotkey::SHARE) {
+            if self.sharer.is_some() {
+                self.stop_share();
+                self.hotkey_chime(true);
+            } else if self.in_voice_channel() {
+                match self.start_share() {
+                    Ok(()) => self.hotkey_chime(false),
+                    Err(e) => crate::notify::toast("VOC", &format!("屏幕共享开不了：{e}")),
+                }
+            }
+        }
+        if bit(crate::hotkey::POP) && !self.views.is_empty() {
+            // 有没弹出的就全部弹出，否则全部收回
+            let pop = self.views.values().any(|v| !v.lock().unwrap().popped);
+            for v in self.views.values() {
+                let mut v = v.lock().unwrap();
+                if v.popped != pop {
+                    v.out.toggle_pop = true;
                 }
             }
         }
         self.sync_voice_state();
     }
 
+    /// 快捷键提示音：低音 = 闭麦 / 静音 / 停止共享，高音 = 恢复 / 开始共享
+    fn hotkey_chime(&mut self, low: bool) {
+        if self.cfg.sfx {
+            let mut m = self.mixer.lock().unwrap();
+            m.set_volume(SFX_ID, self.cfg.sfx_volume);
+            for f in audio::chime(if low { Chime::MuteOn } else { Chime::MuteOff }).chunks(voc_proto::FRAME_SAMPLES) {
+                self.sfx_seq = self.sfx_seq.wrapping_add(1);
+                m.push(SFX_ID, self.sfx_seq, f);
+            }
+        }
+    }
+
+    fn in_voice_channel(&self) -> bool {
+        match &self.screen {
+            Screen::Main(s) => s.users.iter().any(|u| u.id == s.user_id && u.channel_id.is_some()),
+            _ => false,
+        }
+    }
+
+    /// 按共享设置开始共享屏幕（共享窗口的「开始共享」按钮和快捷键共用）
+    pub(crate) fn start_share(&mut self) -> Result<(), String> {
+        let Screen::Main(s) = &self.screen else { return Err("还没登录".into()) };
+        let eff = self.cfg.share.effective(self.cfg.low_bandwidth);
+        match Sharer::start(eff.clone(), self.voice.clone()) {
+            Ok(sh) => {
+                s.send(ClientMsg::ShareStart {
+                    desc: eff.desc(),
+                    audio: self.cfg.share_audio && crate::loopback::supported(),
+                    simulcast: true,
+                    rtx: true,
+                    bps: eff.bitrate(),
+                    p2p_only: eff.p2p_only,
+                });
+                self.sharer = Some(sh);
+                self.share_confirmed = false;
+                self.share_error = None;
+                Ok(())
+            }
+            Err(e) => {
+                crate::applog::log(format!("屏幕共享开不了：{e}"));
+                self.share_error = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) fn stop_share(&mut self) {
+        self.sharer = None;
+        self.share_confirmed = false;
+        if let Screen::Main(s) = &self.screen {
+            s.send(ClientMsg::ShareStop);
+        }
+    }
+
     /// 改了快捷键后交给后台检测线程
     fn apply_hotkeys(&self) {
-        self.hotkeys.set_keys(vec![self.cfg.mute_key, self.cfg.deafen_key]);
+        self.hotkeys.set_keys(self.cfg.toggle_keys());
+        self.settings.ptt_key.store(self.cfg.ptt_packed(), Ordering::Relaxed);
+        self.settings.ptt_tail_ms.store(self.cfg.ptt_tail_ms, Ordering::Relaxed);
     }
 
     fn sync_voice_state(&self) {
@@ -1019,6 +1241,13 @@ impl App {
             cfg.skip_static = env("VOC_TEST_SKIP_STATIC").map(|v| v != 0).unwrap_or(cfg.skip_static);
             cfg.auto_res = env("VOC_TEST_AUTO_RES").map(|v| v != 0).unwrap_or(cfg.auto_res);
             cfg.p2p_only = env("VOC_TEST_P2P_ONLY").map(|v| v != 0).unwrap_or(cfg.p2p_only);
+            // VOC_TEST_FORCE_AV1=1：强制 AV1（第 61 项）
+            cfg.force_av1 = env("VOC_TEST_FORCE_AV1") == Some(1);
+            // VOC_TEST_SHARE_WINDOW=标题里的一段字：只共享这个窗口（第 60-1 项）
+            if let Ok(t) = std::env::var("VOC_TEST_SHARE_WINDOW") {
+                cfg.window = video::window_list().into_iter().find(|w| w.title.contains(&t));
+                eprintln!("VOC_TEST_SHARE_WINDOW：{:?}", cfg.window.as_ref().map(|w| (&w.title, &w.exe)));
+            }
             let rtx = env("VOC_TEST_RTX") != Some(0);
             // VOC_TEST_SHARE_AUDIO=1 同时共享电脑声音；VOC_TEST_SHARE_AUDIO_ROUTE=0/1/2；VOC_TEST_STEREO=0/1
             let audio = env("VOC_TEST_SHARE_AUDIO") == Some(1);
@@ -1034,7 +1263,13 @@ impl App {
             }
         }
         if let (Ok(mode), true) = (std::env::var("VOC_TEST_WATCH"), self.views.is_empty()) {
-            if let Some(id) = s.users.iter().find(|u| u.id != s.user_id && u.sharing.is_some()).map(|u| u.id) {
+            if let Some(u) = s.users.iter().find(|u| u.id != s.user_id && u.sharing.as_deref().is_some_and(|d| video::av1_only(d)) && !video::can_decode_av1()) {
+                // 共享者强制 AV1、本机解不了：和界面上一样不去看（第 61 项）
+                if !self.test_av1_blocked {
+                    self.test_av1_blocked = true;
+                    crate::applog::log(format!("测试：{} 的共享只用 AV1，本机解不了，不观看", u.id));
+                }
+            } else if let Some(id) = s.users.iter().find(|u| u.id != s.user_id && u.sharing.is_some()).map(|u| u.id) {
                 let low = mode == "low";
                 let route = match std::env::var("VOC_TEST_VIDEO_ROUTE").as_deref() {
                     Ok("p2p") => 1,
@@ -1043,7 +1278,10 @@ impl App {
                 };
                 s.send(ClientMsg::Watch { target: id, on: true, low, route, cursor: true });
                 if let Some(view) = self.voice.video.watch(id, true) {
-                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route, rx_prev: None, rates: Default::default(), gpu: None, popped: false, on_top: false });
+                    let v = Viewer::new_ref(view, low, route);
+                    // VOC_TEST_POPPED=1：一开始就弹出成独立窗口（第 56-d 项对比用）
+                    v.lock().unwrap().popped = std::env::var_os("VOC_TEST_POPPED").is_some();
+                    self.views.insert(id, v);
                 }
             }
         }
@@ -1078,7 +1316,15 @@ impl App {
             }
         );
         if let Some(l) = self.voice.current_link() {
-            line += &format!("NAT {:?} 第二探测点 {:?} 线路最大包 {:?} ", *l.nat.lock().unwrap(), l.nat_detail(), l.path_mtu());
+            line += &format!(
+                "NAT {:?} 第二探测点 {:?} 线路最大包 {:?} 模拟路由器拦掉 {} 生日攻击 {:?} 候选 {:?} ",
+                *l.nat.lock().unwrap(),
+                l.nat_detail(),
+                l.path_mtu(),
+                l.nat_emu.as_ref().map(|e| e.dropped.load(Ordering::Relaxed)).unwrap_or(0),
+                l.bday_debug(),
+                l.peer_cands_debug()
+            );
             // 三人测试：每个人的语音这一秒放了几帧（满分 50）、其中补出来的几帧；中转路线；语音优先改走服务器的人
             let mut rx: Vec<(u32, (u32, u32))> = std::mem::take(&mut *self.voice.voice_rx.lock().unwrap()).into_iter().collect();
             rx.sort();
@@ -1129,6 +1375,7 @@ impl App {
             );
         }
         for (id, v) in &self.views {
+            let v = v.lock().unwrap();
             let f = v.view.frame.lock().unwrap();
             let (w, h, seq) = f.as_ref().map(|f| (f.width, f.height, f.seq)).unwrap_or((0, 0, 0));
             line += &format!(
@@ -1142,7 +1389,11 @@ impl App {
             // 0.6.2：显卡转颜色、共享者状态、共享声音播放情况
             let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
             line += &format!(
-                "要补发 {} 片 显卡转颜色 {} 收到 {} fps 显示耗时 {} ms 共享者 {:?} 共享声音 {:?} ",
+                "实际显示 {} fps 间隔抖动 {:.1} ms 等着画上屏幕 {:.1} ms 弹出 {} 要补发 {} 片 显卡转颜色 {} 收到 {} fps 显示耗时 {} ms 共享者 {:?} 共享声音 {:?} ",
+                v.shown_stats().0,
+                v.shown_stats().1,
+                v.paint_ms,
+                v.popped,
                 self.voice.video.rx_stats(*id).map(|(s, _, _)| s.nack_frags).unwrap_or(0),
                 f.as_ref().is_some_and(|f| f.nv12.is_some()),
                 v.view.rx_fps.load(Ordering::Relaxed),
@@ -1155,6 +1406,12 @@ impl App {
             line += &format!("| 共享声音在发 录音不连续 {} ", crate::loopback::GLITCHES.load(Ordering::Relaxed));
         }
         use std::io::Write;
+        if self.test_av1_blocked {
+            line += "| 看不了：共享者强制 AV1，本机解不了 AV1 ";
+        }
+        if let Some(sh) = &self.sharer {
+            line += &format!("| 编码器 {} ", sh.stats.encoder.lock().unwrap());
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(f, "{line}");
         }
@@ -1341,13 +1598,15 @@ impl App {
                     if let Some(a) = self.mixer.lock().unwrap().stream_stats(sid) {
                         let _ = writeln!(
                             d,
-                            "  #{id} 的共享声音：缓冲 {} ms（目标 {}）· 丢包补音 {} 帧 · 播空 {} 次 · 积压丢弃 {} 次 · 播放速度 {:+.1}%",
+                            "  #{id} 的共享声音：缓冲 {} ms（目标 {}）· 丢包补音 {} 帧 · 播空 {} 次 · 积压丢弃 {} 次 · 播放速度 {:+.1}% · 音量 {:.0}% · 峰值被压低 {} 次",
                             a.buffered_ms,
                             a.target_ms,
                             a.concealed,
                             a.underruns,
                             a.drops,
-                            a.rate_permille as f32 / 10.0
+                            a.rate_permille as f32 / 10.0,
+                            self.mixer.lock().unwrap().volume(sid) * 100.0,
+                            a.limited
                         );
                     }
                     if let Some((st, keys, rtt)) = self.voice.video.rx_stats(*id) {
@@ -1441,7 +1700,7 @@ impl App {
         let _ = writeln!(d, "降噪：{:?} · 语音激活阈值 {} dB", self.cfg.denoise, self.cfg.vad_threshold_db);
         {
             let st = &self.settings;
-            let ptt = st.ptt_vk.load(Ordering::Relaxed);
+            let ptt = st.ptt_key.load(Ordering::Relaxed);
             let _ = writeln!(
                 d,
                 "麦克风状态：{} · 说话方式 {} · 当前电平 {:.0} dB · 正在发送 {} · 回声消除 {} · 麦克风完全没声音 {}",
@@ -1452,7 +1711,12 @@ impl App {
                 } else {
                     "开"
                 },
-                if ptt == 0 { "语音激活".to_string() } else { format!("按键说话（{}）", vk_name(ptt)) },
+                if ptt == 0 {
+                    "语音激活".to_string()
+                } else {
+                    let k = crate::hotkey::Hotkey::unpack(ptt);
+                    format!("按键说话（{}{}，拖尾 {} ms）", k.label(), if k.focus_only { "，仅前台" } else { "" }, st.ptt_tail_ms.load(Ordering::Relaxed))
+                },
                 st.input_level_db.get(),
                 if st.transmitting.load(Ordering::Relaxed) { "是" } else { "否" },
                 if st.aec.load(Ordering::Relaxed) { "开" } else { "关" },
@@ -1547,7 +1811,12 @@ impl App {
             self.share_audio_src = None;
             self.share_audio_failed = false;
         } else if self.share_audio_src.is_none() && !self.share_audio_failed {
-            let target = crate::loopback::Target::Exclude(std::process::id());
+            // 共享的是窗口、选了只录这个程序：只录它（含子进程）的声音；否则录除了 VOC 以外的全部（第 60-2 项）
+            let target = match self.sharer.as_ref().and_then(|s| s.cfg.window.clone()) {
+                // UWP 应用的窗口属于 ApplicationFrameHost，声音是另一个进程放的：只录窗口那个进程会没声音，改录全部
+                Some(w) if self.cfg.share.audio_app_only && !w.exe.eq_ignore_ascii_case("ApplicationFrameHost.exe") => crate::loopback::Target::Include(w.pid),
+                _ => crate::loopback::Target::Exclude(std::process::id()),
+            };
             match crate::streams::start(voc_proto::udp::SHARE_AUDIO, target, self.voice.clone(), Arc::new(audio::AtomicF32::new(1.0)), self.cfg.stream_stereo) {
                 Ok(src) => self.share_audio_src = Some(src),
                 Err(e) => {
@@ -2367,8 +2636,8 @@ impl App {
                     rgba[i + 3] = 255;
                 }
             }
-            *view.frame.lock().unwrap() = Some(video::DecodedFrame { width: w, height: h, rgba, nv12: None, seq: 1 });
-            self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0), low: false, route: 0, rx_prev: None, rates: Default::default(), gpu: None, popped: false, on_top: false });
+            *view.frame.lock().unwrap() = Some(video::DecodedFrame { width: w, height: h, rgba, nv12: None, seq: 1, at: std::time::Instant::now() });
+            self.views.insert(2, Viewer::new_ref(view, false, 0));
             if kind == "fullscreen" {
                 self.fullscreen = Some(2); // 演示只画全屏界面，不真的切换窗口全屏
             }
@@ -2377,6 +2646,24 @@ impl App {
         self.screen = Screen::Main(Box::new(s));
         self.show_settings = kind == "settings";
         self.settings_tab = std::env::var("VOC_TAB").ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+        // VOC_THEME=1 浅色 / 2 深色（截图用）
+        if let Some(t) = std::env::var("VOC_THEME").ok().and_then(|t| t.parse().ok()) {
+            self.cfg.theme = t;
+        }
+        // VOC_GLASS=1：弹框后面的毛玻璃（截图用）
+        self.cfg.glass = std::env::var_os("VOC_GLASS").is_some();
+        // VOC_DEMO_KEYS=1：按键页演示冲突提示；=2 再打开录键框（第 58 项）
+        if let Ok(k) = std::env::var("VOC_DEMO_KEYS") {
+            use crate::hotkey::Hotkey;
+            self.cfg.ptt_on = true;
+            self.cfg.ptt_key = Hotkey::key(0x4D);
+            self.cfg.mute_key = crate::hotkey::default_key(crate::hotkey::MUTE);
+            self.cfg.deafen_key = Hotkey { vk: 0x44, ctrl: true, ..Default::default() };
+            self.cfg.share_key = Hotkey::key(0x77);
+            if k == "2" {
+                self.begin_key_edit(crate::hotkey::SHARE);
+            }
+        }
         self.show_share = kind == "share";
     }
 
@@ -2484,13 +2771,12 @@ pub fn vk_name(vk: u32) -> String {
     format!("按键 {vk:#04x}")
 }
 
-/// 等待用户按下一个键（键盘或鼠标中键 / 侧键）当作说话键。Esc 取消。左右键不算。
-pub fn capture_ptt_key() -> Option<Option<u32>> {
-    const VK_ESCAPE: u32 = 0x1B;
-    if voice::key_down(VK_ESCAPE) {
-        return Some(None);
-    }
-    (0x04u32..=0xFE).filter(|&vk| vk != VK_ESCAPE && !(0x10..=0x12).contains(&vk)).find(|&vk| voice::key_down(vk)).map(Some)
+/// 按键页的录键框（第 58 项）：录哪个动作、录到的键、有什么问题
+pub(crate) struct KeyEdit {
+    pub action: usize,
+    pub cap: crate::hotkey::Capture,
+    /// 录完了、等用户处理问题（换过来 / 仍然使用 / 重新录）
+    pub got: Option<(crate::hotkey::Hotkey, crate::hotkey::Problem)>,
 }
 
 impl Drop for App {
