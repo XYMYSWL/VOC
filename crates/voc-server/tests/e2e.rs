@@ -1058,8 +1058,8 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
 
     // 经 carol：20 + 20 + 4 = 44 ms；经服务器：150 + 150 = 300 ms
     let want = vec![
-        RelayRoute { from: ia, to: ib, via: ir, ms: 44, server_ms: 300 },
-        RelayRoute { from: ib, to: ia, via: ir, ms: 44, server_ms: 300 },
+        RelayRoute { from: ia, to: ib, via: ir, ms: 44, server_ms: 300, manual: false },
+        RelayRoute { from: ib, to: ia, via: ir, ms: 44, server_ms: 300, manual: false },
     ];
     let mut expected = want.clone();
     expected.sort();
@@ -1117,7 +1117,7 @@ fn viewer_video_relay_is_planned() {
     std::thread::sleep(Duration::from_millis(1500));
     // carol 上行够了
     r.send(ClientMsg::LinkStats { server_rtt: 80, peers: vec![stat(ia), stat(ib)], relay_slots: 4, via_server: vec![], video_relay_bps: 20_000_000, talking: false, heard: vec![], manual_via: vec![], voice_loss: 0 });
-    let want = vec![RelayRoute { from: ia, to: ib, via: ir, ms: 0, server_ms: 0 }];
+    let want = vec![RelayRoute { from: ia, to: ib, via: ir, ms: 0, server_ms: 0, manual: false }];
     for x in [&mut a, &mut b, &mut r] {
         x.wait_for(|m| matches!(m, ServerMsg::VideoRelays { routes } if *routes == want));
     }

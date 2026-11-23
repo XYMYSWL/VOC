@@ -94,6 +94,49 @@ struct SavedServer {
     code: String,
 }
 
+impl Persisted {
+    /// 读配置后：解开用 Windows 凭据保护加密的身份种子、授权码（第 41-6 项）。返回解不开的项（换了电脑 / Windows 用户）
+    fn unseal_secrets(&mut self) -> Vec<&'static str> {
+        let mut lost = Vec::new();
+        let mut one = |v: &mut String, what: &'static str| match crate::secret::open(v) {
+            Some(p) => *v = p,
+            None => {
+                v.clear();
+                if !lost.contains(&what) {
+                    lost.push(what);
+                }
+            }
+        };
+        one(&mut self.identity_seed, "加密身份");
+        one(&mut self.code, "记住的授权码");
+        for s in &mut self.servers {
+            one(&mut s.code, "记住的授权码");
+        }
+        lost
+    }
+
+    /// 写配置前：把机密加密，返回原文（写完用 restore_secrets 放回，内存里一直是明文）
+    fn seal_secrets(&mut self) -> Vec<String> {
+        let mut plain = vec![self.identity_seed.clone(), self.code.clone()];
+        plain.extend(self.servers.iter().map(|s| s.code.clone()));
+        self.identity_seed = crate::secret::seal(&self.identity_seed);
+        self.code = crate::secret::seal(&self.code);
+        for s in &mut self.servers {
+            s.code = crate::secret::seal(&s.code);
+        }
+        plain
+    }
+
+    fn restore_secrets(&mut self, plain: Vec<String>) {
+        let mut it = plain.into_iter();
+        self.identity_seed = it.next().unwrap_or_default();
+        self.code = it.next().unwrap_or_default();
+        for s in &mut self.servers {
+            s.code = it.next().unwrap_or_default();
+        }
+    }
+}
+
 impl Default for Persisted {
     fn default() -> Self {
         Self {
@@ -472,6 +515,8 @@ pub struct App {
     settings_tab: u8,
     sfx_seq: u16,
     updater: crate::update::Updater,
+    /// Wi-Fi 低延迟模式（第 37-1 项）：Some = 在频道里试过（里面的 None = 没有 Wi-Fi / 不支持）
+    wifi: Option<Option<crate::wifi::LowLatency>>,
     /// 上次点「复制诊断信息」的时间（显示「已复制」）
     diag_copied: Option<std::time::Instant>,
     /// 诊断信息里附上「编号 ↔ 昵称」对照（默认不附）
@@ -515,6 +560,8 @@ pub struct App {
     /// 测试模式：VOC_TEST_SHARE 已经开始过共享；VOC_TEST_LOG 上次写日志的时间
     test_share_started: bool,
     test_log_at: std::time::Instant,
+    /// 测试模式：写了几行日志（VOC_TEST_CHAT 按它每 5 秒发一条）
+    test_ticks: u32,
     /// 正在放的伴奏
     music: Option<MusicPlaying>,
     /// 伴奏窗口
@@ -547,8 +594,18 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::setup_fonts(&cc.egui_ctx);
         crate::theme::apply(&cc.egui_ctx);
-        let mut cfg: Persisted =
-            cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        // 测试模式（VOC_AUTOLOGIN）从默认配置开始、每次新身份：不受本机真实设置影响（例如真实配置开着「只走 P2P」），
+        // 几个测试客户端也不会共用同一个身份
+        let test_login = std::env::var_os("VOC_AUTOLOGIN").is_some() && std::env::var_os("VOC_DEMO").is_none();
+        let mut cfg: Persisted = if test_login {
+            Persisted::default()
+        } else {
+            cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default()
+        };
+        let lost = cfg.unseal_secrets();
+        if !lost.is_empty() {
+            crate::applog::log(format!("配置：{} 是在别的电脑 / Windows 用户下加密的，这里解不开，已重置", lost.join("、")));
+        }
         // 端到端加密身份：第一次运行时生成，之后一直沿用
         let identity_seed: [u8; 32] = voc_proto::e2e::unb64(&cfg.identity_seed)
             .and_then(|b| b.try_into().ok())
@@ -622,6 +679,7 @@ impl App {
             settings_tab: 0,
             sfx_seq: 0,
             updater: crate::update::Updater::default(),
+            wifi: None,
             diag_copied: None,
             diag_names: false,
             log_path_copied: None,
@@ -649,6 +707,7 @@ impl App {
             test_image_sent: false,
             test_share_started: false,
             test_log_at: std::time::Instant::now(),
+            test_ticks: 0,
             music: None,
             music_window: false,
             music_apps: Vec::new(),
@@ -902,6 +961,7 @@ impl App {
             // VOC_TEST_SKIP_STATIC=0/1、VOC_TEST_AUTO_RES=0/1
             cfg.skip_static = env("VOC_TEST_SKIP_STATIC").map(|v| v != 0).unwrap_or(cfg.skip_static);
             cfg.auto_res = env("VOC_TEST_AUTO_RES").map(|v| v != 0).unwrap_or(cfg.auto_res);
+            cfg.p2p_only = env("VOC_TEST_P2P_ONLY").map(|v| v != 0).unwrap_or(cfg.p2p_only);
             let rtx = env("VOC_TEST_RTX") != Some(0);
             match Sharer::start(cfg.clone(), self.voice.clone()) {
                 Ok(sh) => {
@@ -930,11 +990,30 @@ impl App {
             return;
         }
         self.test_log_at = std::time::Instant::now();
+        // VOC_TEST_CHAT=1：每 5 秒在频道里发一条文字（端到端加密）
+        self.test_ticks += 1;
+        if std::env::var_os("VOC_TEST_CHAT").is_some() && self.test_ticks % 5 == 0 {
+            if let Some(e2e) = &s.e2e {
+                let text = format!("测试消息 {}", self.test_ticks / 5);
+                let (id, _, _) = e2e.lock().unwrap().send_chat(&text);
+                let me = s.me().map(|u| u.name.clone()).unwrap_or_default();
+                s.chat.push(ChatLine::User { from: me, text, ts: voc_proto::now_millis(), mine: true, id: Some((s.user_id, id)), reactions: Vec::new() });
+            }
+        }
+        let chat_in = s.chat.iter().filter(|l| matches!(l, ChatLine::User { mine: false, .. })).count();
+        let (img_done, img_all) = s.chat.iter().fold((0, 0), |(d, a), l| match l {
+            ChatLine::Image(i) if !i.mine => (d + usize::from(i.receiving.is_none() && i.error.is_none()), a + 1),
+            _ => (d, a),
+        });
         let mut line = format!(
-            "{} 闭麦 {} 静音 {} ",
+            "{} 闭麦 {} 静音 {} 聊天收 {chat_in} 图片收 {img_done}/{img_all} 累计字节(语音发,语音收,共享发,共享收) {:?} ",
             voc_proto::now_millis(),
             self.settings.muted.load(Ordering::Relaxed),
-            self.settings.deafened.load(Ordering::Relaxed)
+            self.settings.deafened.load(Ordering::Relaxed),
+            {
+                let t = crate::traffic::snapshot();
+                (t[0].0, t[0].1, t[1].0, t[1].1)
+            }
         );
         if let Some(l) = self.voice.current_link() {
             line += &format!("NAT {:?} ", *l.nat.lock().unwrap());
@@ -953,11 +1032,15 @@ impl App {
         if let Some(l) = self.voice.current_link() {
             let (v, d) = l.allocation();
             line += &format!(
-                "udp {:?} 语音直连 {v:?} 画面直连 {d:?} 观看者 {} 陌生丢 {} 匀速丢 {} ",
+                "udp {:?} 语音直连 {v:?} 画面直连 {d:?} 观看者 {} 陌生丢 {} 匀速丢 {} 发送失败 {} 发包 {} 收包 {} 最慢 {} us ",
                 self.voice.transport_udp(),
                 l.watcher_count(),
                 l.unknown_dropped.load(Ordering::Relaxed),
-                l.pace_dropped_total()
+                l.pace_dropped_total(),
+                crate::voice::SEND_ERRORS.load(Ordering::Relaxed),
+                crate::voice::SENT_PKTS.swap(0, Ordering::Relaxed),
+                crate::voice::RECV_PKTS.swap(0, Ordering::Relaxed),
+                crate::voice::RECV_MAX_US.swap(0, Ordering::Relaxed)
             );
         }
         if let Some(sh) = &self.sharer {
@@ -1006,7 +1089,7 @@ impl App {
         let Screen::Main(s) = &self.screen else { return };
         let Some(l) = self.voice.current_link() else { return };
         let id_of = |n: &str| s.users.iter().find(|u| u.name == n && u.id != s.user_id).map(|u| u.id);
-        let map: HashMap<u32, voice::PeerPref> = match self.cfg.peer_routes.get(&s.server_key) {
+        let mut map: HashMap<u32, voice::PeerPref> = match self.cfg.peer_routes.get(&s.server_key) {
             Some(m) => s
                 .users
                 .iter()
@@ -1015,6 +1098,17 @@ impl App {
                 .collect(),
             None => HashMap::new(),
         };
+        // 测试：VOC_TEST_VIA="B=C;…" 和 B 的语音经 C 中转（两个方向）
+        if self.test_mode {
+            if let Ok(v) = std::env::var("VOC_TEST_VIA") {
+                for (peer, via) in v.split(';').filter_map(|p| p.split_once('=')) {
+                    if let Some(id) = id_of(peer.trim()) {
+                        let r = voice::PeerRoute { voice: voice::VoiceRoute::Via(via.trim().to_string()), ..Default::default() };
+                        map.insert(id, voice::PeerPref::from_route(&r, id_of));
+                    }
+                }
+            }
+        }
         l.set_route_prefs(map);
     }
 
@@ -1036,6 +1130,7 @@ impl App {
         let _ = writeln!(d, "系统：{}", os_version());
         let _ = writeln!(d, "安装方式：{}", if crate::update::is_packaged() { "安装版（MSIX）" } else { "绿色版" });
         let _ = writeln!(d, "\n[网络]");
+        let _ = writeln!(d, "Wi-Fi 低延迟模式：{}", crate::wifi::state_text());
         match (&self.screen, self.voice.current_link()) {
             (Screen::Main(s), Some(l)) => {
                 let tr = match self.voice.transport_udp() {
@@ -1286,7 +1381,8 @@ impl App {
         if self.test_mode && !self.test_image_sent {
             if let (Ok(path), Screen::Main(s)) = (std::env::var("VOC_TEST_SEND_IMAGE"), &self.screen) {
                 let others = s.users.iter().filter(|u| u.id != s.user_id && u.channel_id.is_some() && u.channel_id == s.me().and_then(|m| m.channel_id)).count();
-                if others > 0 && self.last_device_check.elapsed() > Duration::from_millis(1500) {
+                // 等一会儿（约 8 秒，频道里每个人的端到端加密都建好了）再发，测「大家都收到」
+                if others > 0 && self.last_device_check.elapsed() > Duration::from_millis(1500) && self.test_ticks >= 8 {
                     self.test_image_sent = true;
                     let p = std::path::PathBuf::from(path);
                     queue_image(&self.image_jobs.0, ctx, move || crate::images::prepare_file(&p));
@@ -1565,6 +1661,7 @@ impl App {
 
     fn go_login(&mut self, error: Option<String>) {
         self.leave_main();
+        self.wifi = None;
         self.rejoin = None;
         self.screen = Screen::Login { error };
     }
@@ -1687,6 +1784,12 @@ impl App {
                             self.rejoin = None;
                         }
                         let in_ch = s.me().is_some_and(|u| u.channel_id.is_some());
+                        // Wi-Fi 低延迟模式：在语音频道里才开，离开频道就关（第 37-1 项）；没有 Wi-Fi 时只试一次
+                        if in_ch && self.wifi.is_none() {
+                            self.wifi = Some(crate::wifi::LowLatency::enable());
+                        } else if !in_ch && self.wifi.is_some() {
+                            self.wifi = None;
+                        }
                         if let Some(l) = self.voice.current_link() {
                             l.in_channel.store(in_ch, Ordering::Relaxed);
                             let my_ch = s.me().and_then(|u| u.channel_id);
@@ -2019,7 +2122,7 @@ impl App {
         ]
         .into();
         // 小鱼和我打不通，经阿豪中继；我帮阿豪把语音转给 Mia
-        let rt = |from, to, via, ms, server_ms| voc_proto::RelayRoute { from, to, via, ms, server_ms };
+        let rt = |from, to, via, ms, server_ms| voc_proto::RelayRoute { from, to, via, ms, server_ms, manual: false };
         self.demo.relays = vec![rt(4, 1, 2, 62, 148), rt(1, 4, 2, 62, 148), rt(2, 5, 1, 64, 133)];
         use voice::PunchState::*;
         self.demo.punch = [

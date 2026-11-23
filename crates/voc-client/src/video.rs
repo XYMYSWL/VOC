@@ -1450,6 +1450,10 @@ fn encode_loop(
             if congested {
                 (fec_main, fec_low) = (fec_main.min(CONGESTED_FEC_CAP), fec_low.min(CONGESTED_FEC_CAP));
             }
+            // 测试：VOC_TEST_FEC=百分比 固定冗余比例
+            if let Some(f) = std::env::var("VOC_TEST_FEC").ok().and_then(|v| v.parse::<f32>().ok()) {
+                (fec_main, fec_low) = (f / 100.0, f / 100.0);
+            }
             stats.fec_pct.store((fec_main * 100.0).round() as u32, Ordering::Relaxed);
             link.set_fec_pct((fec_main.max(fec_low) * 100.0).round() as u32);
             stats.viewer_loss.store(loss_main.max(loss_low) as u32, Ordering::Relaxed);

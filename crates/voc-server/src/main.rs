@@ -246,6 +246,8 @@ struct State {
     /// 这一秒转发的语音 / 画面字节数；上一秒的（状态文件和带宽上限用）
     sec_bytes: (u64, u64),
     last_sec_bytes: (u64, u64),
+    /// 启动以来每 5 秒数一次「同频道、都开了 P2P 的两人」：(总对数, 语音直连的对数)，按时间加权算直连率（第 47 项）
+    p2p_samples: (u64, u64),
     /// 画面转发总带宽上限（bps）
     max_video_bps: Option<u64>,
     /// 因为服务器带宽不够被临时改看「流畅」的 (观看者, 共享者)；带宽宽松了多少秒
@@ -668,7 +670,7 @@ impl State {
         let routes: Vec<RelayRoute> = self
             .video_relays
             .iter()
-            .map(|((s, t), v)| RelayRoute { from: *s, to: *t, via: *v, ms: 0, server_ms: 0 })
+            .map(|((s, t), v)| RelayRoute { from: *s, to: *t, via: *v, ms: 0, server_ms: 0, manual: false })
             .collect();
         for (id, u) in self.users.iter_mut() {
             let mut mine: Vec<RelayRoute> = routes.iter().filter(|r| r.from == *id || r.via == *id || r.to == *id).copied().collect();
@@ -772,6 +774,42 @@ impl State {
         self.forced_low.retain(|(v, s)| users.get(v).is_some_and(|u| u.watching.contains(s)));
     }
 
+    /// 同频道、两人都开了 P2P（且没有对对方隐藏 IP）的对数、其中语音直连的对数、没直连的按 NAT 类型组合分
+    fn p2p_pairs(&self) -> (u32, u32, HashMap<String, u32>) {
+        fn nat_name(n: Option<&NatInfo>) -> &'static str {
+            match n.map(|n| n.kind) {
+                Some(voc_proto::NAT_OPEN) => "公网",
+                Some(voc_proto::NAT_CONE) => "锥形",
+                Some(voc_proto::NAT_SYM_PREDICTABLE) => "对称可预测",
+                Some(voc_proto::NAT_SYM_RANDOM) => "对称随机",
+                _ => "未知",
+            }
+        }
+        let mut ids: Vec<&u32> = self.users.keys().collect();
+        ids.sort();
+        let (mut pairs, mut direct, mut failed) = (0u32, 0u32, HashMap::new());
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                let (ua, ub) = (&self.users[*a], &self.users[*b]);
+                if ua.channel.is_none() || ua.channel != ub.channel || ua.p2p.is_none() || ub.p2p.is_none() {
+                    continue;
+                }
+                if ua.p2p_hide.contains(*b) || ub.p2p_hide.contains(*a) {
+                    continue;
+                }
+                pairs += 1;
+                if ua.direct.contains(*b) || ub.direct.contains(*a) {
+                    direct += 1;
+                } else {
+                    let mut k = [nat_name(ua.nat.as_ref()), nat_name(ub.nat.as_ref())];
+                    k.sort();
+                    *failed.entry(format!("{} × {}", k[0], k[1])).or_insert(0) += 1;
+                }
+            }
+        }
+        (pairs, direct, failed)
+    }
+
     /// 状态文件内容
     fn status_text(&self, port: u16) -> String {
         use std::fmt::Write;
@@ -780,7 +818,7 @@ impl State {
         let probe = if self.probe_listening { format!("NAT 探测 UDP {}（监听中）", self.probe_port) } else { "NAT 探测端口没开".into() };
         let _ = writeln!(t, "端口：TCP/UDP {port} · {probe}");
         let mbps = |b: u64| b as f64 * 8.0 / 1e6;
-        let cap = self.max_video_bps.map(|c| format!("上限 {:.0} Mbps", c as f64 / 1e6)).unwrap_or_else(|| "不限".into());
+        let cap = self.max_video_bps.map(|c| format!("上限 {} Mbps", fmt_mbps(c))).unwrap_or_else(|| "不限".into());
         let _ = writeln!(
             t,
             "最近 1 秒服务器转发：语音 {:.2} Mbps · 画面 {:.2} Mbps（画面{cap}）",
@@ -831,6 +869,17 @@ impl State {
         }
         if !self.forced_low.is_empty() {
             let _ = writeln!(t, "因为画面带宽上限临时改看「流畅」的：{} 人", self.forced_low.len());
+        }
+        // P2P 直连情况（第 47 项）：只数次数和 NAT 类型组合，不写昵称、不写 IP
+        let (pairs, direct, failed) = self.p2p_pairs();
+        if pairs > 0 {
+            let mut f: Vec<(String, u32)> = failed.into_iter().collect();
+            f.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let fails = if f.is_empty() { String::new() } else { format!("；没直连的：{}", f.iter().map(|(k, n)| format!("{k} {n} 对")).collect::<Vec<_>>().join("、")) };
+            let _ = writeln!(t, "P2P：现在语音直连 {direct} / {pairs} 对（{}%）{fails}", direct * 100 / pairs);
+        }
+        if self.p2p_samples.0 > 0 {
+            let _ = writeln!(t, "P2P：启动以来语音直连率 {}%（按时间算）", self.p2p_samples.1 * 100 / self.p2p_samples.0);
         }
         let banned = self.bans.count(Instant::now());
         if banned > 0 {
@@ -943,6 +992,11 @@ VOC 服务器
   voc-server revoke-code <ID>   [--codes 文件]   吊销（在线的人会被立即踢下线）
   voc-server restore-code <ID>  [--codes 文件]   取消吊销
 
+换服务器时搬授权码（大家原来的授权码在新服务器上照样能用）：
+  voc-server export-users [--codes 文件] > 文件   导出全部授权码，用你设的密码加密（输出是一串看不出格式的字符）
+  voc-server import-users [文件] [--codes 文件]    在新服务器上导入（不带文件 = 从标准输入读），已有的授权码不动
+  密码在终端里输入（不显示）；脚本里用可以设环境变量 VOC_USERS_PASSWORD
+
   voc-server --version   显示版本";
 
 fn main() {
@@ -968,6 +1022,8 @@ fn main() {
         Some("gen-code") => cmd_gen(&codes_path, &rest[1..]),
         Some("status") => cmd_status(&codes_path),
         Some("list-codes") => cmd_list(&codes_path),
+        Some("export-users") => cmd_export_users(&codes_path),
+        Some("import-users") => cmd_import_users(&codes_path, rest.get(1).map(String::as_str)),
         Some("revoke-code") | Some("restore-code") => {
             let id = rest.get(1).unwrap_or_else(|| die("需要授权码 ID"));
             let revoke = rest[0] == "revoke-code";
@@ -1036,6 +1092,89 @@ fn cmd_gen(path: &std::path::Path, args: &[String]) {
     println!("已生成 {} 个授权码（只显示这一次，请妥善发给对应的人）：", codes.len());
     for c in codes {
         println!("{}", c.display());
+    }
+}
+
+/// 读密码：环境变量 VOC_USERS_PASSWORD（脚本用）→ 终端（不显示输入）→ 标准输入的一行
+fn read_password(prompt: &str) -> String {
+    if let Ok(p) = std::env::var("VOC_USERS_PASSWORD") {
+        return p;
+    }
+    use std::io::{BufRead, Write};
+    #[cfg(unix)]
+    if let Ok(tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        let stty = |arg: &str| {
+            let _ = std::process::Command::new("stty").arg(arg).stdin(tty.try_clone().expect("tty")).status();
+        };
+        let mut w = &tty;
+        let _ = write!(w, "{prompt}");
+        let _ = w.flush();
+        stty("-echo");
+        let mut line = String::new();
+        let r = std::io::BufReader::new(&tty).read_line(&mut line);
+        stty("echo");
+        let _ = writeln!(w);
+        if r.is_ok() {
+            return line.trim_end_matches(['\r', '\n']).to_string();
+        }
+    }
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).unwrap_or_else(|e| die(&format!("读不到密码：{e}")));
+    line.trim_end_matches(['\r', '\n']).to_string()
+}
+
+fn cmd_export_users(path: &std::path::Path) {
+    let min = voc_proto::backup::MIN_PASSWORD_CHARS;
+    let pw = read_password(&format!("设一个导出密码（至少 {min} 个字，导入时要用）："));
+    if pw.chars().count() < min {
+        die(&format!("密码至少 {min} 个字"));
+    }
+    if std::env::var_os("VOC_USERS_PASSWORD").is_none() && read_password("再输一次：") != pw {
+        die("两次密码不一样");
+    }
+    let (text, n) = codes::export_users(path, &pw).unwrap_or_else(|e| die(&e));
+    println!("{text}");
+    eprintln!("已导出 {n} 个授权码（含备注、到期、吊销状态）。");
+    eprintln!("在新服务器上：sudo voc import-users 这个文件，输同一个密码。文件和密码请分开保管：拿到两样的人能冒充任何一个授权码登录。");
+}
+
+/// 文本文件转字符串：Windows PowerShell 5 的 `>` 存成 UTF-16（带 BOM），记事本可能带 UTF-8 BOM
+fn decode_text(b: &[u8]) -> String {
+    if let Some(rest) = b.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        return String::from_utf16_lossy(&units);
+    }
+    let b = b.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(b);
+    String::from_utf8_lossy(b).into_owned()
+}
+
+fn cmd_import_users(path: &std::path::Path, file: Option<&str>) {
+    use std::io::Read;
+    let bytes = match file {
+        Some(f) if f != "-" => std::fs::read(f).unwrap_or_else(|e| die(&format!("读不了 {f}：{e}"))),
+        _ => {
+            let mut t = Vec::new();
+            std::io::stdin().read_to_end(&mut t).unwrap_or_else(|e| die(&format!("读不到导出内容：{e}")));
+            t
+        }
+    };
+    let text = decode_text(&bytes);
+    if text.trim().is_empty() {
+        die("导出内容是空的。用法：voc-server import-users 文件（或从标准输入传进来）");
+    }
+    let pw = read_password("导出时设的密码：");
+    let r = codes::import_users(path, &text, &pw).unwrap_or_else(|e| die(&e));
+    println!("导入完成：新加 {} 个授权码，{} 个本来就有（没动）。", r.added, r.same);
+    if !r.conflict.is_empty() {
+        println!("跳过 {} 个：本服务器已有同一个 ID 但密钥不同（没覆盖）：{}", r.conflict.len(), r.conflict.join(", "));
+    }
+    if !r.broken.is_empty() {
+        println!("跳过 {} 个：导出内容里的密钥损坏：{}", r.broken.len(), r.broken.join(", "));
+    }
+    if r.added > 0 {
+        println!("服务器在运行的话几秒内自动生效，不用重启。用 `list-codes` 查看。");
     }
 }
 
@@ -1122,6 +1261,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         voice_fallback: HashMap::new(),
         sec_bytes: (0, 0),
         last_sec_bytes: (0, 0),
+        p2p_samples: (0, 0),
         max_video_bps: cfg.max_video_bps,
         forced_low: HashSet::new(),
         cap_calm_secs: 0,
@@ -1874,7 +2014,13 @@ async fn revocation_loop(state: Shared) {
 async fn status_loop(state: Shared, path: PathBuf, port: u16) {
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let text = state.lock().unwrap().status_text(port);
+        let text = {
+            let mut st = state.lock().unwrap();
+            let (pairs, direct, _) = st.p2p_pairs();
+            st.p2p_samples.0 += pairs as u64;
+            st.p2p_samples.1 += direct as u64;
+            st.status_text(port)
+        };
         let _ = std::fs::write(&path, text);
     }
 }
@@ -1932,19 +2078,44 @@ async fn probe_loop(state: Shared, sock: Arc<UdpSocket>) {
     }
 }
 
+/// 带宽显示：1.5 → 「1.5」，2.0 → 「2」（第 52 项：以前四舍五入成整数，1.5 显示成 2）
+fn fmt_mbps(bps: u64) -> String {
+    let m = (bps as f64 / 1e5).round() / 10.0;
+    if m.fract() == 0.0 {
+        format!("{m:.0}")
+    } else {
+        format!("{m:.1}")
+    }
+}
+
 /// 未知地址最多试解多少个用户（防止被随机包刷 CPU）
 const MAX_TRIAL: usize = 512;
 
 async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
     let mut buf = [0u8; 2048];
     let mut out: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+    // 调试：VOC_DEBUG_UDP=1 每秒打印收到的画面包、转发出去的包、等锁最久多少毫秒、收包出错次数
+    let debug = std::env::var_os("VOC_DEBUG_UDP").is_some();
+    let (mut d_at, mut d_vin, mut d_out, mut d_wait, mut d_err, mut d_send_err) = (Instant::now(), 0u32, 0u32, 0u128, 0u32, 0u32);
+    let (mut d_last, mut d_gap) = (Instant::now(), 0u128);
     loop {
+        if debug && d_at.elapsed() >= Duration::from_secs(1) {
+            println!("[udp] {} 画面收 {d_vin} 发出 {d_out} 等锁最久 {d_wait} ms 收包间隔最长 {d_gap} ms 收错 {d_err} 发错 {d_send_err}", now_millis());
+            (d_at, d_vin, d_out, d_wait, d_err, d_send_err, d_gap) = (Instant::now(), 0, 0, 0, 0, 0, 0);
+        }
         // Windows 上对端不可达时 recv_from 会返回 ConnectionReset，忽略即可
-        let Ok((n, addr)) = sock.recv_from(&mut buf).await else { continue };
+        let Ok((n, addr)) = sock.recv_from(&mut buf).await else {
+            d_err += 1;
+            continue;
+        };
+        d_gap = d_gap.max(d_last.elapsed().as_millis());
+        d_last = Instant::now();
         let pkt = &buf[..n];
         out.clear();
         {
+            let t0 = Instant::now();
             let mut st = state.lock().unwrap();
+            d_wait = d_wait.max(t0.elapsed().as_millis());
             // 先试这个地址对应的用户；不认识的地址（新连接 / NAT 换了端口）再逐个试解
             let mut found = None;
             if let Some(&uid) = st.addr_map.get(&addr) {
@@ -1982,7 +2153,10 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
                         out = st.forward_voice(uid, seq, f);
                     }
                 }
-                udp::VIDEO => out = st.forward_video(uid, &data),
+                udp::VIDEO => {
+                    d_vin += 1;
+                    out = st.forward_video(uid, &data)
+                }
                 udp::NACK => out = st.on_nack(uid, &data),
                 udp::MUSIC | udp::SHARE_AUDIO | udp::CURSOR => {
                     if let Some((seq, f)) = udp::read_client_voice(&data) {
@@ -1993,7 +2167,10 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
             }
         }
         for (a, p) in &out {
-            let _ = sock.send_to(p, a).await;
+            d_out += 1;
+            if sock.send_to(p, a).await.is_err() {
+                d_send_err += 1;
+            }
         }
     }
 }
@@ -2001,6 +2178,14 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
 #[cfg(test)]
 mod tests {
     use super::is_public;
+
+    #[test]
+    fn video_cap_shows_decimals() {
+        assert_eq!(super::fmt_mbps(1_500_000), "1.5");
+        assert_eq!(super::fmt_mbps(2_000_000), "2");
+        assert_eq!(super::fmt_mbps(10_000_000), "10");
+        assert_eq!(super::fmt_mbps(800_000), "0.8");
+    }
 
     #[test]
     fn pre_auth_connections_are_limited() {

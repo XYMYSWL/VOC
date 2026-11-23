@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod auth;
+pub mod backup;
 pub mod crypto;
 pub mod e2e;
 pub mod file;
@@ -220,6 +221,9 @@ pub struct RelayRoute {
     /// 同一对人走服务器中转的预计往返延迟（ms）：A–服务器往返 + B–服务器往返。界面用来对比
     #[serde(default)]
     pub server_ms: u32,
+    /// 有人手动指定了「经 via 中转」（0.6.1）：from 这边就算能直连 to，语音也要改经 via（两个方向都按指定的走）
+    #[serde(default)]
+    pub manual: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

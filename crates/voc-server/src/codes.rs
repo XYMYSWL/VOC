@@ -141,12 +141,96 @@ pub fn set_revoked(path: &Path, id: &str, revoked: bool) -> Result<(), String> {
     write_file(path, &entries)
 }
 
+/// 导出 / 导入授权码时加密用的用途标记（不出现在导出内容里）
+const EXPORT_PURPOSE: &[u8] = b"voc-server-users-v1";
+
+/// 把全部授权码（含备注、到期、吊销）用密码加密 + 混淆成一串字符（第 33 项：换服务器用）
+pub fn export_users(path: &Path, password: &str) -> Result<(String, usize), String> {
+    let entries = read_file(path)?;
+    let json = serde_json::to_vec(&entries).map_err(|e| e.to_string())?;
+    Ok((voc_proto::backup::seal(&json, password, EXPORT_PURPOSE), entries.len()))
+}
+
+/// 导入结果
+#[derive(Debug, Default, PartialEq)]
+pub struct ImportReport {
+    /// 新加进来的
+    pub added: usize,
+    /// 已经有了（ID 和密钥都一样），没动
+    pub same: usize,
+    /// 同一个 ID、密钥不一样：跳过（不覆盖本服务器已有的）
+    pub conflict: Vec<String>,
+    /// 导出内容里密钥损坏的：跳过
+    pub broken: Vec<String>,
+}
+
+/// 把 [`export_users`] 导出的内容合并进本服务器的授权码文件。已有的不动；运行中的服务器几秒内自动生效
+pub fn import_users(path: &Path, text: &str, password: &str) -> Result<ImportReport, String> {
+    let json = voc_proto::backup::open(text, password, EXPORT_PURPOSE)?;
+    let incoming: Vec<CodeEntry> = serde_json::from_slice(&json).map_err(|_| "导出内容的格式不认识（可能是更新版本的 VOC 导出的）".to_string())?;
+    let mut entries = read_file(path)?;
+    let mut r = ImportReport::default();
+    for e in incoming {
+        if from_hex32(&e.psk).is_none() {
+            r.broken.push(e.id);
+        } else if let Some(old) = entries.iter().find(|o| o.id == e.id) {
+            if old.psk.eq_ignore_ascii_case(&e.psk) {
+                r.same += 1;
+            } else {
+                r.conflict.push(e.id);
+            }
+        } else {
+            entries.push(e);
+            r.added += 1;
+        }
+    }
+    if r.added > 0 {
+        write_file(path, &entries)?;
+    }
+    Ok(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn entry(id: &str, psk: &str) -> CodeEntry {
         CodeEntry { id: id.into(), psk: psk.into(), note: String::new(), created: 0, expires: None, revoked: false }
+    }
+
+    #[test]
+    fn export_import_users_merges_without_overwriting() {
+        let dir = std::env::temp_dir().join(format!("voc-users-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.json"), dir.join("b.json"));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+        generate(&a, 3, "朋友", Some(30)).unwrap();
+        set_revoked(&a, &read_file(&a).unwrap()[2].id, true).unwrap();
+        let (text, n) = export_users(&a, "correct horse").unwrap();
+        assert_eq!(n, 3);
+        let src = read_file(&a).unwrap();
+        assert!(!text.contains(&src[0].id) && !text.contains(&src[0].psk) && !text.contains("朋友"));
+        assert!(import_users(&b, &text, "wrong horse").is_err());
+        assert!(!b.exists(), "wrong password writes nothing");
+
+        // 新服务器上已经有一个自己的码，另有一个 ID 撞了但密钥不同
+        generate(&b, 1, "", None).unwrap();
+        let mut bl = read_file(&b).unwrap();
+        bl.push(CodeEntry { id: src[1].id.clone(), ..bl[0].clone() });
+        write_file(&b, &bl).unwrap();
+
+        let r = import_users(&b, &text, "correct horse").unwrap();
+        assert_eq!(r, ImportReport { added: 2, same: 0, conflict: vec![src[1].id.clone()], broken: vec![] });
+        let after = read_file(&b).unwrap();
+        assert_eq!(after.len(), 4);
+        let got = after.iter().find(|e| e.id == src[2].id).unwrap();
+        assert!(got.revoked && got.note == "朋友" && got.expires == src[2].expires && got.psk == src[2].psk);
+        assert_eq!(after.iter().find(|e| e.id == src[1].id).unwrap().psk, bl[0].psk, "conflict not overwritten");
+        // 再导一次：都已经有了
+        let r = import_users(&b, &text, "correct horse").unwrap();
+        assert_eq!((r.added, r.same, r.conflict.len()), (0, 2, 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

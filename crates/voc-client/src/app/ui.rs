@@ -2294,7 +2294,10 @@ impl eframe::App for App {
                 s.code.clear();
             }
         }
+        // 身份种子、授权码用 Windows 凭据保护加密后再写盘（第 41-6 项）
+        let plain = self.cfg.seal_secrets();
         eframe::set_value(storage, eframe::APP_KEY, &self.cfg);
+        self.cfg.restore_secrets(plain);
     }
 }
 

@@ -66,6 +66,7 @@ pub fn plan(members: &[Member], current: &HashMap<(u32, u32), u32>) -> Vec<Relay
         to: u32,
         server_ms: u32,
         cands: Vec<(u32, u32)>, // (预计单程 ms, via)
+        manual: bool,
     }
     let mut needs: Vec<Need> = Vec::new();
     for a in members {
@@ -73,7 +74,7 @@ pub fn plan(members: &[Member], current: &HashMap<(u32, u32), u32>) -> Vec<Relay
             continue; // 闭麦的人不发语音
         }
         for b in members {
-            if b.id == a.id || b.deafened || a.direct.contains(&b.id) || a.no_relay_to.contains(&b.id) {
+            if b.id == a.id || b.deafened || a.no_relay_to.contains(&b.id) {
                 continue;
             }
             if a.server_only.contains(&b.id) || b.server_only.contains(&a.id) {
@@ -87,6 +88,10 @@ pub fn plan(members: &[Member], current: &HashMap<(u32, u32), u32>) -> Vec<Relay
                 (Some(x), _) | (_, Some(x)) => Some(*x),
                 _ => None,
             };
+            // 已经直连的不用中转；但对方手动指定了经谁中转时，我这个方向也照他的走（0.6.1：以前只管指定的那一方说话）
+            if manual.is_none() && a.direct.contains(&b.id) {
+                continue;
+            }
             let mut cands: Vec<(u32, u32)> = members
                 .iter()
                 .filter(|r| r.id != a.id && r.id != b.id && r.slots > 0 && a.direct.contains(&r.id))
@@ -104,7 +109,7 @@ pub fn plan(members: &[Member], current: &HashMap<(u32, u32), u32>) -> Vec<Relay
                 continue;
             }
             cands.sort();
-            needs.push(Need { from: a.id, to: b.id, server_ms, cands });
+            needs.push(Need { from: a.id, to: b.id, server_ms, cands, manual: manual.is_some() });
         }
     }
     // 收益大的先分配名额
@@ -123,7 +128,7 @@ pub fn plan(members: &[Member], current: &HashMap<(u32, u32), u32>) -> Vec<Relay
         let pick = keep.or_else(|| n.cands.iter().find(|(_, via)| free(*via, &used)).copied());
         if let Some((ms, via)) = pick {
             *used.entry(via).or_default() += 1;
-            out.push(RelayRoute { from: n.from, to: n.to, via, ms, server_ms: n.server_ms });
+            out.push(RelayRoute { from: n.from, to: n.to, via, ms, server_ms: n.server_ms, manual: n.manual });
         }
     }
     out.sort();
@@ -172,8 +177,8 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert!(r.iter().all(|x| x.via == 4));
         // 经 4：20 + 24 + 4 = 48 ms；经服务器：120 + 140 = 260 ms
-        assert_eq!(r[0], RelayRoute { from: 1, to: 2, via: 4, ms: 48, server_ms: 260 });
-        assert_eq!(r[1], RelayRoute { from: 2, to: 1, via: 4, ms: 48, server_ms: 260 });
+        assert_eq!(r[0], RelayRoute { from: 1, to: 2, via: 4, ms: 48, server_ms: 260, manual: false });
+        assert_eq!(r[1], RelayRoute { from: 2, to: 1, via: 4, ms: 48, server_ms: 260, manual: false });
     }
 
     #[test]
@@ -270,6 +275,14 @@ mod tests {
         let mut ms = base();
         ms[1].server_only.insert(1);
         assert!(plan(&ms, &HashMap::new()).is_empty());
+        // 1、2 本来能直连（2 正在直连发给 1）：1 指定经 3，两个方向都改经 3，路线标成手动
+        let mut ms = base();
+        ms[0].direct.insert(2);
+        ms[1].direct.insert(1);
+        let r = plan(&ms, &HashMap::new());
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r.iter().all(|x| x.via == 3 && x.manual), "{r:?}");
+        assert!(r.iter().any(|x| x.from == 2 && x.to == 1), "the other side follows the choice too: {r:?}");
     }
 
     #[test]

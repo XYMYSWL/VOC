@@ -709,6 +709,18 @@ struct Peers {
 
 /// 我的屏幕共享选了「只走 P2P」：画面、补发、鼠标、共享声音都不发给服务器（伴奏、语音不受影响）
 pub static SHARE_P2P_ONLY: AtomicBool = AtomicBool::new(false);
+/// UDP 发送失败的次数（诊断 / 测试日志）
+pub static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// 收包线程：处理过的包数、处理一个包最久用了多少微秒（测试日志读一次清零）
+pub static RECV_PKTS: AtomicU64 = AtomicU64::new(0);
+pub static SENT_PKTS: AtomicU64 = AtomicU64::new(0);
+pub static RECV_MAX_US: AtomicU64 = AtomicU64::new(0);
+struct RecvTimer(Instant);
+impl Drop for RecvTimer {
+    fn drop(&mut self) {
+        RECV_MAX_US.fetch_max(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
 
 /// 每秒最多放行多少次（陌生地址来的包挨个试解密用）
 #[derive(Default)]
@@ -874,6 +886,9 @@ impl Link {
         }
         if self.sock.send_to(buf, wire(to, self.dual)).is_ok() {
             self.sent_bytes.fetch_add(buf.len() as u64 + 28, Ordering::Relaxed);
+            SENT_PKTS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SEND_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1149,7 +1164,7 @@ impl Link {
 
     /// 发送一帧视频的全部分片（low = 低画质层）：这一层能 P2P 直连的观看者直接发，其余交给服务器按层中转。
     /// 数据分片记下来，观看者请求补发时重发
-    pub fn send_video(&self, frags: &[Vec<u8>], buf: &mut Vec<u8>, low: bool) {
+    pub fn send_video(&self, frags: &[Vec<u8>], _buf: &mut Vec<u8>, low: bool) {
         let watchers = self.layer_watchers(low);
         if watchers.is_empty() {
             return;
@@ -1167,17 +1182,20 @@ impl Link {
         let mut direct = 0;
         if self.p2p_active() {
             let chosen = self.alloc.lock().unwrap().1.clone();
-            let mut peers = self.peers.lock().unwrap();
-            for id in watchers.iter().filter(|i| chosen.contains(i)) {
-                let Some(p) = peers.map.get_mut(id) else { continue };
-                if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
-                    for f in frags {
-                        s.seal(udp::VIDEO, &udp::server_video(self.my_id, f), buf);
-                        self.send_paced(path, buf);
-                    }
-                    direct += 1;
+            let targets: Vec<(u32, SocketAddr)> = {
+                let peers = self.peers.lock().unwrap();
+                watchers
+                    .iter()
+                    .filter(|i| chosen.contains(i))
+                    .filter_map(|id| peers.map.get(id).filter(|p| p.confirmed && p.sealer.is_some()).and_then(|p| p.path).map(|path| (*id, path)))
+                    .collect()
+            };
+            for (id, path) in &targets {
+                for f in frags {
+                    self.send_paced(*path, SealFor::Peer(*id), udp::VIDEO, udp::server_video(self.my_id, f));
                 }
             }
+            direct = targets.len();
         }
         let dual = self.dual_video.lock().unwrap().iter().filter(|i| watchers.contains(i)).count();
         // 经观看者转发能送到的人（转发的人得是我这次直连发到的）
@@ -1196,8 +1214,7 @@ impl Link {
         let udp_ok = self.udp_ok.load(Ordering::Relaxed);
         for f in frags {
             if udp_ok {
-                self.sealer.lock().unwrap().seal(udp::VIDEO, f, buf);
-                self.send_paced(self.server, buf);
+                self.send_paced(self.server, SealFor::Server, udp::VIDEO, f.clone());
             } else {
                 self.tcp_send(Outgoing::Video(f.clone()));
             }
@@ -1299,23 +1316,45 @@ impl Link {
 
     /// 画面包交给匀速发送线程（队列没起来时直接发）。每个目标一个队列，总字节数有上限：
     /// 满了丢这个包（画面会靠补发 / 恢复帧接上），不让延迟越积越多（0.6：第 41-1 项）
-    fn send_paced(&self, to: SocketAddr, pkt: &[u8]) {
-        crate::traffic::sent(crate::traffic::Cat::Share, pkt.len());
+    /// 调用时不能拿着 peers 锁（没开匀速发送时当场加密要用它）
+    fn send_paced(&self, to: SocketAddr, seal: SealFor, kind: u8, data: Vec<u8>) {
+        crate::traffic::sent(crate::traffic::Cat::Share, data.len());
+        let pkt = Paced { seal, kind, data };
         if !self.pacer.running.load(Ordering::Relaxed) {
-            self.send_raw(pkt, to);
+            self.send_sealed(to, &pkt, &mut Vec::new());
             return;
         }
         let rate = self.pace_rate();
         let mut q = self.pacer.q.lock().unwrap();
         let cap = ((rate / 8.0) * PACE_QUEUE_SECS) as usize;
-        if q.bytes + pkt.len() > cap.max(PACE_QUEUE_MIN) {
+        if q.bytes + pkt.data.len() > cap.max(PACE_QUEUE_MIN) {
             drop(q);
             self.pace_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        q.push(to, pkt.to_vec(), Instant::now());
+        q.push(to, pkt, Instant::now());
         drop(q);
         self.pacer.wake.notify_one();
+    }
+
+    /// 排队的画面包轮到了：这时才加密（编号按发出顺序），发给服务器 / 对端当前的线路
+    fn send_sealed(&self, to: SocketAddr, p: &Paced, buf: &mut Vec<u8>) {
+        match p.seal {
+            SealFor::Server => {
+                self.sealer.lock().unwrap().seal(p.kind, &p.data, buf);
+                self.send_raw(buf, to);
+            }
+            SealFor::Peer(id) => {
+                let path = {
+                    let mut peers = self.peers.lock().unwrap();
+                    let Some(peer) = peers.map.get_mut(&id) else { return };
+                    let Some(s) = peer.sealer.as_mut() else { return };
+                    s.seal(p.kind, &p.data, buf);
+                    peer.path.unwrap_or(to)
+                };
+                self.send_raw(buf, path);
+            }
+        }
     }
 
     /// 观看者的长期参考帧确认 / 恢复请求
@@ -1413,15 +1452,10 @@ impl Link {
             .map(|e| (e.4, e.5.clone()))
             .collect();
         let mut buf = Vec::new();
-        {
-            let mut peers = self.peers.lock().unwrap();
-            if let Some(p) = peers.map.get_mut(&c) {
-                if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
-                    for (_, pl) in &found {
-                        s.seal(udp::VIDEO, pl, &mut buf);
-                        self.send_paced(path, &buf);
-                    }
-                }
+        let path = self.peers.lock().unwrap().map.get(&c).filter(|p| p.confirmed && p.sealer.is_some()).and_then(|p| p.path);
+        if let Some(path) = path {
+            for (_, pl) in &found {
+                self.send_paced(path, SealFor::Peer(c), udp::VIDEO, pl.clone());
             }
         }
         // 我这儿没有的（或整帧都要）：直连向共享者要
@@ -1458,23 +1492,19 @@ impl Link {
             }
         };
         self.video_frags_nacked.fetch_add(frags.len() as u32, Ordering::Relaxed);
-        let mut buf = Vec::new();
         match peer {
             Some(id) => {
-                let mut peers = self.peers.lock().unwrap();
-                let Some(p) = peers.map.get_mut(&id) else { return };
-                if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
+                let path = self.peers.lock().unwrap().map.get(&id).filter(|p| p.confirmed && p.sealer.is_some()).and_then(|p| p.path);
+                if let Some(path) = path {
                     for f in &frags {
-                        s.seal(udp::VIDEO, &udp::server_video(self.my_id, f), &mut buf);
-                        self.send_paced(path, &buf);
+                        self.send_paced(path, SealFor::Peer(id), udp::VIDEO, udp::server_video(self.my_id, f));
                     }
                 }
             }
             None if SHARE_P2P_ONLY.load(Ordering::Relaxed) => {} // 只走 P2P：不经服务器补发
             None => {
-                for f in &frags {
-                    self.sealer.lock().unwrap().seal(udp::VIDEO, f, &mut buf);
-                    self.send_paced(self.server, &buf);
+                for f in frags {
+                    self.send_paced(self.server, SealFor::Server, udp::VIDEO, f);
                 }
             }
         }
@@ -1976,10 +2006,12 @@ impl Link {
         let prefs = self.route_prefs.lock().unwrap().clone();
         let pref = |id: &u32| prefs.get(id).copied().unwrap_or_default();
         let up = |id: &u32| peers.map.get(id).is_some_and(|p| p.confirmed && p.alive(now));
-        let forced: Vec<u32> = others.iter().copied().filter(|id| pref(id).voice_direct && up(id)).collect();
+        // 对方（或我）手动指定了经谁中转、服务器排了这条线：我这个方向也不直连，照指定的走（两个方向一致）
+        let manual_relay: Vec<u32> = self.relays.lock().unwrap().iter().filter(|r| r.manual && r.from == self.my_id).map(|r| r.to).collect();
+        let forced: Vec<u32> = others.iter().copied().filter(|id| pref(id).voice_direct && up(id) && !manual_relay.contains(id)).collect();
         // 语音不能直连的人（走服务器 / 不透露 IP / 指定了经谁中转）、服务器让我们改回服务器转发的人
         let fallback = self.server_fallback.lock().unwrap().clone();
-        let no_voice: Vec<u32> = others.iter().copied().filter(|id| pref(id).voice_not_direct() || fallback.contains(id)).collect();
+        let no_voice: Vec<u32> = others.iter().copied().filter(|id| pref(id).voice_not_direct() || fallback.contains(id) || manual_relay.contains(id)).collect();
         // 其余的人按上行预算分配：已打通的候选按延迟从低到高
         let srv = self.server_rtt.load(Ordering::Relaxed);
         let by_rtt = |ids: &[u32]| {
@@ -2993,6 +3025,8 @@ pub fn connect(
             };
             let from = norm(from);
             let pkt = &buf[..n];
+            RECV_PKTS.fetch_add(1, Ordering::Relaxed);
+            let _timer = RecvTimer(Instant::now());
             if Some(from) == l.probe {
                 if let Some((udp::PONG, data)) = opener.open(pkt) {
                     if let Some((_, Some(addr))) = udp::read_pong(&data) {
@@ -3081,9 +3115,26 @@ pub fn connect(
 
 /// 匀速发送队列（0.6）：每个目标（观看者 / 服务器）一个队列，按字节轮流发（亏额轮询 DRR，第 42-2 项）：
 /// 某个观看者一下子要很多补发时，别人的实时画面不用排在整批补发后面
+/// 排队的画面包：存明文，真正发出时才加密（0.6.1）。
+/// 以前是先加密再排队：关键帧一下子排进几百个包时，后加密的语音 / ping / 补发请求不排队、先到，
+/// 接收端（服务器 / 对端）的防重放窗口只有 64 个编号，排在后面的画面包就被当成重放悄悄丢掉
+/// （语音也走服务器时，每个关键帧都丢几十上百个包）。现在加密编号按真正发出的顺序递增
+struct Paced {
+    seal: SealFor,
+    kind: u8,
+    data: Vec<u8>,
+}
+
+/// 用谁的密钥加密：服务器，或者直连的某个队友（发的时候按他当前的线路发）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SealFor {
+    Server,
+    Peer(u32),
+}
+
 #[derive(Default)]
 struct PaceQueue {
-    queues: HashMap<SocketAddr, VecDeque<(Instant, Vec<u8>)>>,
+    queues: HashMap<SocketAddr, VecDeque<(Instant, Paced)>>,
     /// 轮到谁（有包的目标按到达顺序轮）
     order: VecDeque<SocketAddr>,
     deficit: HashMap<SocketAddr, usize>,
@@ -3092,8 +3143,8 @@ struct PaceQueue {
 }
 
 impl PaceQueue {
-    fn push(&mut self, to: SocketAddr, pkt: Vec<u8>, now: Instant) {
-        self.bytes += pkt.len();
+    fn push(&mut self, to: SocketAddr, pkt: Paced, now: Instant) {
+        self.bytes += pkt.data.len();
         let q = self.queues.entry(to).or_default();
         if q.is_empty() && !self.order.contains(&to) {
             self.order.push_back(to);
@@ -3102,16 +3153,16 @@ impl PaceQueue {
     }
 
     /// 按 DRR 取下一个要发的包；过期的（排太久的）丢掉并计数
-    fn pop(&mut self, now: Instant, dropped: &mut u32) -> Option<(SocketAddr, Vec<u8>)> {
+    fn pop(&mut self, now: Instant, dropped: &mut u32) -> Option<(SocketAddr, Paced)> {
         let mut spins = 0;
         while let Some(to) = self.order.front().copied() {
             let q = self.queues.entry(to).or_default();
             while q.front().is_some_and(|(t, _)| now.duration_since(*t) > PACE_STALE) {
                 let (_, p) = q.pop_front().unwrap();
-                self.bytes -= p.len();
+                self.bytes -= p.data.len();
                 *dropped += 1;
             }
-            let Some(len) = q.front().map(|(_, p)| p.len()) else {
+            let Some(len) = q.front().map(|(_, p)| p.data.len()) else {
                 self.order.pop_front();
                 self.deficit.remove(&to);
                 continue;
@@ -3129,7 +3180,7 @@ impl PaceQueue {
             }
             *d -= len;
             let (_, p) = q.pop_front().unwrap();
-            self.bytes -= p.len();
+            self.bytes -= p.data.len();
             return Some((to, p));
         }
         None
@@ -3218,6 +3269,7 @@ fn spawn_pacer(link: Arc<Link>) {
     let _ = std::thread::Builder::new().name("video-pacer".into()).spawn(move || {
         let mut tokens = PACE_BURST as f64;
         let mut last = Instant::now();
+        let mut buf = Vec::with_capacity(1500);
         while !link.closed.load(Ordering::Relaxed) {
             let next = {
                 let mut q = link.pacer.q.lock().unwrap();
@@ -3233,19 +3285,21 @@ fn spawn_pacer(link: Arc<Link>) {
                 got
             };
             let Some((to, pkt)) = next else { continue };
+            // 加密后的大小（明文 + 编号 8 + 类型长度 3 + 随机填充平均 12 + 认证标签 16）
+            let len = (pkt.data.len() + 39) as f64;
             let rate = link.pace_rate() / 8.0;
             let now = Instant::now();
             tokens = (tokens + now.duration_since(last).as_secs_f64() * rate).min(PACE_BURST as f64);
             last = now;
-            if tokens < pkt.len() as f64 {
-                let wait = (pkt.len() as f64 - tokens) / rate;
+            if tokens < len {
+                let wait = (len - tokens) / rate;
                 std::thread::sleep(Duration::from_secs_f64(wait));
                 let now = Instant::now();
                 tokens += now.duration_since(last).as_secs_f64() * rate;
                 last = now;
             }
-            tokens -= pkt.len() as f64;
-            link.send_raw(&pkt, to);
+            tokens -= len;
+            link.send_sealed(to, &pkt, &mut buf);
         }
         link.pacer.running.store(false, Ordering::Relaxed);
     });
@@ -3622,7 +3676,7 @@ mod testnet_tests {
 
 #[cfg(test)]
 mod pace_tests {
-    use super::{PaceQueue, PACE_STALE};
+    use super::{PaceQueue, Paced, SealFor, PACE_STALE};
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
@@ -3632,11 +3686,12 @@ mod pace_tests {
         let (a, b): (SocketAddr, SocketAddr) = ("1.1.1.1:1".parse().unwrap(), "2.2.2.2:2".parse().unwrap());
         let mut q = PaceQueue::default();
         let t = Instant::now();
+        let pk = |x: u8| Paced { seal: SealFor::Server, kind: 0, data: vec![x; 1100] };
         for _ in 0..100 {
-            q.push(a, vec![0; 1100], t);
+            q.push(a, pk(0), t);
         }
         for _ in 0..3 {
-            q.push(b, vec![1; 1100], t);
+            q.push(b, pk(1), t);
         }
         let mut dropped = 0;
         let first: Vec<SocketAddr> = (0..8).map(|_| q.pop(t, &mut dropped).unwrap().0).collect();
@@ -4069,8 +4124,8 @@ mod tests {
         }
         // 服务器下发的路线（双向都经 R）
         let routes = vec![
-            RelayRoute { from: 3, to: 7, via: 5, ms: 20, server_ms: 120 },
-            RelayRoute { from: 7, to: 3, via: 5, ms: 20, server_ms: 120 },
+            RelayRoute { from: 3, to: 7, via: 5, ms: 20, server_ms: 120, manual: false },
+            RelayRoute { from: 7, to: 3, via: 5, ms: 20, server_ms: 120, manual: false },
         ];
         for l in [&la, &lr, &lb] {
             l.set_relays(routes.clone());

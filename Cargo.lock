@@ -5411,7 +5411,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voc-client"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "arboard",
  "cpal",
@@ -5440,16 +5440,17 @@ dependencies = [
 
 [[package]]
 name = "voc-denoise-example"
-version = "0.6.0"
+version = "0.6.1"
 
 [[package]]
 name = "voc-proto"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "base64 0.23.1",
  "chacha20poly1305",
  "getrandom 0.4.3",
  "hkdf",
+ "hmac",
  "ml-dsa",
  "ml-kem",
  "reed-solomon-erasure",
@@ -5460,7 +5461,7 @@ dependencies = [
 
 [[package]]
 name = "voc-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5471,7 +5472,7 @@ dependencies = [
 
 [[package]]
 name = "voc-setup"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "eframe",
  "png 0.18.1",

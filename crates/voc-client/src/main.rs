@@ -18,11 +18,13 @@ mod notify;
 mod opusx;
 mod pathcache;
 mod portmap;
+mod secret;
 mod theme;
 mod traffic;
 mod tray;
 mod update;
 mod vrecv;
+mod wifi;
 mod video;
 mod voice;
 

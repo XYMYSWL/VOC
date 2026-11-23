@@ -200,6 +200,8 @@ cat > "$ADMIN" <<EOF
 #   voc gen-code [-n 数量] [--note 备注] [--days 天数]   生成授权码
 #   voc list-codes                                       查看授权码
 #   voc revoke-code <ID> / voc restore-code <ID>          吊销 / 恢复
+#   voc export-users > 文件                              导出全部授权码（用密码加密，换服务器用）
+#   voc import-users 文件                                在新服务器上导入授权码（已有的不动）
 #   voc status                                           运行状态（在线的人、谁在共享、转发带宽、NAT 探测端口）
 #   voc logs | restart | stop | start                    服务管理
 #   voc config                                           编辑配置
@@ -245,6 +247,18 @@ case "\${1:-}" in
     upgrade)
         [ -n "\${2:-}" ] && export VOC_VERSION="\$2"
         exec bash $LIB/get.sh --upgrade ;;
+    export-users|import-users)
+        # 导入：文件由 root 打开后从标准输入交给服务账号（服务账号可能读不了你的文件）；密码在终端里输
+        if [ "\$1" = import-users ] && [ -n "\${2:-}" ] && [ "\$2" != "-" ]; then
+            [ -r "\$2" ] || { echo "读不了文件：\$2"; exit 1; }
+            exec < "\$2"
+        fi
+        cd $DATA
+        if command -v runuser >/dev/null 2>&1; then
+            exec runuser -u $SVC_USER -- $BIN "\$1" - --codes $CODES
+        else
+            exec su -s /bin/sh $SVC_USER -c '$BIN "\$1" - --codes $CODES' -- sh "\$1"
+        fi ;;
     gen-code|list-codes|revoke-code|restore-code)
         cd $DATA
         if command -v runuser >/dev/null 2>&1; then
@@ -252,7 +266,7 @@ case "\${1:-}" in
         else
             exec su -s /bin/sh $SVC_USER -c '$BIN "\$@" --codes $CODES' -- sh "\$@"
         fi ;;
-    *) sed -n '2,11p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,13p' "\$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
 EOF
 chmod 0755 "$ADMIN"
@@ -321,6 +335,7 @@ echo "常用命令："
 echo "  sudo voc gen-code --note 小明        给小明生成授权码"
 echo "  sudo voc gen-code -n 5 --days 30     生成 5 个 30 天有效的授权码"
 echo "  sudo voc list-codes / revoke-code <ID>"
+echo "  sudo voc export-users > 授权码备份.txt   换服务器时导出授权码（新服务器上 sudo voc import-users 授权码备份.txt）"
 echo "  sudo voc status / logs / restart"
 echo "  sudo voc video-limit 1.5             服务器带宽小：转发屏幕共享画面最多 1.5 Mbps（off = 不限）"
 echo "  sudo voc upgrade                     升级到最新版（保留授权码和配置）"

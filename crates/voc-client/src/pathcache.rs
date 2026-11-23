@@ -26,7 +26,7 @@ fn file() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn protect(data: &[u8], encrypt: bool) -> Option<Vec<u8>> {
+pub(crate) fn protect(data: &[u8], encrypt: bool) -> Option<Vec<u8>> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN};
     let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
@@ -45,7 +45,7 @@ fn protect(data: &[u8], encrypt: bool) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(windows))]
-fn protect(_data: &[u8], _encrypt: bool) -> Option<Vec<u8>> {
+pub(crate) fn protect(_data: &[u8], _encrypt: bool) -> Option<Vec<u8>> {
     None
 }
 

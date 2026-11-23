@@ -395,16 +395,26 @@ impl DatagramSealer {
     }
 }
 
+/// 防重放窗口：比收到的最大编号小这么多以内、没收过的包还收（0.6.1 起 1024；以前 64，
+/// 屏幕共享关键帧排队时后加密的包先到，排在后面的画面包会被当成重放丢掉）
+pub const REPLAY_WINDOW: u64 = 1024;
+
 pub struct DatagramOpener {
     aead: ChaCha20Poly1305,
     hp: [u8; 32],
     max: Option<u64>,
-    window: u64,
+    /// 按「编号 % REPLAY_WINDOW」记收没收过（环形）
+    seen: [u64; (REPLAY_WINDOW / 64) as usize],
 }
 
 impl DatagramOpener {
     pub fn new(key: &[u8; 32], hp: &[u8; 32]) -> Self {
-        Self { aead: aead(key), hp: *hp, max: None, window: 0 }
+        Self { aead: aead(key), hp: *hp, max: None, seen: [0; (REPLAY_WINDOW / 64) as usize] }
+    }
+
+    fn bit(ctr: u64) -> (usize, u64) {
+        let i = ctr % REPLAY_WINDOW;
+        ((i / 64) as usize, 1u64 << (i % 64))
     }
 
     fn fresh(&self, ctr: u64) -> bool {
@@ -412,25 +422,32 @@ impl DatagramOpener {
             None => true,
             Some(m) if ctr > m => true,
             Some(m) => {
-                let back = m - ctr;
-                back < 64 && self.window & (1u64 << back) == 0
+                let (w, b) = Self::bit(ctr);
+                m - ctr < REPLAY_WINDOW && self.seen[w] & b == 0
             }
         }
     }
 
     fn mark(&mut self, ctr: u64) {
         match self.max {
-            None => {
+            Some(m) if ctr <= m => {}
+            Some(m) if ctr - m < REPLAY_WINDOW => {
+                // 往前走：中间跳过的编号还没收过，清掉它们在环里的旧记录
+                for c in m + 1..ctr {
+                    let (w, b) = Self::bit(c);
+                    self.seen[w] &= !b;
+                }
+                let (w, b) = Self::bit(ctr);
+                self.seen[w] &= !b;
                 self.max = Some(ctr);
-                self.window = 1;
             }
-            Some(m) if ctr > m => {
-                let shift = ctr - m;
-                self.window = if shift >= 64 { 0 } else { self.window << shift } | 1;
+            _ => {
+                self.seen = [0; (REPLAY_WINDOW / 64) as usize];
                 self.max = Some(ctr);
             }
-            Some(m) => self.window |= 1u64 << (m - ctr),
         }
+        let (w, b) = Self::bit(ctr);
+        self.seen[w] |= b;
     }
 
     /// 成功返回 (kind, data)
@@ -537,5 +554,40 @@ mod tests {
         assert!(rx.open(&bad).is_none()); // 篡改
         // 错误密钥打不开（服务器靠这个在多个用户间试解）
         assert!(DatagramOpener::new(&[1; 32], &hp).open(&p2).is_none());
+    }
+
+    /// 关键帧排队时后加密的包先到几百个：排在后面的照样收；太旧的、收过的不收；环形记录跨过一圈也对
+    #[test]
+    fn replay_window_tolerates_large_reordering() {
+        let (k, hp) = ([7u8; 32], [8u8; 32]);
+        let mut tx = DatagramSealer::new(&k, &hp);
+        let mut rx = DatagramOpener::new(&k, &hp);
+        let pkts: Vec<Vec<u8>> = (0..3000)
+            .map(|i| {
+                let mut p = Vec::new();
+                tx.seal(1, &(i as u32).to_le_bytes(), &mut p);
+                p
+            })
+            .collect();
+        // 0..500 先排队；500..900 先到
+        for p in &pkts[500..900] {
+            assert!(rx.open(p).is_some());
+        }
+        for p in &pkts[0..500] {
+            assert!(rx.open(p).is_some(), "reordered by up to 900 is accepted");
+        }
+        for p in &pkts[0..900] {
+            assert!(rx.open(p).is_none(), "replays rejected");
+        }
+        // 往前跳很远：太旧的不收
+        assert!(rx.open(&pkts[2999]).is_some());
+        assert!(rx.open(&pkts[1000]).is_none(), "older than the window");
+        assert!(rx.open(&pkts[2500]).is_some());
+        assert!(rx.open(&pkts[2500]).is_none());
+        // 一个一个往前走过整圈，环里的旧记录不会把新包误当重放
+        let mut rx = DatagramOpener::new(&k, &hp);
+        for (i, p) in pkts.iter().enumerate() {
+            assert!(rx.open(p).is_some(), "in-order packet {i}");
+        }
     }
 }

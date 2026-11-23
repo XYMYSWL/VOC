@@ -42,6 +42,8 @@ VOC 服务器 —— Linux 安装说明
     sudo voc list-codes                    查看所有授权码
     sudo voc revoke-code <ID>              吊销（在线的人会被踢下线）
     sudo voc restore-code <ID>             恢复
+    sudo voc export-users > 授权码备份.txt  换服务器时导出全部授权码（会让你设一个密码，内容加密）
+    sudo voc import-users 授权码备份.txt    在新服务器上导入（输同一个密码），大家原来的授权码照样能用
     sudo voc status                        查看运行状态
     sudo voc logs                          实时查看日志（Ctrl+C 退出）
     sudo voc restart                       重启
