@@ -93,6 +93,7 @@ struct Client {
     useal: DatagramSealer,
     uopen: DatagramOpener,
     probe_port: u16,
+    resume: String,
 }
 
 #[derive(Debug)]
@@ -116,9 +117,15 @@ impl Client {
     }
 
     fn connect_to(host: &str, port: u16, code: &str, name: &str) -> Result<Client, ConnErr> {
+        Self::connect_with(host, port, code, name, false, None)
+    }
+
+    /// can_resume / resume：断线恢复（第 37-2 项）
+    fn connect_with(host: &str, port: u16, code: &str, name: &str, can_resume: bool, resume: Option<(u32, String)>) -> Result<Client, ConnErr> {
         let code = AuthCode::parse(code).unwrap();
         let mut s = TcpStream::connect((host, port)).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // 全部测试一起跑时机器很忙，服务器握手可能回得慢：多等一会儿
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut hs = ClientHandshake::start(code.psk());
         s.write_all(hs.first_flight()).unwrap();
         let mut prefix = [0u8; SERVER_PREFIX_LEN];
@@ -142,12 +149,24 @@ impl Client {
             useal: DatagramSealer::new(&keys.udp_c2s, &keys.udp_c2s_hp),
             uopen: DatagramOpener::new(&keys.udp_s2c, &keys.udp_s2c_hp),
             probe_port: 0,
+            resume: String::new(),
         };
-        c.send(ClientMsg::Hello { name: name.into(), version: PROTOCOL_VERSION });
+        c.send(ClientMsg::Hello {
+            name: name.into(),
+            version: PROTOCOL_VERSION,
+            can_resume,
+            resume: resume.map(|(id, token)| voc_proto::ResumeToken { id, token }),
+        });
         match c.recv_json() {
-            ServerMsg::Welcome { user_id, probe_port, .. } => {
+            ServerMsg::Welcome { user_id, probe_port, resume, .. } => {
                 c.id = user_id;
                 c.probe_port = probe_port;
+                c.resume = resume;
+                Ok(c)
+            }
+            ServerMsg::Resumed { user_id } => {
+                c.id = user_id;
+                c.resume = "resumed".into();
                 Ok(c)
             }
             ServerMsg::Error { message } => Err(ConnErr::Rejected(message)),
@@ -562,7 +581,7 @@ fn p2p_signaling_punching_and_direct_voice() {
     assert_eq!(a_rx.open(&pkt), Some((p2p::PUNCH_ACK, b"t".to_vec())));
 
     // 已直连 bob：服务器只给 carol 转发
-    a.send(ClientMsg::DirectPeers { ids: vec![b.id, c.id], video: vec![] }); // carol 不在 P2P 名单里，应被忽略
+    a.send(ClientMsg::DirectPeers { ids: vec![b.id, c.id], video: vec![], share_audio: None }); // carol 不在 P2P 名单里，应被忽略
     a.send(ClientMsg::Ping);
     a.wait_for(|m| matches!(m, ServerMsg::Pong));
     let f = frame();
@@ -898,6 +917,43 @@ fn channel_capacity_is_20() {
     last.wait_state(|u| u.iter().any(|x| x.id == id && x.channel_id == Some(1)));
 }
 
+/// 第 37-2 项：断线后 20 秒内带凭证回来，接回原来的编号；这期间别人看不到他离开、UDP 语音照常转发；
+/// 凭证不对就拒绝；主动 Bye 的马上移除
+#[test]
+fn resume_after_disconnect() {
+    let srv = Server::start(41);
+    let codes = srv.gen_codes(2);
+    let mut a = Client::connect_with("127.0.0.1", srv.port, &codes[0], "alice", true, None).unwrap();
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
+    assert_eq!(a.resume.len(), 32, "新客户端拿到凭证");
+    assert!(b.resume.is_empty(), "旧客户端没有凭证");
+    for x in [&mut a, &mut b] {
+        x.enable_udp();
+        x.send(ClientMsg::JoinChannel { channel_id: 1 });
+    }
+    let aid = a.id;
+    b.wait_state(|u| u.iter().filter(|x| x.channel_id == Some(1)).count() == 2);
+    // a 的 TCP 断了（换网络）：服务器先保留
+    a.s.shutdown(std::net::Shutdown::Both).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    a.udp_send(udp::VOICE, &udp::client_voice(1, b"opus"));
+    assert_eq!(b.udp_recv().map(|x| x.0), Some(udp::VOICE), "断开期间 UDP 语音照常转发");
+    // 凭证不对：拒绝
+    match Client::connect_with("127.0.0.1", srv.port, &codes[0], "alice", true, Some((aid, "00".repeat(16)))) {
+        Err(ConnErr::Rejected(m)) => assert_eq!(m, voc_proto::RESUME_FAILED),
+        Err(ConnErr::Silence) => panic!("错的凭证应该被拒绝：服务器没回应"),
+        Ok(c) => panic!("错的凭证应该被拒绝：却登录成功了（#{}，凭证 {:?}）", c.id, c.resume),
+    }
+    // 带对的凭证回来：同一个编号，还在频道里
+    let token = a.resume.clone();
+    let mut a2 = Client::connect_with("127.0.0.1", srv.port, &codes[0], "alice", true, Some((aid, token))).unwrap();
+    assert_eq!((a2.id, a2.resume.as_str()), (aid, "resumed"));
+    a2.wait_state(|u| u.iter().any(|x| x.id == aid && x.channel_id == Some(1)));
+    // 主动退出：马上移除
+    a2.send(ClientMsg::Bye);
+    b.wait_state(|u| u.iter().all(|x| x.id != aid));
+}
+
 #[test]
 fn voice_and_video_direct_lists_are_independent() {
     let srv = Server::start(8);
@@ -922,7 +978,7 @@ fn voice_and_video_direct_lists_are_independent() {
     };
 
     // 画面直连、语音中转
-    a.send(ClientMsg::DirectPeers { ids: vec![], video: vec![bid] });
+    a.send(ClientMsg::DirectPeers { ids: vec![], video: vec![bid], share_audio: None });
     sync(&mut a);
     a.udp_send(udp::VIDEO, &frag);
     assert!(b.udp_recv().is_none(), "video must not be relayed to a video-direct peer");
@@ -930,7 +986,7 @@ fn voice_and_video_direct_lists_are_independent() {
     assert_eq!(b.udp_recv().map(|x| x.0), Some(udp::VOICE), "voice still relayed");
 
     // 反过来：语音直连、画面中转
-    a.send(ClientMsg::DirectPeers { ids: vec![bid], video: vec![] });
+    a.send(ClientMsg::DirectPeers { ids: vec![bid], video: vec![], share_audio: None });
     sync(&mut a);
     a.udp_send(udp::VOICE, &udp::client_voice(2, b"opus"));
     assert!(b.udp_recv().is_none(), "voice must not be relayed to a voice-direct peer");
@@ -940,7 +996,49 @@ fn voice_and_video_direct_lists_are_independent() {
     // 旧版客户端不带 video 字段：画面照常中转
     let raw = r#"{"type":"direct_peers","ids":[]}"#;
     let old: ClientMsg = serde_json::from_str(raw).unwrap();
-    assert_eq!(old, ClientMsg::DirectPeers { ids: vec![], video: vec![] });
+    assert_eq!(old, ClientMsg::DirectPeers { ids: vec![], video: vec![], share_audio: None });
+}
+
+/// 第 54 项：共享声音单独的直连名单。没报（旧客户端）跟画面走；报了就按它，和画面无关
+#[test]
+fn share_audio_direct_list_is_separate() {
+    let srv = Server::start(40);
+    let codes = srv.gen_codes(2);
+    let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
+    let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
+    for x in [&mut a, &mut b] {
+        x.enable_udp();
+        x.send(ClientMsg::P2pEnable { local_addrs: vec![], nat: None });
+        x.send(ClientMsg::JoinChannel { channel_id: 1 });
+    }
+    let (aid, bid) = (a.id, b.id);
+    a.wait_for(|m| matches!(m, ServerMsg::Peers { peers } if peers.iter().any(|p| p.id == bid)));
+    a.send(ClientMsg::ShareStart { desc: "1080p60".into(), audio: true, simulcast: false, rtx: false, bps: 0, p2p_only: false });
+    b.wait_state(|u| u.iter().any(|x| x.id == aid && x.sharing.is_some()));
+    b.send(ClientMsg::Watch { target: aid, on: true, low: false, route: 0, cursor: false });
+    a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if ids == &vec![bid]));
+    let sync = |a: &mut Client| {
+        a.send(ClientMsg::Ping);
+        a.wait_for(|m| matches!(m, ServerMsg::Pong));
+    };
+    let mut seq = 0u16;
+    let mut audio = |a: &mut Client, b: &mut Client| {
+        seq += 1;
+        a.udp_send(udp::SHARE_AUDIO, &udp::client_voice(seq, b"opus"));
+        b.udp_recv().map(|x| x.0)
+    };
+    // 旧客户端：画面直连 → 共享声音也不转
+    a.send(ClientMsg::DirectPeers { ids: vec![], video: vec![bid], share_audio: None });
+    sync(&mut a);
+    assert_eq!(audio(&mut a, &mut b), None);
+    // 新客户端：画面直连，但共享声音选了「经服务器」（名单为空）→ 照转
+    a.send(ClientMsg::DirectPeers { ids: vec![], video: vec![bid], share_audio: Some(vec![]) });
+    sync(&mut a);
+    assert_eq!(audio(&mut a, &mut b), Some(udp::SHARE_AUDIO));
+    // 画面经服务器，共享声音直连 → 不转
+    a.send(ClientMsg::DirectPeers { ids: vec![], video: vec![], share_audio: Some(vec![bid]) });
+    sync(&mut a);
+    assert_eq!(audio(&mut a, &mut b), None);
 }
 
 /// 按听众保护语音（0.6）：bob 报告经服务器收语音丢包 20% → 服务器只给 bob 每包多发一份，carol 照常一份
@@ -1008,7 +1106,7 @@ fn voice_fallback_when_listener_does_not_hear() {
         manual_via: vec![],
         voice_loss: 0,
     };
-    a.send(ClientMsg::DirectPeers { ids: vec![ib], video: vec![] });
+    a.send(ClientMsg::DirectPeers { ids: vec![ib], video: vec![], share_audio: None });
     // 直连：服务器不转
     a.send(stats(ib, true, vec![]));
     a.send(ClientMsg::Ping);
@@ -1048,9 +1146,9 @@ fn member_relay_is_planned_and_server_stops_forwarding() {
     }
     let (ia, ib, ir) = (a.id, b.id, r.id);
     let stat = |id: u32| PeerStat { id, rtt: 20, loss: 0, jitter: 2 };
-    a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
-    b.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![] });
-    r.send(ClientMsg::DirectPeers { ids: vec![ia, ib], video: vec![] });
+    a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![], share_audio: None });
+    b.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![], share_audio: None });
+    r.send(ClientMsg::DirectPeers { ids: vec![ia, ib], video: vec![], share_audio: None });
     a.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![], video_relay_bps: 0, talking: false, heard: vec![], manual_via: vec![], voice_loss: 0 });
     b.send(ClientMsg::LinkStats { server_rtt: 150, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![], video_relay_bps: 0, talking: false, heard: vec![], manual_via: vec![], voice_loss: 0 });
     // carol 顺带报了一个不在频道里的 id，服务器应忽略
@@ -1110,7 +1208,7 @@ fn viewer_video_relay_is_planned() {
     }
     a.wait_for(|m| matches!(m, ServerMsg::Watchers { ids, .. } if ids.len() == 2));
     let stat = |id: u32| PeerStat { id, rtt: 20, loss: 0, jitter: 2 };
-    a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![ir] });
+    a.send(ClientMsg::DirectPeers { ids: vec![ir], video: vec![ir], share_audio: None });
     b.send(ClientMsg::LinkStats { server_rtt: 80, peers: vec![stat(ir)], relay_slots: 0, via_server: vec![], video_relay_bps: 0, talking: false, heard: vec![], manual_via: vec![], voice_loss: 0 });
     // carol 上行不够：不安排
     r.send(ClientMsg::LinkStats { server_rtt: 80, peers: vec![stat(ia), stat(ib)], relay_slots: 4, via_server: vec![], video_relay_bps: 3_000_000, talking: false, heard: vec![], manual_via: vec![], voice_loss: 0 });

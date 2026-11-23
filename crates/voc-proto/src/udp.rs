@@ -40,6 +40,106 @@ pub fn read_cursor(b: &[u8]) -> Option<(u16, u16, u8, bool)> {
     (b.len() >= 6).then(|| (u16::from_le_bytes([b[0], b[1]]), u16::from_le_bytes([b[2], b[3]]), b[4], b[5] != 0))
 }
 
+/// 带冗余的语音（第 34-3 项）：发出方向丢包高时，把前一两帧的 Opus 包顺带塞进这一包，接收端丢了前一包也能原样还原。
+/// 格式（在端到端加密里面）：0xFF | 份数 k | k 个长度（u16，最旧的在前）| k 个旧包 | 这一包。
+/// 单声道 Opus 包的第一个字节不会是 0xFF（0xFF 表示立体声），不会和普通语音包混淆
+pub const VOICE_RED_MARK: u8 = 0xFF;
+
+pub fn voice_red(primary: &[u8], older: &[&[u8]]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + older.len() * 2 + older.iter().map(|o| o.len()).sum::<usize>() + primary.len());
+    v.push(VOICE_RED_MARK);
+    v.push(older.len() as u8);
+    for o in older {
+        v.extend_from_slice(&(o.len() as u16).to_le_bytes());
+    }
+    for o in older {
+        v.extend_from_slice(o);
+    }
+    v.extend_from_slice(primary);
+    v
+}
+
+/// 拆开带冗余的语音：(旧包，最旧的在前；这一包)。不是这种格式就返回 None（普通语音包）
+pub fn read_voice_red(d: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
+    if d.first() != Some(&VOICE_RED_MARK) {
+        return None;
+    }
+    let k = *d.get(1)? as usize;
+    let mut pos = 2 + k * 2;
+    if k == 0 || k > 4 || d.len() < pos {
+        return None;
+    }
+    let mut older = Vec::with_capacity(k);
+    for i in 0..k {
+        let len = u16::from_le_bytes([d[2 + i * 2], d[3 + i * 2]]) as usize;
+        older.push(d.get(pos..pos + len)?);
+        pos += len;
+    }
+    let primary = d.get(pos..).filter(|p| !p.is_empty())?;
+    Some((older, primary))
+}
+
+/// 共享者每秒附在鼠标包后面的状态（第 53-1 / 36-6 项）。旧客户端只读前 6 字节，多出来的忽略
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShareInfo {
+    /// 共享者选的帧率
+    pub target_fps: u8,
+    /// 系统实际给了多少帧（屏幕 / 游戏本身的帧率）
+    pub source_fps: u8,
+    /// 采集到的帧率
+    pub capture_fps: u8,
+    /// 编码发出的帧率
+    pub sent_fps: u8,
+    /// 每秒因为画面没变没发的帧
+    pub static_skipped: u8,
+    /// 每秒被码率控制跳过的帧
+    pub rate_skipped: u8,
+    /// 平均每帧编码耗时（ms）
+    pub encode_ms: u8,
+    /// 共享者判断上行拥塞（在降码率）
+    pub congested: bool,
+    /// 实际发送码率（kbps）
+    pub kbps: u16,
+    /// 码率占设定值的百分比（拥塞时自动降低）
+    pub rate_pct: u8,
+    /// 共享声音：最近一秒录音「数据不连续」（录音线程没跟上）的次数
+    pub audio_glitches: u8,
+}
+
+const SHARE_INFO_V1: u8 = 1;
+const SHARE_INFO_LEN: usize = 13;
+
+/// 鼠标包 + 共享状态
+pub fn cursor_with_info(x: u16, y: u16, shape: u8, visible: bool, i: &ShareInfo) -> Vec<u8> {
+    let mut v = cursor_payload(x, y, shape, visible).to_vec();
+    v.push(SHARE_INFO_V1);
+    v.extend_from_slice(&[i.target_fps, i.source_fps, i.capture_fps, i.sent_fps, i.static_skipped, i.rate_skipped, i.encode_ms, i.congested as u8]);
+    v.extend_from_slice(&i.kbps.to_le_bytes());
+    v.push(i.rate_pct);
+    v.push(i.audio_glitches);
+    v
+}
+
+pub fn read_share_info(b: &[u8]) -> Option<ShareInfo> {
+    let t = b.get(6..)?;
+    if t.len() < SHARE_INFO_LEN || t[0] != SHARE_INFO_V1 {
+        return None;
+    }
+    Some(ShareInfo {
+        target_fps: t[1],
+        source_fps: t[2],
+        capture_fps: t[3],
+        sent_fps: t[4],
+        static_skipped: t[5],
+        rate_skipped: t[6],
+        encode_ms: t[7],
+        congested: t[8] != 0,
+        kbps: u16::from_le_bytes([t[9], t[10]]),
+        rate_pct: t[11],
+        audio_glitches: t[12],
+    })
+}
+
 pub const CURSOR_ARROW: u8 = 0;
 pub const CURSOR_IBEAM: u8 = 1;
 pub const CURSOR_HAND: u8 = 2;
@@ -64,6 +164,10 @@ pub const VIDEO_LOW: u8 = 8;
 pub const VIDEO_LTR: u8 = 16;
 /// 恢复帧：只参考所有观看者都确认过的长期参考帧，丢过帧的观看者从这里接着解，不用等关键帧
 pub const VIDEO_RECOVER: u8 = 32;
+/// 跨帧交错（第 34-5 项）：这帧和相邻一帧的分片是交替发的，接收端等这一对都到齐（或超时）再要补发。旧客户端不看这一位
+pub const VIDEO_INTERLEAVED: u8 = 64;
+/// 分片包头里 flags 的位置（frame u32 | idx u16 | count u16 | flags u8）
+pub const VIDEO_FLAGS_AT: usize = 8;
 pub const CODEC_H264: u8 = 0;
 pub const CODEC_HEVC: u8 = 1;
 pub const CODEC_AV1: u8 = 2;
@@ -73,6 +177,26 @@ pub fn ping_payload(ts_ms: u64) -> [u8; 9] {
     let mut p = [1u8; 9];
     p[..8].copy_from_slice(&ts_ms.to_le_bytes());
     p
+}
+
+/// 过滤行为测试（第 39-2 项）：发给探测端口，服务器从「另一个 IP」的探测点回。收得到 = 我的 NAT 对没联系过的地址也放行
+pub fn filter_test_payload(ts_ms: u64) -> [u8; 9] {
+    let mut p = ping_payload(ts_ms);
+    p[8] = FILTER_TEST;
+    p
+}
+pub const FILTER_TEST: u8 = 2;
+
+/// 探测线路能走多大的包（第 37-4 项）：时间戳 | 3 | 补零到 len 字节。服务器 / 队友原样回显
+pub const MTU_PROBE: u8 = 3;
+pub fn mtu_probe_payload(ts_ms: u64, len: usize) -> Vec<u8> {
+    let mut v = ts_ms.to_le_bytes().to_vec();
+    v.push(MTU_PROBE);
+    v.resize(len.max(9), 0);
+    v
+}
+pub fn is_mtu_probe(d: &[u8]) -> bool {
+    d.len() > 64 && d[8] == MTU_PROBE
 }
 
 /// 服务器回的 PONG：客户端要了就附上观察到的地址，否则原样回显
@@ -505,6 +629,27 @@ pub fn seq_newer(a: u16, b: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn voice_red_roundtrip() {
+        use super::*;
+        let b = voice_red(b"main", &[b"a1", b"bb2"]);
+        let (old, main) = read_voice_red(&b).unwrap();
+        assert_eq!(old, vec![&b"a1"[..], &b"bb2"[..]]);
+        assert_eq!(main, b"main");
+        assert!(read_voice_red(&[0x48, 1, 2]).is_none(), "普通 Opus 包");
+        assert!(read_voice_red(&[0xFF, 1, 9, 0, 1]).is_none(), "长度不对");
+    }
+
+    #[test]
+    fn share_info_roundtrip() {
+        use super::*;
+        let i = ShareInfo { target_fps: 60, source_fps: 58, capture_fps: 57, sent_fps: 50, static_skipped: 3, rate_skipped: 4, encode_ms: 6, congested: true, kbps: 12_345, rate_pct: 80, audio_glitches: 2 };
+        let b = cursor_with_info(100, 200, CURSOR_HAND, true, &i);
+        assert_eq!(read_cursor(&b), Some((100, 200, CURSOR_HAND, true)));
+        assert_eq!(read_share_info(&b), Some(i));
+        assert_eq!(read_share_info(&cursor_payload(1, 2, 0, false)), None);
+    }
+
     use super::*;
 
     #[test]

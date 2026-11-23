@@ -360,6 +360,10 @@ impl HwEncoder {
                         set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
                     }
                 }
+                // 画质 / 速度档位（第 36-5 项，0 = 最快、100 = 画质最好）：打游戏时显卡忙，编码排队是卡顿来源之一。
+                // 60 帧偏速度（每帧只有 16 ms），30 帧折中；测试时 VOC_TEST_QVS=数字 覆盖
+                let qvs = std::env::var("VOC_TEST_QVS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(if fps >= 50 { 25 } else { 50 });
+                set(&CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(qvs.min(100)));
                 set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
                 set(&CODECAPI_AVEncMPVGOPSize, VARIANT::from(fps * 10));
             }

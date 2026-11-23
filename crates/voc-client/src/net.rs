@@ -28,7 +28,7 @@ pub enum Outgoing {
 }
 
 pub struct Conn {
-    tx: Sender<Outgoing>,
+    pub tx: Sender<Outgoing>,
     stream: TcpStream,
     pub server_addr: SocketAddr,
     pub keys: SessionKeys,
@@ -94,6 +94,7 @@ pub fn connect(
     addr: &str,
     name: &str,
     code: &str,
+    resume: Option<(u32, String)>,
     notify: impl Fn() + Send + 'static,
     mut on_media: impl FnMut(u8, &[u8]) + Send + 'static,
 ) -> Result<(Conn, Receiver<NetEvent>), String> {
@@ -116,7 +117,12 @@ pub fn connect(
 
     let mut sealer = FrameSealer::new(&keys.tcp_c2s);
     let mut opener = FrameOpener::new(&keys.tcp_s2c);
-    let hello = ClientMsg::Hello { name: name.trim().to_string(), version: PROTOCOL_VERSION };
+    let hello = ClientMsg::Hello {
+        name: name.trim().to_string(),
+        version: PROTOCOL_VERSION,
+        can_resume: true,
+        resume: resume.map(|(id, token)| voc_proto::ResumeToken { id, token }),
+    };
     stream
         .write_all(&sealer.seal(KIND_JSON, serde_json::to_string(&hello).unwrap().as_bytes()))
         .map_err(|e| e.to_string())?;
@@ -124,6 +130,9 @@ pub fn connect(
     let first = read_frame(&mut stream, &mut opener).ok_or("登录失败：服务器断开了连接")?;
     let first: ServerMsg = serde_json::from_slice(&first.1).map_err(|_| "服务器回复格式错误")?;
     if let ServerMsg::Error { message } = first {
+        if message == voc_proto::RESUME_FAILED {
+            return Err(message);
+        }
         return Err(voc_proto::explain_login_error(&message));
     }
     stream.set_read_timeout(None).map_err(|e| e.to_string())?;

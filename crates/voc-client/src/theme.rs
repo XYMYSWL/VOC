@@ -232,6 +232,113 @@ fn latency_colors(ms: u32) -> (Color32, Color32) {
     }
 }
 
+/// 观看端这一秒收画面的情况（掉帧原因用）
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ViewRates {
+    /// 收到的完整帧 / 显示的帧（每秒）
+    pub rx_fps: u32,
+    pub shown_fps: u32,
+    /// 原始丢包（冗余和补发之前，%）
+    pub loss_pct: f32,
+    /// 每秒：等不到放弃的帧、靠冗余救回的片、补发收回的片
+    pub gaps: u32,
+    pub fec: u32,
+    pub rtx: u32,
+}
+
+/// 掉帧时最主要的原因（第 53-1 项）。帧数比共享者选的低不到 4 帧不算掉帧；info = None：共享者是旧版本，只能看本机这边
+pub fn drop_reason(info: Option<&voc_proto::udp::ShareInfo>, r: &ViewRates) -> Option<String> {
+    const SLACK: u32 = 4;
+    let low = |a: u32, b: u32| a + SLACK <= b;
+    if let Some(i) = info {
+        let (target, source, cap, sent) = (i.target_fps as u32, i.source_fps as u32, i.capture_fps as u32, i.sent_fps as u32);
+        if !low(r.shown_fps, target) {
+            return None;
+        }
+        if source > 0 && low(source, target) {
+            return Some(format!("共享者的屏幕 / 游戏本身只有 {source} 帧（选了 {target} 帧）"));
+        }
+        if low(cap, source.max(1).min(target)) {
+            return Some(format!("共享者那边采集只有 {cap} 帧（电脑或显卡太忙）"));
+        }
+        if low(sent, cap) {
+            let static_skip = i.static_skipped as u32;
+            let rate_skip = i.rate_skipped as u32;
+            return Some(if static_skip >= rate_skip && static_skip > 0 {
+                format!("画面变化小，共享者每秒少发 {static_skip} 帧（正常，省流量；一动起来就恢复）")
+            } else if rate_skip > 0 || i.congested {
+                format!("共享者上行带宽不够，在降码率 / 跳帧（码率降到 {}%，每秒跳过 {rate_skip} 帧）", i.rate_pct)
+            } else {
+                format!("共享者编码跟不上：只编出 {sent} 帧（每帧 {} ms）", i.encode_ms)
+            });
+        }
+        if low(r.rx_fps, sent) {
+            return Some(network_reason(r, sent));
+        }
+    } else if r.gaps > 0 || r.loss_pct >= 2.0 {
+        return Some(network_reason(r, r.rx_fps + r.gaps));
+    }
+    if low(r.shown_fps, r.rx_fps) {
+        return Some(format!("本机解码 / 显示跟不上：收到 {} 帧，只显示了 {} 帧", r.rx_fps, r.shown_fps));
+    }
+    None
+}
+
+fn network_reason(r: &ViewRates, sent: u32) -> String {
+    if r.gaps > 0 {
+        format!("网络丢包 {:.0}%：每秒有 {} 帧没等到、放弃了（共享者发了 {sent} 帧）", r.loss_pct, r.gaps)
+    } else {
+        format!("网络丢包 {:.0}% / 抖动：共享者发了 {sent} 帧，收到 {} 帧", r.loss_pct, r.rx_fps)
+    }
+}
+
+/// 画面线路的说明（第 53-6 项）：为什么画面直连 / 经服务器，语音为什么不一样。
+/// route = 我在观看窗口选的画面线路（0 自动 / 1 P2P / 2 服务器）
+pub fn video_route_explain(video_direct: Option<bool>, q: Option<&PeerQuality>, route: u8, sharer_p2p_only: bool) -> String {
+    let mut t = String::new();
+    match q {
+        Some(q) => {
+            t.push_str(&format!("和他直连：延迟 {} ms · 丢包 {}% · 抖动 {} ms", q.rtt_ms, q.loss_pct, q.jitter_ms));
+            if q.unstable {
+                t.push_str("\n这条直连被判成「不稳」（丢包 ≥ 15%、延迟 > 350 ms 或抖动 > 80 ms 之一），语音已改走服务器 / 中转，稳定 10 秒后自动切回。");
+            }
+        }
+        None => t.push_str("和他还没打通直连。"),
+    }
+    t.push('\n');
+    match video_direct {
+        Some(true) => {
+            let why = if route == 1 {
+                "你选了画面「P2P」：打通了就直连，不看稳不稳"
+            } else if sharer_p2p_only {
+                "共享者选了「只走 P2P」：画面不经服务器"
+            } else if q.is_some_and(|q| q.unstable) {
+                "共享者那边对你设了画面直连（右键名字 → 线路），不看稳不稳"
+            } else {
+                "自动：直连稳定、对方上行预算够"
+            };
+            t.push_str(&format!("画面现在走直连：{why}。"));
+            if q.is_some_and(|q| q.unstable) {
+                t.push_str("\n画面有冗余校验包和补发，比语音扛丢包；直连卡顿、花屏时可以改选「服务器」。");
+            }
+        }
+        Some(false) => {
+            let why = if route == 2 {
+                "你选了画面「服务器」"
+            } else if q.is_none() {
+                "和他打不通直连"
+            } else if q.is_some_and(|q| q.unstable) {
+                "直连不稳"
+            } else {
+                "共享者的上行预算不够直连发给每个人，或直连比经服务器绕远"
+            };
+            t.push_str(&format!("画面现在经服务器（或经别的观看者转发）：{why}。"));
+        }
+        None => t.push_str("最近 2 秒没收到画面。"),
+    }
+    t
+}
+
 /// 我和某人之间三条线路的对比（往返延迟）：经队友中继 / 经服务器 / 直连
 pub fn relay_compare(via_name: &str, ms: u32, server_ms: u32, direct: Option<&PeerQuality>) -> String {
     let saved = server_ms.saturating_sub(ms);
@@ -343,15 +450,42 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options:
     changed
 }
 
-/// Unix 毫秒 → 本地「时:分」（按北京时间）
+/// Unix 毫秒 → 电脑本地时区的「时:分」
 pub fn fmt_time(ts_ms: u64) -> String {
-    let secs = ts_ms / 1000 + 8 * 3600;
-    format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60)
+    let t = crate::applog::local_time(ts_ms);
+    format!("{:02}:{:02}", t.3, t.4)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_reasons() {
+        use voc_proto::udp::ShareInfo;
+        let ok = ShareInfo { target_fps: 60, source_fps: 60, capture_fps: 60, sent_fps: 60, kbps: 8000, rate_pct: 100, ..Default::default() };
+        let r = |rx, shown, loss, gaps| ViewRates { rx_fps: rx, shown_fps: shown, loss_pct: loss, gaps, fec: 0, rtx: 0 };
+        assert_eq!(drop_reason(Some(&ok), &r(60, 59, 0.0, 0)), None);
+        let game = ShareInfo { source_fps: 48, capture_fps: 48, sent_fps: 48, ..ok };
+        assert!(drop_reason(Some(&game), &r(48, 48, 0.0, 0)).unwrap().contains("本身只有 48 帧"));
+        let busy = ShareInfo { capture_fps: 45, sent_fps: 45, ..ok };
+        assert!(drop_reason(Some(&busy), &r(45, 45, 0.0, 0)).unwrap().contains("采集只有 45 帧"));
+        let still = ShareInfo { sent_fps: 30, static_skipped: 30, ..ok };
+        assert!(drop_reason(Some(&still), &r(30, 30, 0.0, 0)).unwrap().contains("画面变化小"));
+        let cong = ShareInfo { sent_fps: 40, rate_skipped: 20, congested: true, rate_pct: 60, ..ok };
+        assert!(drop_reason(Some(&cong), &r(40, 40, 0.0, 0)).unwrap().contains("上行带宽不够"));
+        let slow = ShareInfo { sent_fps: 40, encode_ms: 25, ..ok };
+        assert!(drop_reason(Some(&slow), &r(40, 40, 0.0, 0)).unwrap().contains("编码跟不上"));
+        assert!(drop_reason(Some(&ok), &r(50, 50, 6.0, 10)).unwrap().contains("网络丢包 6%"));
+        assert!(drop_reason(Some(&ok), &r(60, 40, 0.0, 0)).unwrap().contains("本机解码"));
+        assert!(drop_reason(None, &r(40, 40, 8.0, 5)).unwrap().contains("网络丢包"));
+        assert_eq!(drop_reason(None, &r(40, 40, 0.0, 0)), None);
+        let q = PeerQuality { rtt_ms: 120, loss_pct: 18, jitter_ms: 30, unstable: true };
+        let t = video_route_explain(Some(true), Some(&q), 1, false);
+        println!("{t}");
+        assert!(t.contains("不稳") && t.contains("你选了画面「P2P」"));
+        assert!(video_route_explain(Some(false), None, 0, false).contains("打不通"));
+    }
 
     #[test]
     fn relay_comparison_text() {

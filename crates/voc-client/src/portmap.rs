@@ -99,6 +99,48 @@ pub fn pcp_map_resp(b: &[u8], nonce: &[u8; 12]) -> Option<(Ipv4Addr, u16, u32)> 
     Some((ip, port, lifetime))
 }
 
+/// PCP PEER 请求（80 字节，第 39-3 项）：为「我这个端口 ↔ 某个对端」单独要一个映射。
+/// 有的路由器不给 MAP（随便谁都能进来的映射），但给 PEER（只对这一个对端）
+pub fn pcp_peer_req(client: Ipv4Addr, internal: u16, remote: SocketAddrV4, lifetime: u32, nonce: [u8; 12]) -> [u8; 80] {
+    let mut r = [0u8; 80];
+    r[0] = 2;
+    r[1] = 2; // PEER
+    r[4..8].copy_from_slice(&lifetime.to_be_bytes());
+    r[8..24].copy_from_slice(&v4_mapped(client));
+    r[24..36].copy_from_slice(&nonce);
+    r[36] = 17;
+    r[40..42].copy_from_slice(&internal.to_be_bytes());
+    r[42..44].copy_from_slice(&internal.to_be_bytes());
+    r[44..60].copy_from_slice(&v4_mapped(Ipv4Addr::UNSPECIFIED));
+    r[60..62].copy_from_slice(&remote.port().to_be_bytes());
+    r[64..80].copy_from_slice(&v4_mapped(*remote.ip()));
+    r
+}
+
+/// 解析 PCP PEER 回复：(外部地址, 外部端口)
+pub fn pcp_peer_resp(b: &[u8], nonce: &[u8; 12]) -> Option<(Ipv4Addr, u16)> {
+    if b.len() < 80 || b[0] != 2 || b[1] != 0x82 || b[3] != 0 || &b[24..36] != nonce {
+        return None;
+    }
+    Some((Ipv4Addr::new(b[56], b[57], b[58], b[59]), u16::from_be_bytes([b[42], b[43]])))
+}
+
+/// 网关会不会说 PCP：发一个 MAP，收到任何 PCP 回复（哪怕是拒绝）就算会。返回结果码（0 = 成功）
+pub fn pcp_answers(gw: Ipv4Addr, client: Ipv4Addr, internal: u16) -> Option<u8> {
+    let nonce: [u8; 12] = voc_proto::auth::random_bytes::<12>();
+    let req = pcp_map_req(client, internal, internal, 60, nonce);
+    let r = ask(gw, &req, |b| b.len() >= 24 && b[0] == 2 && b[1] == 0x81)?;
+    Some(r[3])
+}
+
+/// 用 PCP PEER 为某个对端要映射；成功返回 (外部地址, 外部端口)
+pub fn pcp_peer(gw: Ipv4Addr, client: Ipv4Addr, internal: u16, remote: SocketAddrV4, lifetime: u32) -> Option<(Ipv4Addr, u16)> {
+    let nonce: [u8; 12] = voc_proto::auth::random_bytes::<12>();
+    let req = pcp_peer_req(client, internal, remote, lifetime, nonce);
+    let r = ask(gw, &req, |b| pcp_peer_resp(b, &nonce).is_some())?;
+    pcp_peer_resp(&r, &nonce)
+}
+
 // ------------------------------------------------------------ 收发
 
 /// 发一个请求等回复（RFC 建议的退避：250 ms 起，翻倍，试 3 次）
@@ -225,6 +267,23 @@ mod tests {
         assert_eq!(pcp_map_resp(&resp, &[1u8; 12]), None, "nonce mismatch");
         resp[3] = 8; // 错误码
         assert_eq!(pcp_map_resp(&resp, &nonce), None);
+    }
+
+    #[test]
+    fn pcp_peer_packets() {
+        let nonce = [7u8; 12];
+        let remote = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 40123);
+        let req = pcp_peer_req(Ipv4Addr::new(192, 168, 1, 5), 7878, remote, 120, nonce);
+        assert_eq!((req.len(), req[0], req[1], req[36]), (80, 2, 2, 17));
+        assert_eq!(&req[60..62], &40123u16.to_be_bytes());
+        assert_eq!(&req[64..80], &v4_mapped(*remote.ip()));
+        let mut resp = req;
+        resp[1] = 0x82;
+        resp[42..44].copy_from_slice(&50000u16.to_be_bytes());
+        resp[44..60].copy_from_slice(&v4_mapped(Ipv4Addr::new(203, 0, 113, 9)));
+        assert_eq!(pcp_peer_resp(&resp, &nonce), Some((Ipv4Addr::new(203, 0, 113, 9), 50000)));
+        resp[3] = 2; // NOT_AUTHORIZED
+        assert_eq!(pcp_peer_resp(&resp, &nonce), None);
     }
 
     #[test]

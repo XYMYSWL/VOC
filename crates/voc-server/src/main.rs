@@ -60,6 +60,12 @@ struct User {
     direct: HashSet<u32>,
     /// 屏幕共享画面已直连的观看者：不再替该用户转发视频给他们
     direct_video: HashSet<u32>,
+    /// 共享声音已直连的观看者（客户端单独报了才有；None = 跟 direct_video 一样）
+    direct_share_audio: Option<HashSet<u32>>,
+    /// 断线恢复（第 37-2 项）：凭证（空 = 旧客户端，不保留）、当前是第几个连接、断开的时间
+    resume_token: String,
+    conn_gen: u64,
+    detached: Option<Instant>,
     /// 上次发给该用户的 Peers 列表（没变化就不重发）
     last_peers: Vec<PeerInfo>,
     /// 正在屏幕共享（描述，例如 "1080p60"）
@@ -248,6 +254,10 @@ struct State {
     last_sec_bytes: (u64, u64),
     /// 启动以来每 5 秒数一次「同频道、都开了 P2P 的两人」：(总对数, 语音直连的对数)，按时间加权算直连率（第 47 项）
     p2p_samples: (u64, u64),
+    /// 按天累计的直连率（第 47-2 项）：(日期 UTC「YYYY-MM-DD」, 总对数, 直连对数)，只留最近 7 天，存在授权码文件旁边
+    p2p_days: Vec<(String, u64, u64)>,
+    /// 连接计数（断线恢复用，第 37-2 项）
+    next_conn_gen: u64,
     /// 画面转发总带宽上限（bps）
     max_video_bps: Option<u64>,
     /// 因为服务器带宽不够被临时改看「流畅」的 (观看者, 共享者)；带宽宽松了多少秒
@@ -257,6 +267,8 @@ struct State {
     bans: BanList,
     /// NAT 探测端口（状态文件用）
     probe_listening: bool,
+    /// 第二个探测点「公网IP:端口」，没有为空
+    probe2: String,
 }
 
 /// 认证失败的 IP：(1 分钟内失败次数, 这一分钟从什么时候开始, 封到什么时候)
@@ -376,6 +388,9 @@ impl State {
             if peers != u.last_peers {
                 u.direct.retain(|d| peers.iter().any(|p| p.id == *d));
                 u.direct_video.retain(|d| peers.iter().any(|p| p.id == *d));
+                if let Some(a) = &mut u.direct_share_audio {
+                    a.retain(|d| peers.iter().any(|p| p.id == *d));
+                }
                 u.last_peers = peers.clone();
                 u.send(ServerMsg::Peers { peers });
             }
@@ -442,7 +457,11 @@ impl State {
         if music && u.music.is_none() || !music && (u.sharing.is_none() || (kind == udp::SHARE_AUDIO && !u.share_audio) || u.share_p2p_only) {
             return Vec::new();
         }
-        let direct = if music { u.direct.clone() } else { u.direct_video.clone() };
+        let direct = match (music, kind == udp::SHARE_AUDIO, &u.direct_share_audio) {
+            (true, _, _) => u.direct.clone(),
+            (false, true, Some(a)) => a.clone(),
+            _ => u.direct_video.clone(),
+        };
         let payload = udp::server_voice(from, seq, frame);
         let mut out = Vec::new();
         for (id, other) in self.users.iter_mut() {
@@ -881,6 +900,9 @@ impl State {
         if self.p2p_samples.0 > 0 {
             let _ = writeln!(t, "P2P：启动以来语音直连率 {}%（按时间算）", self.p2p_samples.1 * 100 / self.p2p_samples.0);
         }
+        if let Some(line) = p2p_days_text(&self.p2p_days) {
+            let _ = writeln!(t, "P2P：最近 {line}");
+        }
         let banned = self.bans.count(Instant::now());
         if banned > 0 {
             let _ = writeln!(t, "封禁中的 IP：{banned} 个（认证失败太多次）");
@@ -961,6 +983,8 @@ struct Config {
     max_video_bps: Option<u64>,
     /// NAT 探测端口，None = 主端口 + 1，Some(0) = 不开
     probe_port: Option<u16>,
+    /// 第二个探测点：(绑定的 IP, 告诉客户端的公网 IP)
+    probe2: Option<(std::net::IpAddr, std::net::IpAddr)>,
     name: String,
     channels: Vec<String>,
     codes: PathBuf,
@@ -981,6 +1005,8 @@ VOC 服务器
     -c, --channels   初始语音频道
         --codes      授权码文件，默认 voc-codes.json
         --probe-port NAT 探测用的 UDP 端口，默认主端口 + 1（7879），0 = 不开
+        --probe2 IP[/公网IP] 服务器有第二个公网 IP 时：在它上面也开探测端口，客户端能更准地判断 NAT（换了对方 IP 映射变不变、
+                   没联系过的地址能不能进来）。云服务器上绑的是内网 IP 时用「内网IP/公网IP」
         --max-video-mbps  服务器转发屏幕共享画面的总带宽上限（Mbps），超出时让部分观看者自动看「流畅」；默认不限
 
 查看运行状态（在线的人、谁在共享、转发带宽、NAT 探测端口）：
@@ -1048,6 +1074,7 @@ fn parse_run(args: &[String], codes: PathBuf) -> Config {
     let mut cfg = Config {
         bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
         probe_port: None,
+        probe2: None,
         max_video_bps: None,
         name: "VOC 服务器".into(),
         channels: vec!["大厅".into(), "开黑一号".into(), "开黑二号".into(), "挂机".into()],
@@ -1060,6 +1087,12 @@ fn parse_run(args: &[String], codes: PathBuf) -> Config {
             "--bind" | "-b" => cfg.bind = val().parse().unwrap_or_else(|_| die("--bind 格式应为 IP:端口")),
             "--name" | "-n" => cfg.name = val(),
             "--probe-port" => cfg.probe_port = Some(val().parse().unwrap_or_else(|_| die("--probe-port 必须是端口号"))),
+            "--probe2" => {
+                let v = val();
+                let (b, p) = v.split_once('/').unwrap_or((v.as_str(), v.as_str()));
+                let ip = |s: &str| s.trim().parse::<std::net::IpAddr>().unwrap_or_else(|_| die("--probe2 要写 IP 或「内网IP/公网IP」"));
+                cfg.probe2 = Some((ip(b), ip(p)));
+            }
             "--max-video-mbps" => {
                 let m: f64 = val().parse().unwrap_or_else(|_| die("--max-video-mbps 必须是数字"));
                 cfg.max_video_bps = (m > 0.0).then_some((m * 1_000_000.0) as u64);
@@ -1238,6 +1271,22 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         }
     };
 
+    // 第二个公网 IP 上的探测点（第 39-2 项）
+    let probe2_sock = match (cfg.probe2, &probe_sock) {
+        (Some((bind, _)), Some(p1)) => match bind_udp(SocketAddr::new(bind, p1.local_addr()?.port())) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                eprintln!("[VOC] 第二个探测点 {bind} 开不了（{e}）");
+                None
+            }
+        },
+        _ => None,
+    };
+    let probe2_text = match (&probe2_sock, cfg.probe2) {
+        (Some(s), Some((_, public))) => SocketAddr::new(public, s.local_addr()?.port()).to_string(),
+        _ => String::new(),
+    };
+
     let channels: Vec<ChannelInfo> =
         cfg.channels.iter().enumerate().map(|(i, n)| ChannelInfo { id: i as u32 + 1, name: n.clone() }).collect();
     let n_codes = codes.entries.iter().filter(|e| e.check(now_millis()).is_ok()).count();
@@ -1262,11 +1311,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         sec_bytes: (0, 0),
         last_sec_bytes: (0, 0),
         p2p_samples: (0, 0),
+        p2p_days: Vec::new(),
+        next_conn_gen: 0,
         max_video_bps: cfg.max_video_bps,
         forced_low: HashSet::new(),
         cap_calm_secs: 0,
         bans: BanList::default(),
         probe_listening: false,
+        probe2: probe2_text,
     }));
 
     println!("[VOC] 服务器「{}」已启动：TCP/UDP {}", cfg.name, cfg.bind);
@@ -1282,7 +1334,11 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     tokio::spawn(status_loop(state.clone(), status_path(&cfg.codes), port));
     if let Some(p) = probe_sock {
         println!("[VOC] NAT 探测：UDP {}（云服务器的安全组也要放行这个 UDP 端口）", p.local_addr()?.port());
-        tokio::spawn(probe_loop(state.clone(), p));
+        if let Some(p2) = &probe2_sock {
+            println!("[VOC] 第二个探测点：{}", p2.local_addr()?);
+            tokio::spawn(probe_loop(state.clone(), p2.clone(), Some(p.clone())));
+        }
+        tokio::spawn(probe_loop(state.clone(), p, probe2_sock));
     }
     tokio::spawn(revocation_loop(state.clone()));
     tokio::spawn(relay_loop(state.clone()));
@@ -1318,10 +1374,56 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 println!("[VOC] 正在关闭");
+                notify_restarting(&state).await;
+                return Ok(());
+            }
+            _ = terminate() => {
+                println!("[VOC] 收到停止信号（systemctl stop / restart / 升级），正在关闭");
+                notify_restarting(&state).await;
                 return Ok(());
             }
         }
     }
+}
+
+/// 服务器要停了：告诉在线的人「服务器正在重启」，等一小会儿让消息发出去（第 53-5 项）。
+/// 客户端看到后断线时显示这句、立刻重连，不会以为是自己网络的问题
+async fn notify_restarting(state: &Shared) {
+    let n = {
+        let st = state.lock().unwrap();
+        st.broadcast(&ServerMsg::Restarting { text: "服务器正在重启（可能是在升级），几秒后会自动重新连上".into() });
+        st.users.len()
+    };
+    if n > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
+}
+
+/// systemd 停止服务时发的 SIGTERM（Windows 上没有，只等 Ctrl+C）
+#[cfg(unix)]
+async fn terminate() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+#[cfg(not(unix))]
+async fn terminate() {
+    std::future::pending::<()>().await
+}
+
+/// 断线后保留多久等客户端恢复（第 37-2 项）
+const RESUME_GRACE: Duration = Duration::from_secs(20);
+
+/// 客户端要求恢复、但没接上（凭证不对 / 已经过期）
+fn resume_is_failed(resumed: &Option<u32>, hello: &[u8]) -> bool {
+    resumed.is_none() && matches!(serde_json::from_slice::<ClientMsg>(hello), Ok(ClientMsg::Hello { resume: Some(_), .. }))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// 未认证连接最多同时这么多个（全服务器）
@@ -1487,8 +1589,8 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         .ok()
         .flatten()
         .ok_or("登录超时")?;
-    let (name, version) = match (hello.0, serde_json::from_slice::<ClientMsg>(&hello.1)) {
-        (KIND_JSON, Ok(ClientMsg::Hello { name, version })) => (name.trim().to_string(), version),
+    let (name, version, can_resume, resume) = match (hello.0, serde_json::from_slice::<ClientMsg>(&hello.1)) {
+        (KIND_JSON, Ok(ClientMsg::Hello { name, version, can_resume, resume })) => (name.trim().to_string(), version, can_resume, resume),
         _ => return Err("第一条消息必须是 hello".into()),
     };
     let err = {
@@ -1512,7 +1614,42 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     let kick = Arc::new(Notify::new());
     let pending_file = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pending_media = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let user_id = {
+    let conn_gen = {
+        let mut st = state.lock().unwrap();
+        st.next_conn_gen += 1;
+        st.next_conn_gen
+    };
+    let resume_token = if can_resume { hex(&voc_proto::auth::random_bytes::<16>()) } else { String::new() };
+    // 断线恢复（第 37-2 项）：凭证对、授权码一样 → 接回原来的身份（编号、频道、UDP 密钥不变）。旧连接可能还没发现断了：踢掉它
+    let resumed = resume.and_then(|r| {
+        let mut st = state.lock().unwrap();
+        let u = st.users.get_mut(&r.id).filter(|u| !u.resume_token.is_empty() && u.resume_token == r.token && u.code_id == entry.id)?;
+        let old_kick = std::mem::replace(&mut u.kick, kick.clone());
+        u.tx = tx.clone();
+        u.conn_gen = conn_gen;
+        u.detached = None;
+        u.pending_file = pending_file.clone();
+        u.pending_media = pending_media.clone();
+        u.last_peers.clear();
+        u.last_watchers = Default::default();
+        u.last_relays.clear();
+        old_kick.notify_one();
+        let _ = tx.send(Out::Json(ServerMsg::Resumed { user_id: r.id }));
+        let snap = st.snapshot();
+        let _ = tx.send(Out::Json(snap));
+        st.push_peers();
+        st.push_watchers();
+        st.push_relays();
+        Some(r.id)
+    });
+    if resume_is_failed(&resumed, &hello.1) {
+        close_with(rd, wr, &reject(&mut sealer, voc_proto::RESUME_FAILED.into())).await;
+        return Ok(());
+    }
+    let user_id = if let Some(id) = resumed {
+        println!("[{addr}] {name} (#{id}) 断线后恢复了连接");
+        id
+    } else {
         let mut st = state.lock().unwrap();
         // 同一授权码只允许一个在线：踢掉旧的
         let old: Vec<u32> = st.users.iter().filter(|(_, u)| u.code_id == entry.id).map(|(id, _)| *id).collect();
@@ -1528,8 +1665,10 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
             user_id: id,
             udp_port: st.udp_port,
             server_name: st.server_name.clone(),
-            features: vec![voc_proto::FEATURE_DM_FILE.into(), voc_proto::FEATURE_PONG_ADDR.into(), voc_proto::FEATURE_VIDEO_RTX.into()],
+            features: vec![voc_proto::FEATURE_DM_FILE.into(), voc_proto::FEATURE_PONG_ADDR.into(), voc_proto::FEATURE_VIDEO_RTX.into(), voc_proto::FEATURE_SHARE_AUDIO_ROUTE.into()],
             probe_port: st.probe_port,
+            probe2: st.probe2.clone(),
+            resume: resume_token.clone(),
         }));
         st.users.insert(
             id,
@@ -1551,6 +1690,10 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 e2e: None,
                 direct: HashSet::new(),
                 direct_video: HashSet::new(),
+                direct_share_audio: None,
+                resume_token: resume_token.clone(),
+                conn_gen,
+                detached: None,
                 last_peers: Vec::new(),
                 sharing: None,
                 watching: HashSet::new(),
@@ -1579,9 +1722,9 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         st.broadcast_state();
         st.system(format!("{name} 加入了服务器"));
         st.push_peers();
+        println!("[{addr}] {name} (#{id}, 授权码 {} {}) 已连接", entry.id, entry.note);
         id
     };
-    println!("[{addr}] {name} (#{user_id}, 授权码 {} {}) 已连接", entry.id, entry.note);
 
     let pending_writer = pending_file.clone();
     let media_writer = pending_media.clone();
@@ -1620,6 +1763,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         }
     });
 
+    let mut bye = false;
     loop {
         let frame = tokio::select! {
             f = read_frame(&mut rd, &mut opener) => f,
@@ -1628,8 +1772,13 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         let Some((kind, data)) = frame else { break };
         match kind {
             KIND_JSON => {
-                if let Ok(msg) = serde_json::from_slice::<ClientMsg>(&data) {
-                    handle_msg(&state, user_id, msg);
+                match serde_json::from_slice::<ClientMsg>(&data) {
+                    Ok(ClientMsg::Bye) => {
+                        bye = true;
+                        break;
+                    }
+                    Ok(msg) => handle_msg(&state, user_id, msg),
+                    Err(_) => {}
                 }
             }
             KIND_VOICE => {
@@ -1665,7 +1814,27 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     // ---- 断开 ----
     {
         let mut st = state.lock().unwrap();
-        if st.remove_user(user_id).is_some() {
+        // 已经被新连接接走了（断线恢复）：什么都不做
+        let mine = st.users.get(&user_id).is_some_and(|u| u.conn_gen == conn_gen);
+        let keep = mine && !bye && st.users.get(&user_id).is_some_and(|u| !u.resume_token.is_empty());
+        if keep {
+            // 第 37-2 项：先保留 20 秒（UDP 语音照常转发），等它带着凭证回来；没回来再移除
+            if let Some(u) = st.users.get_mut(&user_id) {
+                u.detached = Some(Instant::now());
+            }
+            let (state2, name2) = (state.clone(), name.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(RESUME_GRACE).await;
+                let mut st = state2.lock().unwrap();
+                if st.users.get(&user_id).is_some_and(|u| u.conn_gen == conn_gen && u.detached.is_some()) && st.remove_user(user_id).is_some() {
+                    st.broadcast_state();
+                    st.system(format!("{name2} 离开了服务器"));
+                    st.push_peers();
+                    st.push_watchers();
+                    st.push_relays();
+                }
+            });
+        } else if mine && st.remove_user(user_id).is_some() {
             st.broadcast_state();
             st.system(format!("{name} 离开了服务器"));
             st.push_peers();
@@ -1689,7 +1858,7 @@ fn handle_msg(state: &Shared, uid: u32, msg: ClientMsg) {
 
 fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
     match msg {
-        ClientMsg::Hello { .. } => {}
+        ClientMsg::Hello { .. } | ClientMsg::Bye => {}
         ClientMsg::Transport { udp } => {
             if let Some(u) = st.users.get_mut(&uid) {
                 if u.voice_udp != udp {
@@ -1719,6 +1888,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             u.music = None;
             u.direct.clear();
             u.direct_video.clear();
+            u.direct_share_audio = None;
             // 换频道：停止共享和观看
             u.sharing = None;
             u.watching.clear();
@@ -1733,6 +1903,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                     u.music = None;
                     u.direct.clear();
                     u.direct_video.clear();
+                    u.direct_share_audio = None;
                     u.sharing = None;
                     u.watching.clear();
                     st.broadcast_state();
@@ -1798,6 +1969,7 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 let was = u.p2p.take().is_some();
                 u.direct.clear();
                 u.direct_video.clear();
+                u.direct_share_audio = None;
                 if was {
                     st.broadcast_state();
                 }
@@ -1966,12 +2138,13 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             });
             st.check_voice_heard(uid);
         }
-        ClientMsg::DirectPeers { ids, video } => {
+        ClientMsg::DirectPeers { ids, video, share_audio } => {
             let Some(u) = st.users.get(&uid) else { return };
             let allowed: HashSet<u32> = u.last_peers.iter().map(|p| p.id).collect();
             let u = st.users.get_mut(&uid).unwrap();
             u.direct = ids.into_iter().filter(|i| allowed.contains(i)).collect();
             u.direct_video = video.into_iter().filter(|i| allowed.contains(i)).collect();
+            u.direct_share_audio = share_audio.map(|a| a.into_iter().filter(|i| allowed.contains(i)).collect());
         }
     }
 }
@@ -2010,19 +2183,84 @@ async fn revocation_loop(state: Shared) {
     }
 }
 
-/// 每 5 秒把运行状态写进状态文件（`voc-server status` / `voc status` 读）
+/// 每 5 秒把运行状态写进状态文件（`voc-server status` / `voc status` 读）；按天的直连率每分钟存一次（重启不丢）
 async fn status_loop(state: Shared, path: PathBuf, port: u16) {
+    let days_path = path.with_file_name(path.file_name().map(|n| n.to_string_lossy().replace(".status.txt", ".p2p-days.txt")).unwrap_or_else(|| "voc.p2p-days.txt".into()));
+    state.lock().unwrap().p2p_days = std::fs::read_to_string(&days_path).map(|t| parse_p2p_days(&t)).unwrap_or_default();
+    let mut ticks = 0u32;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let text = {
+        ticks += 1;
+        let (text, days) = {
             let mut st = state.lock().unwrap();
             let (pairs, direct, _) = st.p2p_pairs();
             st.p2p_samples.0 += pairs as u64;
             st.p2p_samples.1 += direct as u64;
-            st.status_text(port)
+            if pairs > 0 {
+                let today = utc_day(voc_proto::now_millis() / 1000);
+                add_p2p_day(&mut st.p2p_days, &today, pairs as u64, direct as u64);
+            }
+            (st.status_text(port), (ticks % 12 == 0).then(|| format_p2p_days(&st.p2p_days)))
         };
         let _ = std::fs::write(&path, text);
+        if let Some(d) = days {
+            let _ = std::fs::write(&days_path, d);
+        }
     }
+}
+
+/// Unix 秒 → UTC 日期「YYYY-MM-DD」
+fn utc_day(secs: u64) -> String {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 只留最近这么多天
+const P2P_DAYS_KEEP: usize = 7;
+
+fn add_p2p_day(days: &mut Vec<(String, u64, u64)>, day: &str, pairs: u64, direct: u64) {
+    match days.iter_mut().find(|d| d.0 == day) {
+        Some(d) => {
+            d.1 += pairs;
+            d.2 += direct;
+        }
+        None => days.push((day.to_string(), pairs, direct)),
+    }
+    days.sort_by(|a, b| b.0.cmp(&a.0));
+    days.truncate(P2P_DAYS_KEEP);
+}
+
+/// 文件格式：每行「日期 总对数 直连对数」（只有次数，没有昵称和 IP）
+fn format_p2p_days(days: &[(String, u64, u64)]) -> String {
+    days.iter().map(|(d, p, k)| format!("{d} {p} {k}\n")).collect()
+}
+
+fn parse_p2p_days(t: &str) -> Vec<(String, u64, u64)> {
+    let mut v: Vec<(String, u64, u64)> = t
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let (d, p, k) = (it.next()?, it.next()?.parse().ok()?, it.next()?.parse::<u64>().ok()?);
+            (d.len() == 10 && k <= p).then(|| (d.to_string(), p, k))
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.truncate(P2P_DAYS_KEEP);
+    v
+}
+
+/// 「7 天按天的直连率：11-23 80% · 11-22 75%」（UTC 日期）
+fn p2p_days_text(days: &[(String, u64, u64)]) -> Option<String> {
+    let parts: Vec<String> = days.iter().filter(|d| d.1 > 0).map(|(d, p, k)| format!("{} {}%", &d[5..], k * 100 / p)).collect();
+    (!parts.is_empty()).then(|| format!("{} 天按天的语音直连率（UTC 日期）：{}", parts.len(), parts.join(" · ")))
 }
 
 /// 每秒重新规划一次成员中继（上报过期、链路变化都会体现）
@@ -2053,7 +2291,8 @@ fn is_public(ip: std::net::IpAddr) -> bool {
 
 /// NAT 探测端口：只回答 PING（告诉客户端从这个端口看到的它的地址），其他包一律不理。
 /// 同样要求是已登录用户、用自己的密钥加密，不是公开的 STUN
-async fn probe_loop(state: Shared, sock: Arc<UdpSocket>) {
+/// other = 另一个 IP 上的探测点：客户端做过滤测试（udp::FILTER_TEST）时从它回（第 39-2 项）
+async fn probe_loop(state: Shared, sock: Arc<UdpSocket>, other: Option<Arc<UdpSocket>>) {
     let mut buf = [0u8; 256];
     loop {
         let Ok((n, addr)) = sock.recv_from(&mut buf).await else { continue };
@@ -2065,15 +2304,22 @@ async fn probe_loop(state: Shared, sock: Arc<UdpSocket>) {
                     if kind == udp::PING {
                         let mut p = Vec::new();
                         u.udp_seal.seal(udp::PONG, &udp::pong_payload(&data, addr), &mut p);
-                        reply = Some(p);
+                        let filter = data.get(8) == Some(&udp::FILTER_TEST);
+                        reply = Some((p, filter));
                     }
                     break;
                 }
             }
             reply
         };
-        if let Some(p) = reply {
-            let _ = sock.send_to(&p, addr).await;
+        match (reply, &other) {
+            (Some((p, true)), Some(o)) => {
+                let _ = o.send_to(&p, addr).await;
+            }
+            (Some((p, false)), _) => {
+                let _ = sock.send_to(&p, addr).await;
+            }
+            _ => {}
         }
     }
 }
@@ -2178,6 +2424,27 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
 #[cfg(test)]
 mod tests {
     use super::is_public;
+
+    #[test]
+    fn p2p_days_keep_seven() {
+        use super::*;
+        assert_eq!(utc_day(0), "1970-01-01");
+        assert_eq!(utc_day(1_795_278_600), "2026-11-21");
+        assert_eq!(utc_day(951_782_400), "2000-02-29");
+        let mut d = Vec::new();
+        for i in 0..9u64 {
+            let day = utc_day(1_795_278_600 + i * 86_400);
+            add_p2p_day(&mut d, &day, 10, i.min(10));
+            add_p2p_day(&mut d, &day, 10, 0);
+        }
+        assert_eq!(d.len(), 7);
+        assert_eq!(d[0], ("2026-11-29".to_string(), 20, 8));
+        let back = parse_p2p_days(&format_p2p_days(&d));
+        assert_eq!(back, d);
+        let t = p2p_days_text(&d).unwrap();
+        assert!(t.starts_with("7 天") && t.contains("11-29 40%"), "{t}");
+        assert!(parse_p2p_days("坏行\n2026-11-01 5 9\n").is_empty(), "直连数不会比总数多");
+    }
 
     #[test]
     fn video_cap_shows_decimals() {

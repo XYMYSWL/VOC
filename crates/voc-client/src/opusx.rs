@@ -65,8 +65,13 @@ unsafe impl Send for Decoder {}
 
 impl Decoder {
     pub fn new(sample_rate: u32) -> Option<Self> {
+        Self::with_channels(sample_rate, 1)
+    }
+
+    /// channels = 2：立体声解码（输出左右交错；收到单声道的包两边一样）
+    pub fn with_channels(sample_rate: u32, channels: u32) -> Option<Self> {
         let mut err: c_int = 0;
-        let ptr = unsafe { ffi::opus_decoder_create(sample_rate as i32, 1, &mut err) };
+        let ptr = unsafe { ffi::opus_decoder_create(sample_rate as i32, channels as c_int, &mut err) };
         if err != ffi::OPUS_OK as c_int || ptr.is_null() {
             return None;
         }
@@ -76,10 +81,15 @@ impl Decoder {
         Some(Self { ptr, dred_dec, dred, sample_rate })
     }
 
-    /// 解一个包；fec = 用这个包里的带内 FEC 还原它前面那一帧（out 的长度决定还原多少采样）
+    /// 解一个包；fec = 用这个包里的带内 FEC 还原它前面那一帧（out 的长度决定还原多少采样）。单声道解码器
     pub fn decode(&mut self, data: &[u8], out: &mut [i16], fec: bool) -> Option<usize> {
+        self.decode_ch(data, out, fec, 1)
+    }
+
+    /// channels 要和创建时一致；返回每个声道的样本数（out 里是交错的 n × channels 个）
+    pub fn decode_ch(&mut self, data: &[u8], out: &mut [i16], fec: bool, channels: usize) -> Option<usize> {
         let (p, len) = if data.is_empty() { (std::ptr::null(), 0) } else { (data.as_ptr(), data.len() as i32) };
-        let n = unsafe { ffi::opus_decode(self.ptr, p, len, out.as_mut_ptr(), out.len() as i32, fec as c_int) };
+        let n = unsafe { ffi::opus_decode(self.ptr, p, len, out.as_mut_ptr(), (out.len() / channels.max(1)) as i32, fec as c_int) };
         (n >= 0).then_some(n as usize)
     }
 

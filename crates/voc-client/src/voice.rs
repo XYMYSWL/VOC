@@ -50,9 +50,22 @@ const PEER_SUSPECT: Duration = Duration::from_millis(1200);
 const UDP_SUSPECT_MS: u64 = 1500;
 /// 直连比经服务器明显绕远时不用直连：直连往返 > 2 × 到服务器往返 + 30 ms
 const DIRECT_DETOUR_MS: u32 = 30;
-/// 屏幕画面匀速发送：按画面码率的 3 倍（至少 4 Mbps）发，最多连发 4 个包
-const PACE_FACTOR: u64 = 3;
-const PACE_MIN_BPS: u64 = 4_000_000;
+/// 屏幕画面匀速发送（第 36-4 项）：队列里的量争取在一帧的时间内发完，速度在画面码率的 1.5～3 倍之间（至少 4 Mbps），最多连发 4 个包。
+/// 普通帧摊到整帧时间里慢慢发（不再一下子冲出去），关键帧这种大帧最多按 3 倍发
+const PACE_FACTOR: f64 = 3.0;
+const PACE_FACTOR_LOW: f64 = 1.5;
+const PACE_MIN_BPS: f64 = 4_000_000.0;
+/// 正在共享的帧率（匀速发送按它算一帧的时间）
+pub static VIDEO_FPS: AtomicU32 = AtomicU32::new(30);
+
+/// 匀速发送的速度（bps）：video_bps = 一路画面码率，fec_pct = 冗余比例，dests = 正在发的目标数，queued = 队列里的字节数
+pub fn pace_rate_bps(video_bps: u32, fec_pct: u32, dests: usize, queued: usize, fps: u32) -> f64 {
+    // 冗余也要发：冗余 200% 时实际是码率的 3 倍（不算进去的话一加冗余队列就积压，又被当成拥塞把冗余压下去）
+    let per = video_bps as f64 * (100 + fec_pct) as f64 / 100.0 * dests.max(1) as f64;
+    let frame_secs = 1.0 / fps.clamp(5, 240) as f64;
+    let want = queued as f64 * 8.0 / (frame_secs * 0.9);
+    want.clamp(per * PACE_FACTOR_LOW, per * PACE_FACTOR).max(PACE_MIN_BPS)
+}
 const PACE_BURST: usize = 4 * 1200;
 /// 画面包在发送队列里超过这么久就丢掉（宁可丢一帧请求关键帧，也不让延迟越积越多）
 const PACE_STALE: Duration = Duration::from_millis(250);
@@ -157,6 +170,84 @@ fn make_socket(server: SocketAddr) -> std::io::Result<(UdpSocket, bool)> {
             Ok((UdpSocket::bind(bind)?, false))
         }
     }
+}
+
+/// 两帧的分片交替排（第 34-5 项）：a0 b0 a1 b1 …，多出来的接在后面
+fn interleave_frags(a: &[Vec<u8>], b: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    for i in 0..a.len().max(b.len()) {
+        if let Some(x) = a.get(i) {
+            out.push(x.clone());
+        }
+        if let Some(x) = b.get(i) {
+            out.push(x.clone());
+        }
+    }
+    out
+}
+
+/// 探测线路能走多大的包（第 37-4 项）：明文大小，加密后再加约 40～60 字节。以太网一般能走 1472 字节的 UDP，VPN 常常小一些
+const MTU_PROBE_SIZES: [usize; 7] = [1100, 1180, 1240, 1300, 1360, 1400, 1440];
+
+/// 临时打开「不许分片」（DF），把 pkts 发出去，再关掉。调用方要保证这期间没有别的线程用这个套接字发包
+fn send_dont_fragment(sock: &UdpSocket, dual: bool, pkts: &[(Vec<u8>, SocketAddr)]) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{setsockopt, IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, IP_DONTFRAGMENT, SOCKET};
+        let s = SOCKET(sock.as_raw_socket() as usize);
+        let set = |on: u32| unsafe {
+            let v = on.to_ne_bytes();
+            let _ = setsockopt(s, IPPROTO_IP.0, IP_DONTFRAGMENT, Some(&v));
+            if dual {
+                let _ = setsockopt(s, IPPROTO_IPV6.0, IPV6_DONTFRAG, Some(&v));
+            }
+        };
+        set(1);
+        for (p, to) in pkts {
+            let _ = sock.send_to(p, wire(*to, dual));
+        }
+        set(0);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (sock, dual, pkts);
+    }
+}
+
+/// 低 TTL 先发（第 35-2 项）用的 TTL：只够走到自己的路由器 / 运营商 NAT，到不了对方。
+/// 先在自己这边的 NAT 上开好口子，对方的包先到也不会被当成「不请自来」拉黑映射
+const LOW_TTLS: [u32; 4] = [2, 3, 4, 5];
+
+/// 临时把套接字的 TTL 调低，按每个 TTL 把 pkts 各发一遍，再改回原来的值。调用方要保证这期间没有别的线程用这个套接字发包
+fn send_low_ttl(sock: &UdpSocket, dual: bool, pkts: &[(Vec<u8>, SocketAddr)], ttls: &[u32]) -> std::io::Result<()> {
+    let sr = socket2::SockRef::from(sock);
+    let old4 = sr.ttl_v4().ok();
+    let old6 = if dual { sr.unicast_hops_v6().ok() } else { None };
+    let set = |t: u32| -> std::io::Result<()> {
+        sr.set_ttl_v4(t)?;
+        if dual {
+            sr.set_unicast_hops_v6(t)?;
+        }
+        Ok(())
+    };
+    let mut r = Ok(());
+    for &t in ttls {
+        if let Err(e) = set(t) {
+            r = Err(e);
+            break;
+        }
+        for (p, to) in pkts {
+            let _ = sock.send_to(p, wire(*to, dual));
+        }
+    }
+    if let Some(o) = old4 {
+        let _ = sr.set_ttl_v4(o);
+    }
+    if let Some(o) = old6 {
+        let _ = sr.set_unicast_hops_v6(o);
+    }
+    r
 }
 
 /// 本机候选地址：局域网 IPv4、公网/ULA IPv6（同一端口）。
@@ -411,6 +502,8 @@ struct Peer {
     last_ping: Instant,
     /// 本轮打洞开始时间（连通后清空）
     punch_started: Option<Instant>,
+    /// 这一轮打洞（按开始时间）已经低 TTL 先发过了（第 35-2 项）
+    low_ttl_for: Option<Instant>,
     punch_round: u32,
     rtt_ms: u32,
     ping_seq: u32,
@@ -574,6 +667,7 @@ impl Peer {
             last_punch: past,
             last_ping: past,
             punch_started: None,
+            low_ttl_for: None,
             punch_round: 0,
             rtt_ms: 0,
             ping_seq: 0,
@@ -600,6 +694,15 @@ impl Peer {
         v.extend(self.reflexive.iter().copied());
         v.extend(self.valid.keys().copied());
         v
+    }
+}
+
+/// 有第二个 IP 的探测点时（第 39-2 项）：换了对方 IP 映射就变（「按地址分配」）的 NAT，对不同的队友来说也是对称型，
+/// 只换端口看不出来。这时按主端口和第二个 IP 看到的地址判断
+pub fn classify_nat3(main: SocketAddr, probe: SocketAddr, probe2: Option<SocketAddr>, lan: &[SocketAddr]) -> NatInfo {
+    match probe2 {
+        Some(p2) if p2 != main && lan.iter().all(|l| l.ip() != main.ip().to_canonical()) => classify_nat(main, SocketAddr::new(main.ip(), p2.port()), lan),
+        _ => classify_nat(main, probe, lan),
     }
 }
 
@@ -705,10 +808,27 @@ struct Peers {
     map: HashMap<u32, Peer>,
     last_direct: Vec<u32>,
     last_direct_video: Vec<u32>,
+    last_share_audio: Option<Vec<u32>>,
 }
 
 /// 我的屏幕共享选了「只走 P2P」：画面、补发、鼠标、共享声音都不发给服务器（伴奏、语音不受影响）
 pub static SHARE_P2P_ONLY: AtomicBool = AtomicBool::new(false);
+/// 语音 10 ms 一包（第 36-3 项）：用户打开了、并且同频道的人都认识（端到端 Hello 里的 voice10）
+pub static VOICE_10MS: AtomicBool = AtomicBool::new(false);
+/// 同频道的人都认识带冗余的语音包（第 34-3 项）
+pub static VOICE_RED_OK: AtomicBool = AtomicBool::new(false);
+/// 发出方向丢包 ≥ 15%：前一帧顺带再发一份；≥ 35%：前两帧
+const RED_LOSS_1: u8 = 15;
+const RED_LOSS_2: u8 = 35;
+
+/// 共享声音的线路（第 54 项，共享者在设置里选）：0 自动（跟语音的线路走，直连有丢包时两条路同时发），
+/// 1 总是经服务器，2 总是直连（打不通的人还是经服务器）
+pub static SHARE_AUDIO_ROUTE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub const SHARE_AUDIO_AUTO: u8 = 0;
+pub const SHARE_AUDIO_SERVER: u8 = 1;
+pub const SHARE_AUDIO_DIRECT: u8 = 2;
+/// 服务器支持共享声音单独的直连名单（FEATURE_SHARE_AUDIO_ROUTE）；旧服务器上共享声音只能跟画面的直连名单走
+pub static SERVER_SHARE_AUDIO_ROUTE: AtomicBool = AtomicBool::new(false);
 /// UDP 发送失败的次数（诊断 / 测试日志）
 pub static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// 收包线程：处理过的包数、处理一个包最久用了多少微秒（测试日志读一次清零）
@@ -795,6 +915,25 @@ pub struct Link {
     video_bps: AtomicU32,
     /// 当前分配结果：(语音直连, 画面直连)
     alloc: Mutex<(Vec<u32>, Vec<u32>)>,
+    /// 共享声音：(直连发给谁, 报给服务器「不用替我转」的人)。两者的差 = 两条路同时发的人
+    share_alloc: Mutex<(Vec<u32>, Vec<u32>)>,
+    /// 最近一次看到突发丢包（任何一条路 ≥ 3%）的时间（第 38-8 项）
+    last_loss_burst: Mutex<Option<Instant>>,
+    /// 探测线路能走多大的包（第 37-4 项）：发出去的探测 时间戳 → (对谁, 加密后大小, 发的时间)；各条线路的结果；实际发过的最大包
+    mtu_probes: Mutex<HashMap<u64, (Option<u32>, u32, Instant)>>,
+    path_mtu: Mutex<HashMap<Option<u32>, (u32, Instant)>>,
+    max_sent: AtomicU32,
+    mtu_seq: AtomicU64,
+    /// 跨帧交错（第 34-5 项）：开着没有、先留着等下一帧的那一帧
+    interleave: AtomicBool,
+    held_video: Mutex<Option<(Vec<Vec<u8>>, Instant)>>,
+    /// 上次看到的本机地址（换网络检测，第 37-2 项）
+    last_local: Mutex<Vec<String>>,
+    /// 低 TTL 先发时拿写锁，平时发包拿读锁（第 35-2 项）
+    ttl_lock: std::sync::RwLock<()>,
+    /// 网关会说 PCP 但不给 MAP：(网关, 我的内网 IP, 本地端口)；已经为哪些人试过 PEER（第 39-3 项）
+    pcp_peer_gw: Mutex<Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, u16)>>,
+    pcp_peer_tried: Mutex<std::collections::HashSet<u32>>,
     /// 到服务器的往返延迟（ms），0 = 未知
     server_rtt: AtomicU32,
     /// 允许帮队友中转语音
@@ -828,6 +967,10 @@ pub struct Link {
     /// 服务器的 NAT 探测端口，以及从那里看到的我的公网地址
     probe: Option<SocketAddr>,
     probe_addr: Mutex<Option<SocketAddr>>,
+    /// 第二个 IP 上的探测点和它看到的我的地址；过滤测试的结果（Some(true) = 没联系过的地址也进得来）
+    probe2: Option<SocketAddr>,
+    probe2_addr: Mutex<Option<SocketAddr>>,
+    pub filter_open: Mutex<Option<bool>>,
     /// 自测的 NAT 类型（测出来后告诉服务器，打洞时对方据此选策略）
     pub nat: Mutex<Option<NatInfo>>,
     /// 最近 30 次服务器 PING：(发送时间, 收到回复)，算丢包率
@@ -868,11 +1011,82 @@ pub struct Link {
 
 /// 直连语音丢包 ≥ 这个百分比：直连和服务器两条路同时发
 const DUAL_VOICE_LOSS: u8 = 5;
+/// 长距离不稳的线路（第 38-8 项）：两条路同时发的门槛降到 2%
+const DUAL_VOICE_LOSS_LONG: u8 = 2;
+/// 「长距离」：往返超过这么多（ms）
+const LONG_HAUL_RTT_MS: u32 = 150;
+/// 最近这么久内出现过突发丢包（≥ 3%）才算「不稳的长距离线路」，之后一直稳定就降回去
+const LONG_HAUL_MEMORY: Duration = Duration::from_secs(180);
+
+/// 第 38-8 项：长距离（往返 > 150 ms）且最近 3 分钟出现过突发丢包的线路，提前加强抗丢包（不等卡了才反应）
+pub fn long_haul_unstable(rtt_ms: u32, last_burst: Option<Instant>, now: Instant) -> bool {
+    rtt_ms > LONG_HAUL_RTT_MS && last_burst.is_some_and(|t| now.duration_since(t) < LONG_HAUL_MEMORY)
+}
 
 /// 补发用的画面历史保留多久
 const VIDEO_HIST: Duration = Duration::from_millis(1000);
 
 impl Link {
+    /// 探测线路能走多大的包（第 37-4 项）：to = 服务器（seal_for = None）或某个直连的人。拿写锁打开 DF 发一组不同大小的探测包，
+    /// 回来的最大那个就是这条线路能走的大小（加密后的字节数）
+    fn probe_mtu(&self, to: SocketAddr, peer: Option<u32>) {
+        // 编号用递增计数（同一毫秒里会同时探服务器和好几个人，用时间戳会撞号）
+        let base = self.mtu_seq.fetch_add(MTU_PROBE_SIZES.len() as u64, Ordering::Relaxed);
+        let mut pkts = Vec::new();
+        {
+            let mut sent = self.mtu_probes.lock().unwrap();
+            sent.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(10));
+            let mut peers = self.peers.lock().unwrap();
+            for (i, &size) in MTU_PROBE_SIZES.iter().enumerate() {
+                let ts = base + i as u64;
+                let plain = udp::mtu_probe_payload(ts, size);
+                let mut buf = Vec::new();
+                match peer {
+                    None => self.sealer.lock().unwrap().seal(udp::PING, &plain, &mut buf),
+                    Some(id) => {
+                        let Some(s) = peers.map.get_mut(&id).and_then(|p| p.sealer.as_mut()) else { return };
+                        s.seal(p2p::PING, &plain, &mut buf);
+                    }
+                }
+                sent.insert(ts, (peer, buf.len() as u32, Instant::now()));
+                pkts.push((buf, to));
+            }
+        }
+        let _w = self.ttl_lock.write().unwrap();
+        send_dont_fragment(&self.sock, self.dual, &pkts);
+    }
+
+    /// 探测包回来了：记下这条线路能走的最大包
+    fn on_mtu_reply(&self, data: &[u8]) {
+        let Some(ts) = data.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())) else { return };
+        let Some((peer, len, _)) = self.mtu_probes.lock().unwrap().remove(&ts) else { return };
+        let mut m = self.path_mtu.lock().unwrap();
+        let e = m.entry(peer).or_insert((0, Instant::now()));
+        // 新的一轮（超过 30 秒）重新算，线路变小了也能看出来
+        if e.1.elapsed() > Duration::from_secs(30) {
+            *e = (0, Instant::now());
+        }
+        e.0 = e.0.max(len);
+    }
+
+    /// 诊断：各条线路能走的最大包（字节，加密后）和 VOC 实际发过的最大包。None 的键 = 服务器
+    pub fn path_mtu(&self) -> (Vec<(Option<u32>, u32)>, u32) {
+        let mut v: Vec<(Option<u32>, u32)> = self.path_mtu.lock().unwrap().iter().map(|(k, (m, _))| (*k, *m)).collect();
+        v.sort();
+        (v, self.max_sent.load(Ordering::Relaxed))
+    }
+
+    /// 低 TTL 先发（第 35-2 项）：拿写锁，期间没有别的包从主套接字发出去（语音不会带着低 TTL 发到服务器）
+    fn low_ttl_burst(&self, pkts: &[(Vec<u8>, SocketAddr)]) {
+        if pkts.is_empty() {
+            return;
+        }
+        let _w = self.ttl_lock.write().unwrap();
+        if let Err(e) = send_low_ttl(&self.sock, self.dual, pkts, &LOW_TTLS) {
+            crate::applog::log(format!("低 TTL 先发失败（{e}），跳过"));
+        }
+    }
+
     fn send_raw(&self, buf: &[u8], to: SocketAddr) {
         // 生日攻击打通的对端：和他改用撞上的那个本地端口收发（第 35-1 项）
         if self.alt_active.load(Ordering::Relaxed) {
@@ -884,6 +1098,8 @@ impl Link {
                 return;
             }
         }
+        let _r = self.ttl_lock.read().unwrap();
+        self.max_sent.fetch_max(buf.len() as u32, Ordering::Relaxed);
         if self.sock.send_to(buf, wire(to, self.dual)).is_ok() {
             self.sent_bytes.fetch_add(buf.len() as u64 + 28, Ordering::Relaxed);
             SENT_PKTS.fetch_add(1, Ordering::Relaxed);
@@ -910,6 +1126,37 @@ impl Link {
     fn send_peer(&self, kind: u8, buf: &[u8], to: SocketAddr) {
         count_tx(kind, buf.len());
         self.send_raw(buf, to);
+    }
+
+    /// 本机网络变了（第 37-2 项）：UDP 照常从新地址发（服务器按密钥认出是同一个人），
+    /// 重新探测 NAT、告诉服务器新的本机地址，直连的人马上改走服务器并重新打洞（旧的直连地址已经不通了）
+    fn on_network_change(&self, local: Vec<String>) {
+        crate::applog::log(format!("本机网络变了（本机地址现在 {} 个）：语音先走服务器，重新探测 NAT、重新打洞", local.len()));
+        *self.local_addrs.lock().unwrap() = local.clone();
+        *self.public_addr.lock().unwrap() = None;
+        *self.probe_addr.lock().unwrap() = None;
+        *self.probe2_addr.lock().unwrap() = None;
+        *self.filter_open.lock().unwrap() = None;
+        *self.portmap.lock().unwrap() = crate::portmap::PortMapStatus::Trying;
+        let now = Instant::now();
+        for p in self.peers.lock().unwrap().map.values_mut() {
+            if p.confirmed {
+                p.confirmed = false;
+                p.prev_path = p.path.take();
+                p.dropped_at = Some(now);
+            }
+            p.punch_started = Some(now);
+            p.low_ttl_for = None;
+            p.bday_tried = false;
+        }
+        if self.p2p_enabled.load(Ordering::Relaxed) {
+            self.tcp_send(Outgoing::Msg(ClientMsg::P2pEnable { local_addrs: local, nat: None }));
+        }
+    }
+
+    /// 断线恢复后换成新的 TCP 连接（第 37-2 项）
+    pub fn set_tcp(&self, tx: Sender<Outgoing>) {
+        *self.tcp.lock().unwrap() = tx;
     }
 
     fn tcp_send(&self, o: Outgoing) {
@@ -1164,11 +1411,60 @@ impl Link {
 
     /// 发送一帧视频的全部分片（low = 低画质层）：这一层能 P2P 直连的观看者直接发，其余交给服务器按层中转。
     /// 数据分片记下来，观看者请求补发时重发
-    pub fn send_video(&self, frags: &[Vec<u8>], _buf: &mut Vec<u8>, low: bool) {
-        let watchers = self.layer_watchers(low);
-        if watchers.is_empty() {
-            return;
+    pub fn send_video(&self, frags: &[Vec<u8>], buf: &mut Vec<u8>, low: bool) {
+        // 跨帧交错（第 34-5 项）：丢包高时原画层两帧一组，这一帧先留着，等下一帧来了两帧的分片交替发，
+        // 一串连丢分摊到两帧上，每帧丢得少、校验包更救得回来。代价是先留的那帧晚一帧发
+        if !low && self.interleave.load(Ordering::Relaxed) {
+            let prev = self.held_video.lock().unwrap().take();
+            match prev {
+                None => {
+                    self.record_video(frags);
+                    *self.held_video.lock().unwrap() = Some((frags.to_vec(), Instant::now()));
+                    return;
+                }
+                Some((p, _)) => {
+                    self.record_video(frags);
+                    let mut merged = interleave_frags(&p, frags);
+                    // 标上「交错」：接收端等这一对到齐再要补发（第 34-5 项）
+                    for f in merged.iter_mut() {
+                        if let Some(b) = f.get_mut(udp::VIDEO_FLAGS_AT) {
+                            *b |= udp::VIDEO_INTERLEAVED;
+                        }
+                    }
+                    self.dispatch_video(&merged, buf, low);
+                    return;
+                }
+            }
         }
+        if let Some((p, _)) = self.held_video.lock().unwrap().take() {
+            self.dispatch_video(&p, buf, false);
+        }
+        self.record_video(frags);
+        self.dispatch_video(frags, buf, low);
+    }
+
+    /// 留着等交错的那一帧太久没等到下一帧（画面不动了）：单独发出去
+    pub fn flush_held_video(&self, max_age: Duration) {
+        let due = self.held_video.lock().unwrap().as_ref().is_some_and(|(_, t)| t.elapsed() >= max_age);
+        if due {
+            if let Some((p, _)) = self.held_video.lock().unwrap().take() {
+                self.dispatch_video(&p, &mut Vec::new(), false);
+            }
+        }
+    }
+
+    /// 正在看我的人（编号）
+    pub fn watcher_ids(&self) -> Vec<u32> {
+        self.watchers.lock().unwrap().clone()
+    }
+
+    /// 打开 / 关掉跨帧交错（共享者每秒按观看者回报的丢包决定）
+    pub fn set_interleave(&self, on: bool) {
+        self.interleave.store(on, Ordering::Relaxed);
+    }
+
+    /// 记进补发用的历史
+    fn record_video(&self, frags: &[Vec<u8>]) {
         if let Some((h, _)) = frags.first().and_then(|f| udp::read_video_frag(f)) {
             let data: Vec<Vec<u8>> = frags.iter().filter(|f| udp::read_video_frag(f).is_some_and(|(x, _)| !x.is_parity())).cloned().collect();
             self.video_frags_sent.fetch_add(data.len() as u32, Ordering::Relaxed);
@@ -1178,6 +1474,13 @@ impl Link {
                 hist.pop_front();
             }
             hist.push_back((now, h.flags & udp::VIDEO_LOW, h.frame, data));
+        }
+    }
+
+    fn dispatch_video(&self, frags: &[Vec<u8>], _buf: &mut Vec<u8>, low: bool) {
+        let watchers = self.layer_watchers(low);
+        if watchers.is_empty() {
+            return;
         }
         let mut direct = 0;
         if self.p2p_active() {
@@ -1234,9 +1537,16 @@ impl Link {
         if targets.is_empty() {
             return;
         }
-        let mut sent = 0;
+        // 共享声音有自己的线路（服务器支持时）：直连发给 chosen，服务器替我转给 covered 以外的人
+        let own_route = kind == udp::SHARE_AUDIO && SERVER_SHARE_AUDIO_ROUTE.load(Ordering::Relaxed);
+        let (chosen, covered) = if own_route {
+            self.share_alloc.lock().unwrap().clone()
+        } else {
+            let c = if music { self.alloc.lock().unwrap().0.clone() } else { self.alloc.lock().unwrap().1.clone() };
+            (c, Vec::new())
+        };
+        let mut sent = Vec::new();
         if self.p2p_active() {
-            let chosen = if music { self.alloc.lock().unwrap().0.clone() } else { self.alloc.lock().unwrap().1.clone() };
             let payload = udp::server_voice(self.my_id, seq, blob);
             let mut peers = self.peers.lock().unwrap();
             for id in targets.iter().filter(|i| chosen.contains(i)) {
@@ -1244,14 +1554,19 @@ impl Link {
                 if let (true, Some(path), Some(s)) = (p.confirmed, p.path, p.sealer.as_mut()) {
                     s.seal(kind, &payload, buf);
                     self.send_peer(kind, buf, path);
-                    sent += 1;
+                    sent.push(*id);
                 }
             }
         }
         if !music && SHARE_P2P_ONLY.load(Ordering::Relaxed) {
             return; // 共享声音 / 鼠标只走 P2P
         }
-        if sent < targets.len() {
+        let need_server = if own_route {
+            targets.iter().any(|t| !(covered.contains(t) && sent.contains(t)))
+        } else {
+            sent.len() < targets.len()
+        };
+        if need_server {
             if self.udp_ok.load(Ordering::Relaxed) {
                 self.send_server(kind, &udp::client_voice(seq, blob), buf);
             } else {
@@ -1414,6 +1729,19 @@ impl Link {
     }
 
     /// 我发出去的语音大概的丢包率（%）：到服务器的丢包和直连的人里最高的那个
+    /// 第 38-8 项：现在是不是「不稳的长距离线路」（到服务器或任何一条直连往返 > 150 ms，且最近 3 分钟有过突发丢包）
+    pub fn long_haul(&self) -> bool {
+        let now = Instant::now();
+        let burst = *self.last_loss_burst.lock().unwrap();
+        let srv = self.server_rtt.load(Ordering::Relaxed);
+        long_haul_unstable(srv, burst, now) || self.direct_peers().values().any(|q| long_haul_unstable(q.rtt_ms, burst, now))
+    }
+
+    /// 记一次突发丢包（语音发出方向、画面观看者回报）
+    pub fn note_loss_burst(&self) {
+        *self.last_loss_burst.lock().unwrap() = Some(Instant::now());
+    }
+
     pub fn voice_path_loss(&self) -> u8 {
         let now = now_millis();
         let srv = {
@@ -1572,7 +1900,7 @@ impl Link {
     /// 两次探测都有结果了：判断 NAT 类型，变了就告诉服务器
     fn update_nat(&self) {
         let (Some(main), Some(probe)) = (*self.public_addr.lock().unwrap(), *self.probe_addr.lock().unwrap()) else { return };
-        let n = classify_nat(main, probe, &self.lan_addrs);
+        let n = classify_nat3(main, probe, *self.probe2_addr.lock().unwrap(), &self.lan_addrs);
         let changed = {
             let mut cur = self.nat.lock().unwrap();
             let changed = *cur != Some(n);
@@ -1583,6 +1911,48 @@ impl Link {
             let local_addrs = self.local_addrs.lock().unwrap().clone();
             self.tcp_send(Outgoing::Msg(ClientMsg::P2pEnable { local_addrs, nat: Some(n) }));
         }
+    }
+
+    /// 第 39-3 项：为某个还没打通的人要一个 PCP PEER 映射（每人只试一次，在后台线程里）
+    fn try_pcp_peer(self: &Arc<Self>, id: u32, cands: &[SocketAddr]) {
+        let Some((gw, lan, port)) = *self.pcp_peer_gw.lock().unwrap() else { return };
+        let Some(remote) = cands.iter().find_map(|a| match a {
+            SocketAddr::V4(v4) if !crate::portmap::is_carrier_or_private(*v4.ip()) => Some(*v4),
+            _ => None,
+        }) else {
+            return;
+        };
+        if !self.pcp_peer_tried.lock().unwrap().insert(id) {
+            return;
+        }
+        let link = self.clone();
+        let _ = std::thread::Builder::new().name("pcp-peer".into()).spawn(move || {
+            match crate::portmap::pcp_peer(gw, lan, port, remote, 600) {
+                Some((ip, p)) if !crate::portmap::is_carrier_or_private(ip) => {
+                    crate::applog::log(format!("PCP PEER：给 #{id} 要到了映射"));
+                    link.add_local_candidate(SocketAddr::new(IpAddr::V4(ip), p).to_string());
+                }
+                _ => crate::applog::log(format!("PCP PEER：给 #{id} 没要到映射")),
+            }
+        });
+    }
+
+    /// 第二个探测点的结果（第 39-2 项，诊断用）；服务器没有第二个 IP 时为 None
+    pub fn nat_detail(&self) -> Option<String> {
+        self.probe2?;
+        let main = *self.public_addr.lock().unwrap();
+        let p2 = *self.probe2_addr.lock().unwrap();
+        let mapping = match (main, p2) {
+            (Some(a), Some(b)) if a == b => "换了对方 IP 映射不变（好打洞）",
+            (Some(_), Some(_)) => "换了对方 IP 映射就变（对不同队友相当于对称型）",
+            _ => "还没测出来",
+        };
+        let filter = match *self.filter_open.lock().unwrap() {
+            Some(true) => "没联系过的地址也进得来",
+            Some(false) => "只放行联系过的地址",
+            None => "还没测出来",
+        };
+        Some(format!("{mapping}；{filter}"))
     }
 
     /// 和这个人两边都是对称型 NAT，不打洞
@@ -1923,6 +2293,10 @@ impl Link {
             }
             if p.sealer.is_some() {
                 self.birthday_step(*id, p, my_nat, now, buf);
+                // 打了 2 秒还没通、网关只给 PEER：给这个人单独要映射，拿到的外部地址加进候选（第 39-3 项）
+                if p.punch_started.is_some_and(|t| now.duration_since(t) > Duration::from_secs(2)) {
+                    self.try_pcp_peer(*id, &p.cands);
+                }
             }
             let spare = p.spare();
             let Some(s) = p.sealer.as_mut() else { continue };
@@ -1952,7 +2326,21 @@ impl Link {
                 };
                 if now.duration_since(p.last_punch) >= interval {
                     p.last_punch = now;
-                    for t in punch_targets(&p.cands, p.path, p.prev_path, &spare) {
+                    let targets = punch_targets(&p.cands, p.path, p.prev_path, &spare);
+                    // 这一轮打洞开始时先低 TTL 发一遍（只发 IPv4 公网地址，第 35-2 项）
+                    if p.low_ttl_for != Some(started) {
+                        p.low_ttl_for = Some(started);
+                        let pkts: Vec<(Vec<u8>, SocketAddr)> = targets
+                            .iter()
+                            .filter(|t| matches!(t, SocketAddr::V4(v4) if !crate::portmap::is_carrier_or_private(*v4.ip())))
+                            .map(|t| {
+                                s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
+                                (buf.clone(), *t)
+                            })
+                            .collect();
+                        self.low_ttl_burst(&pkts);
+                    }
+                    for t in targets {
                         s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
                         self.send_raw(buf, t);
                     }
@@ -2118,16 +2506,58 @@ impl Link {
                 voice_loss: self.take_server_voice_loss(),
             }));
         }
-        // 直连有丢包（≥ 5%）但还没到「不稳」的人：语音两条路同时发（服务器也照常转发给他，接收端按序号去重）
-        let dual_voice: std::collections::HashSet<u32> =
-            voice.iter().copied().filter(|i| peers.map.get(i).is_some_and(|p| p.quality.loss_pct >= DUAL_VOICE_LOSS)).collect();
+        // 记下突发丢包（第 38-8 项）：任何一条直连 ≥ 3%
+        if voice.iter().any(|i| peers.map.get(i).is_some_and(|p| p.quality.loss_pct >= 3)) {
+            *self.last_loss_burst.lock().unwrap() = Some(now);
+        }
+        let burst = *self.last_loss_burst.lock().unwrap();
+        // 直连有丢包（≥ 5%）但还没到「不稳」的人：语音两条路同时发（服务器也照常转发给他，接收端按序号去重）。
+        // 长距离、最近有过突发丢包的直连：门槛降到 2%（第 38-8 项，只对直连；服务器那条路本来就照常转）
+        let dual_voice: std::collections::HashSet<u32> = voice
+            .iter()
+            .copied()
+            .filter(|i| {
+                peers.map.get(i).is_some_and(|p| {
+                    let limit = if long_haul_unstable(p.quality.rtt_ms, burst, now) { DUAL_VOICE_LOSS_LONG } else { DUAL_VOICE_LOSS };
+                    p.quality.loss_pct >= limit
+                })
+            })
+            .collect();
+        // 共享声音的线路（第 54 项）
+        let share = {
+            let route = SHARE_AUDIO_ROUTE.load(Ordering::Relaxed);
+            let direct: Vec<u32> = if !active {
+                Vec::new()
+            } else if SHARE_P2P_ONLY.load(Ordering::Relaxed) {
+                video.clone() // 画面只走 P2P：共享声音也不经服务器（服务器不转），能直连的都直连
+            } else {
+                match route {
+                    SHARE_AUDIO_SERVER => Vec::new(),
+                    SHARE_AUDIO_DIRECT => watchers.iter().copied().filter(|i| up(i) && !pref(i).hide_ip && !manual_relay.contains(i)).collect(),
+                    _ => voice.iter().copied().filter(|i| watchers.contains(i)).collect(),
+                }
+            };
+            // 自动：直连有丢包（和语音一样 ≥ 5%）的人服务器也照常转一份
+            let covered: Vec<u32> = if route == SHARE_AUDIO_AUTO {
+                direct.iter().copied().filter(|i| !dual_voice.contains(i)).collect()
+            } else {
+                direct.clone()
+            };
+            (direct, covered)
+        };
+        let share_report = SERVER_SHARE_AUDIO_ROUTE.load(Ordering::Relaxed).then(|| {
+            let mut c = share.1.clone();
+            c.sort();
+            c
+        });
+        *self.share_alloc.lock().unwrap() = share;
         voice.retain(|i| !dual_voice.contains(i));
         *self.dual_voice.lock().unwrap() = dual_voice;
         let dual_video = self.dual_video.lock().unwrap().clone();
         video.retain(|i| !dual_video.contains(i));
         voice.sort();
         video.sort();
-        if voice != peers.last_direct || video != peers.last_direct_video {
+        if voice != peers.last_direct || video != peers.last_direct_video || share_report != peers.last_share_audio {
             let ids = |v: &[u32]| if v.is_empty() { "无".to_string() } else { v.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(" ") };
             crate::applog::log(format!(
                 "线路：语音直连 {}（两条路同时发 {}）· 画面直连 {}（两条路 {}）· 其余经服务器 / 中转",
@@ -2136,10 +2566,14 @@ impl Link {
                 ids(&video),
                 ids(&dual_video.iter().copied().collect::<Vec<_>>())
             ));
+            if let Some(c) = &share_report {
+                crate::applog::log(format!("线路：共享声音直连（服务器不用转）{}", ids(c)));
+            }
             peers.last_direct = voice.clone();
             peers.last_direct_video = video.clone();
+            peers.last_share_audio = share_report.clone();
             drop(peers);
-            self.tcp_send(Outgoing::Msg(ClientMsg::DirectPeers { ids: voice, video }));
+            self.tcp_send(Outgoing::Msg(ClientMsg::DirectPeers { ids: voice, video, share_audio: share_report }));
         }
     }
 
@@ -2222,7 +2656,18 @@ impl Link {
                 }
                 p2p::PING => {
                     s.seal(p2p::PONG, &data, buf);
-                    self.send_raw(buf, from);
+                    if udp::is_mtu_probe(&data) {
+                        // 回显探测包：不算进「VOC 实际发过的最大包」
+                        let _r = self.ttl_lock.read().unwrap();
+                        let _ = self.sock.send_to(buf, wire(from, self.dual));
+                    } else {
+                        self.send_raw(buf, from);
+                    }
+                }
+                p2p::PONG if udp::is_mtu_probe(&data) => {
+                    drop(peers);
+                    self.on_mtu_reply(&data);
+                    return None;
                 }
                 p2p::PONG => {
                     p.on_pong(&data);
@@ -2246,11 +2691,13 @@ struct UserDecoder {
     epoch: Option<u16>,
     /// 最近用过的旧密钥编号（换密钥那一刻还在路上的旧包认得出来，直接丢）
     old_epochs: Vec<u16>,
+    /// 对方一包多少样本（10 ms = 480，20 ms = 960）：补丢包时补这么长
+    frame_len: usize,
 }
 
 impl UserDecoder {
     fn new(dec: crate::opusx::Decoder) -> Self {
-        Self { dec, last_seq: None, epoch: None, old_epochs: Vec::new() }
+        Self { dec, last_seq: None, epoch: None, old_epochs: Vec::new(), frame_len: FRAME_SAMPLES }
     }
 
     /// 这一包（已解密验证过）用的是哪把密钥：
@@ -2298,16 +2745,22 @@ fn decode_with_concealment(d: &mut UserDecoder, seq: u16, data: &[u8], pcm: &mut
     if d.is_stale(seq) {
         return None; // 重复（直连和中转都到了）或过期
     }
+    // 带冗余的包（第 34-3 项）：拆出前一两帧的原包
+    let (older, data) = match udp::read_voice_red(data) {
+        Some((o, p)) => (o, p),
+        None => (Vec::new(), data),
+    };
     pcm.resize(FRAME_SAMPLES * 3, 0);
     let mut frames: Vec<(u16, Vec<i16>)> = Vec::new();
     if let Some(last) = d.last_seq {
         let gap = seq.wrapping_sub(last).wrapping_sub(1);
         if (1..=MAX_CONCEAL).contains(&gap) {
-            // 丢包：先用本包里的 DRED 深度冗余还原，不够的用 FEC / PLC
-            frames.extend(conceal_gap(d, last, gap, data, pcm));
+            // 丢包：先用这包里带的旧包原样还原，再用 DRED 深度冗余，不够的用 FEC / PLC
+            frames.extend(conceal_gap(d, last, gap, seq, &older, data, pcm));
         }
     }
     let n = d.dec.decode(data, &mut pcm[..], false)?;
+    d.frame_len = n.clamp(FRAME_SAMPLES / 4, FRAME_SAMPLES * 3);
     d.last_seq = Some(seq);
     frames.push((seq, pcm[..n].to_vec()));
     Some(frames)
@@ -2320,25 +2773,64 @@ fn blob_epoch(blob: &[u8]) -> u16 {
 
 /// 收到一包，前面丢了 gap 帧：先用这个包里的 DRED 还原（能还原多少算多少，越近的越准），
 /// 剩下的离得远的用 PLC 补，紧挨着的一帧还可以用带内 FEC。返回按时间顺序的 (序号, 声音)
-fn conceal_gap(d: &mut UserDecoder, last: u16, gap: u16, data: &[u8], pcm: &mut [i16]) -> Vec<(u16, Vec<i16>)> {
+fn conceal_gap(d: &mut UserDecoder, last: u16, gap: u16, cur: u16, older: &[&[u8]], data: &[u8], pcm: &mut [i16]) -> Vec<(u16, Vec<i16>)> {
     let mut frames = Vec::new();
-    let dred = d.dec.dred_recover(data, gap as usize, FRAME_SAMPLES);
+    let fl = d.frame_len;
+    let dred = d.dec.dred_recover(data, gap as usize, fl);
     for i in 0..gap {
         let seq = last.wrapping_add(1 + i);
+        // 这包里顺带的旧包：older[k-1] 是 cur-1，older[0] 是 cur-k
+        let back = cur.wrapping_sub(seq) as usize;
+        if (1..=older.len()).contains(&back) {
+            if let Some(n) = d.dec.decode(older[older.len() - back], &mut pcm[..], false) {
+                frames.push((seq, pcm[..n].to_vec()));
+                continue;
+            }
+        }
         if let Some(Some(f)) = dred.get(i as usize) {
             frames.push((seq, f.clone()));
             continue;
         }
         let n = if i + 1 == gap {
-            d.dec.decode(data, &mut pcm[..FRAME_SAMPLES], true)
+            d.dec.decode(data, &mut pcm[..fl], true)
         } else {
-            d.dec.decode(&[], &mut pcm[..FRAME_SAMPLES], false)
+            d.dec.decode(&[], &mut pcm[..fl], false)
         };
         if let Some(n) = n {
             frames.push((seq, pcm[..n].to_vec()));
         }
     }
     frames
+}
+
+/// 伴奏 / 共享声音（立体声解码，没有 DRED）：丢了帧用下一包的带内 FEC（紧挨着的一帧）和 PLC 补。
+/// 返回按时间顺序的 (序号, 左右交错的声音)
+fn decode_stream_stereo(d: &mut UserDecoder, seq: u16, data: &[u8], pcm: &mut Vec<i16>) -> Option<Vec<(u16, Vec<i16>)>> {
+    if d.is_stale(seq) {
+        return None;
+    }
+    pcm.resize(FRAME_SAMPLES * 3 * 2, 0);
+    let mut frames: Vec<(u16, Vec<i16>)> = Vec::new();
+    if let Some(last) = d.last_seq {
+        let gap = seq.wrapping_sub(last).wrapping_sub(1);
+        // 音乐断太久（> 0.2 秒）就不补了：PLC 补长了是怪声，不如淡出（播放端会淡出 / 淡入）
+        if (1..=10).contains(&gap) {
+            for i in 0..gap {
+                let n = if i + 1 == gap {
+                    d.dec.decode_ch(data, &mut pcm[..FRAME_SAMPLES * 2], true, 2)
+                } else {
+                    d.dec.decode_ch(&[], &mut pcm[..FRAME_SAMPLES * 2], false, 2)
+                };
+                if let Some(n) = n {
+                    frames.push((last.wrapping_add(1 + i), pcm[..n * 2].to_vec()));
+                }
+            }
+        }
+    }
+    let n = d.dec.decode_ch(data, &mut pcm[..], false, 2)?;
+    d.last_seq = Some(seq);
+    frames.push((seq, pcm[..n * 2].to_vec()));
+    Some(frames)
 }
 
 /// 中间丢了多少帧以内还补（DRED 最多约 1 秒；太长的断档当作重新开始）
@@ -2419,7 +2911,8 @@ pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mut
     let d = match decs.entry((from, stream)) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(v) => {
-            let Some(dec) = crate::opusx::Decoder::new(SAMPLE_RATE) else { return };
+            // 立体声解码：对方发的是单声道时左右一样（第 55-b 项）
+            let Some(dec) = crate::opusx::Decoder::with_channels(SAMPLE_RATE, 2) else { return };
             v.insert(UserDecoder::new(dec))
         }
     };
@@ -2427,15 +2920,19 @@ pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mut
     if !keep {
         return;
     }
-    let Some(frames) = decode_with_concealment(d, seq, &data, pcm) else { return };
+    let Some(frames) = decode_stream_stereo(d, seq, &data, pcm) else { return };
     drop(decs);
     let id = crate::audio::stream_mixer_id(kind, from);
     let mut m = mixer.lock().unwrap();
     if rekeyed {
         m.restart_seq(id);
     }
+    let concealed = frames.len().saturating_sub(1) as u32;
     for (s, f) in frames {
-        m.push(id, s, &f);
+        m.push_ch(id, s, &f, 2);
+    }
+    if concealed > 0 {
+        m.note_concealed(id, concealed);
     }
 }
 
@@ -2445,7 +2942,7 @@ fn on_cursor(payload: &[u8], state: &VoiceState) {
     let Some(e2e) = state.e2e.lock().unwrap().clone() else { return };
     let Some((_, data)) = e2e.lock().unwrap().decrypt_stream(from, voc_proto::e2e::STREAM_CURSOR, blob) else { return };
     if let Some((x, y, shape, vis)) = udp::read_cursor(&data) {
-        state.video.set_cursor(from, x, y, shape, vis);
+        state.video.set_cursor(from, x, y, shape, vis, udp::read_share_info(&data));
     }
 }
 
@@ -2818,6 +3315,7 @@ pub fn on_server_voice(payload: &[u8], state: &VoiceState, mixer: &Mutex<Mixer>,
 pub fn connect(
     server: SocketAddr,
     probe_port: u16,
+    probe2: Option<SocketAddr>,
     keys: &SessionKeys,
     my_id: u32,
     p2p_on: bool,
@@ -2863,6 +3361,18 @@ pub fn connect(
         budget_bps: AtomicU32::new(DEFAULT_BUDGET_BPS),
         video_bps: AtomicU32::new(0),
         alloc: Mutex::new((Vec::new(), Vec::new())),
+        share_alloc: Mutex::new((Vec::new(), Vec::new())),
+        last_loss_burst: Mutex::new(None),
+        ttl_lock: std::sync::RwLock::new(()),
+        last_local: Mutex::new(local_candidates(port, dual)),
+        interleave: AtomicBool::new(false),
+        mtu_probes: Mutex::new(HashMap::new()),
+        path_mtu: Mutex::new(HashMap::new()),
+        max_sent: AtomicU32::new(0),
+        mtu_seq: AtomicU64::new(1),
+        held_video: Mutex::new(None),
+        pcp_peer_gw: Mutex::new(None),
+        pcp_peer_tried: Mutex::new(Default::default()),
         server_rtt: AtomicU32::new(0),
         relay_enabled: AtomicBool::new(true),
         relays: Mutex::new(Vec::new()),
@@ -2882,6 +3392,9 @@ pub fn connect(
         public_addr: Mutex::new(None),
         probe: (probe_port != 0).then(|| norm(SocketAddr::new(server.ip(), probe_port))),
         probe_addr: Mutex::new(None),
+        probe2,
+        probe2_addr: Mutex::new(None),
+        filter_open: Mutex::new(None),
         nat: Mutex::new(None),
         srv_pings: Mutex::new(std::collections::VecDeque::new()),
         sent_bytes: AtomicU64::new(0),
@@ -2927,6 +3440,31 @@ pub fn connect(
                 continue;
             }
             last_full = Instant::now();
+            // 每分钟探一次各条线路能走多大的包（第 37-4 项）：服务器那条，和每个直连的人
+            if n % 600 == 50 {
+                l.probe_mtu(l.server, None);
+                let direct: Vec<(u32, SocketAddr)> = l.peers.lock().unwrap().map.iter().filter(|(_, p)| p.confirmed).filter_map(|(id, p)| p.path.map(|a| (*id, a))).collect();
+                for (id, a) in direct {
+                    l.probe_mtu(a, Some(id));
+                }
+            }
+            // 每 3 秒看一次本机地址：换了网络（Wi-Fi ↔ 热点 / 有线）就马上重新探测、重新打洞（第 37-2 项）
+            if n % 30 == 15 {
+                let now_local = local_candidates(l.local_port, l.dual);
+                let changed = {
+                    let mut last = l.last_local.lock().unwrap();
+                    let changed = !now_local.is_empty() && *last != now_local;
+                    if changed {
+                        *last = now_local.clone();
+                    }
+                    changed
+                };
+                if changed {
+                    l.on_network_change(now_local);
+                    spawn_upnp(l.clone(), l.local_port);
+                    n = 0; // 重新快速探测 NAT
+                }
+            }
             if n % 10 == 0 {
                 // 每秒记一次上行码率
                 let sent = l.sent_bytes.load(Ordering::Relaxed);
@@ -2944,6 +3482,18 @@ pub fn connect(
                     if n < 100 || n % 300 == 0 {
                         l.sealer.lock().unwrap().seal(udp::PING, &udp::ping_payload(ts), &mut buf);
                         l.send_raw(&buf, probe);
+                        // 第二个探测点：看换了对方 IP 映射变不变；再请探测端口从第二个 IP 回，看没联系过的地址能不能进来（第 39-2 项）
+                        if let Some(p2) = l.probe2 {
+                            l.sealer.lock().unwrap().seal(udp::PING, &udp::ping_payload(ts), &mut buf);
+                            l.send_raw(&buf, p2);
+                            if l.filter_open.lock().unwrap().is_none() {
+                                l.sealer.lock().unwrap().seal(udp::PING, &udp::filter_test_payload(ts), &mut buf);
+                                l.send_raw(&buf, probe);
+                                if l.created.elapsed() > Duration::from_secs(8) {
+                                    *l.filter_open.lock().unwrap() = Some(false);
+                                }
+                            }
+                        }
                     }
                 }
                 {
@@ -3036,6 +3586,18 @@ pub fn connect(
                 }
                 continue;
             }
+            if l.probe2.is_some_and(|p| p.ip() == from.ip()) {
+                if let Some((udp::PONG, data)) = opener.open(pkt) {
+                    if data.get(8) == Some(&udp::FILTER_TEST) {
+                        // 没往第二个 IP 发过过滤测试却收到了它的回包：我的 NAT 对没联系过的地址也放行
+                        *l.filter_open.lock().unwrap() = Some(true);
+                    } else if let Some((_, Some(addr))) = udp::read_pong(&data) {
+                        *l.probe2_addr.lock().unwrap() = Some(addr);
+                        l.update_nat();
+                    }
+                }
+                continue;
+            }
             if from == l.server {
                 let Some((kind, data)) = opener.open(pkt) else { continue };
                 count_rx(kind, data.len());
@@ -3056,6 +3618,7 @@ pub fn connect(
                     }
                 }
                 match kind {
+                    udp::PONG if udp::is_mtu_probe(&data) => l.on_mtu_reply(&data),
                     udp::PONG => {
                         let Some((sent, public)) = udp::read_pong(&data) else { continue };
                         let now = now_millis();
@@ -3251,10 +3814,11 @@ impl Link {
 
     /// 匀速发送的总速度：一路画面码率 × 倍数 × 正在发的目标数（0.5.x 不管几个观看者都按一路算，人一多就排队过期，F-07）
     fn pace_rate(&self) -> f64 {
-        let dests = self.pacer.q.lock().unwrap().active().max(1) as u64;
-        // 冗余也要发：冗余 200% 时实际是码率的 3 倍（不算进去的话一加冗余队列就积压，又被当成拥塞把冗余压下去）
-        let fec = 100 + self.fec_pct.load(Ordering::Relaxed) as u64;
-        (self.video_bps.load(Ordering::Relaxed) as u64 * PACE_FACTOR * dests * fec / 100).max(PACE_MIN_BPS) as f64
+        let (dests, queued) = {
+            let q = self.pacer.q.lock().unwrap();
+            (q.active(), q.bytes)
+        };
+        pace_rate_bps(self.video_bps.load(Ordering::Relaxed), self.fec_pct.load(Ordering::Relaxed), dests, queued, VIDEO_FPS.load(Ordering::Relaxed))
     }
 
     /// 共享者每秒告诉链路当前的冗余比例（%），匀速发送按「码率 ×（1 + 冗余）」算
@@ -3276,7 +3840,9 @@ fn spawn_pacer(link: Arc<Link>) {
                 let mut dropped = 0;
                 let mut got = q.pop(Instant::now(), &mut dropped);
                 if got.is_none() {
-                    q = link.pacer.wake.wait_timeout(q, Duration::from_millis(200)).unwrap().0;
+                    // 有交错留着的帧时醒得勤一点，画面不动了也能及时发出去
+                    let wait = if link.held_video.lock().unwrap().is_some() { 20 } else { 200 };
+                    q = link.pacer.wake.wait_timeout(q, Duration::from_millis(wait)).unwrap().0;
                     got = q.pop(Instant::now(), &mut dropped);
                 }
                 if dropped > 0 {
@@ -3284,7 +3850,10 @@ fn spawn_pacer(link: Arc<Link>) {
                 }
                 got
             };
-            let Some((to, pkt)) = next else { continue };
+            let Some((to, pkt)) = next else {
+                link.flush_held_video(Duration::from_millis(60));
+                continue;
+            };
             // 加密后的大小（明文 + 编号 8 + 类型长度 3 + 随机填充平均 12 + 认证标签 16）
             let len = (pkt.data.len() + 39) as f64;
             let rate = link.pace_rate() / 8.0;
@@ -3362,6 +3931,13 @@ fn spawn_upnp(link: Arc<Link>, port: u16) {
         }
         let Some((kind, ext_ip, ext_port, method)) = got else {
             set(PortMapStatus::Unavailable);
+            // 第 39-3 项：网关会说 PCP、只是不给 MAP → 记下来，打洞打不通时给那个人单独要 PEER 映射
+            if let Some(gw) = portmap::gateway_for(*lan.ip()) {
+                if let Some(code) = portmap::pcp_answers(gw, *lan.ip(), port) {
+                    crate::applog::log(format!("端口映射：网关支持 PCP 但不给普通映射（结果码 {code}），打不通时改试 PCP PEER"));
+                    *link.pcp_peer_gw.lock().unwrap() = Some((gw, *lan.ip(), port));
+                }
+            }
             return;
         };
         if portmap::is_carrier_or_private(ext_ip) {
@@ -3433,7 +4009,10 @@ pub fn spawn_encoder(
                             0.2 * (2.0 * std::f32::consts::PI * 220.0 * n).sin() * (0.6 + 0.4 * (2.0 * std::f32::consts::PI * 3.0 * n).sin())
                         })
                         .collect();
-                    tx.on_frame(&f);
+                    let flen = if VOICE_10MS.load(Ordering::Relaxed) { FRAME_SAMPLES / 2 } else { FRAME_SAMPLES };
+                    for c in f.chunks(flen) {
+                        tx.on_frame(c);
+                    }
                     t += 1;
                     next += Duration::from_millis(20);
                     let now = Instant::now();
@@ -3473,9 +4052,11 @@ pub fn spawn_encoder(
                     }
                     None => acc.extend_from_slice(&frame),
                 }
-                while acc.len() >= FRAME_SAMPLES {
-                    tx.on_frame(&acc[..FRAME_SAMPLES]);
-                    acc.drain(..FRAME_SAMPLES);
+                // 10 ms 一包（第 36-3 项）还是 20 ms 一包
+                let flen = if VOICE_10MS.load(Ordering::Relaxed) { FRAME_SAMPLES / 2 } else { FRAME_SAMPLES };
+                while acc.len() >= flen {
+                    tx.on_frame(&acc[..flen]);
+                    acc.drain(..flen);
                 }
             }
         })
@@ -3524,8 +4105,12 @@ struct Transmitter {
     loop_seq: u16,
     /// 编码器当前是否按低带宽码率
     low: bool,
-    /// 连续多少帧完全没有声音（全 0）
-    zero_frames: u32,
+    /// 连续多久（ms）完全没有声音（全 0）
+    zero_ms: u32,
+    /// 最近发出的几包（带冗余时顺带塞进下一包），停止说话就清空
+    recent: std::collections::VecDeque<Vec<u8>>,
+    /// 现在每包顺带几份旧包（0 / 1 / 2）
+    red_copies: usize,
 }
 
 impl Transmitter {
@@ -3543,37 +4128,44 @@ impl Transmitter {
             hang: 0,
             loop_seq: 0,
             low: false,
-            zero_frames: 0,
+            zero_ms: 0,
+            recent: std::collections::VecDeque::new(),
+            red_copies: 0,
             loss_mode: 0,
             loss_checked: Instant::now(),
         }
     }
 
+    /// frame：10 ms（480）或 20 ms（960）
     fn on_frame(&mut self, frame: &[f32]) {
         let s = &self.settings;
+        let frame_ms = (frame.len() * 1000 / SAMPLE_RATE as usize) as u32;
+        self.pcm.resize(frame.len(), 0);
         let mut energy = 0.0f32;
         for (o, &v) in self.pcm.iter_mut().zip(frame) {
             energy += v * v;
             *o = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
         }
-        let rms = (energy / FRAME_SAMPLES as f32).sqrt();
+        let rms = (energy / frame.len().max(1) as f32).sqrt();
         let db = 20.0 * (rms + 1e-9).log10();
         s.input_level_db.set(db);
         // 麦克风连续 5 秒给的全是 0：多半是 Windows 隐私设置不让 VOC 用麦克风，或设备坏了（真实环境总有底噪）
-        self.zero_frames = if energy < 1e-12 { self.zero_frames.saturating_add(1) } else { 0 };
-        s.mic_silent.store(self.zero_frames >= MIC_SILENT_FRAMES, Ordering::Relaxed);
+        self.zero_ms = if energy < 1e-12 { self.zero_ms.saturating_add(frame_ms) } else { 0 };
+        s.mic_silent.store(self.zero_ms >= MIC_SILENT_FRAMES * 20, Ordering::Relaxed);
 
         let ptt = s.ptt_vk.load(Ordering::Relaxed);
         let speaking = if ptt != 0 { key_down(ptt) } else { db >= s.vad_threshold_db.get() };
         if speaking {
-            self.hang = if ptt != 0 { PTT_HANGOVER } else { VAD_HANGOVER };
+            // 拖尾按毫秒算（10 ms / 20 ms 一包都一样长）
+            self.hang = if ptt != 0 { PTT_HANGOVER } else { VAD_HANGOVER } * 20;
         } else {
-            self.hang = self.hang.saturating_sub(1);
+            self.hang = self.hang.saturating_sub(frame_ms);
         }
         let muted = s.muted.load(Ordering::Relaxed) || s.deafened.load(Ordering::Relaxed);
         let gate = self.hang > 0 && !muted;
         s.transmitting.store(gate, Ordering::Relaxed);
         if !gate {
+            self.recent.clear();
             return;
         }
 
@@ -3585,8 +4177,31 @@ impl Transmitter {
         // 每秒看一次线路丢包，变了就调编码器（FEC / DRED）
         if self.loss_checked.elapsed() >= Duration::from_secs(1) {
             self.loss_checked = Instant::now();
-            let loss = self.state.current_link().map(|l| l.voice_path_loss()).unwrap_or(0);
-            let mode = if loss >= DRED_LOSS_PCT { loss } else { 0 };
+            let link = self.state.current_link();
+            let loss = link.as_ref().map(|l| l.voice_path_loss()).unwrap_or(0);
+            if loss >= 3 {
+                if let Some(l) = &link {
+                    l.note_loss_burst();
+                }
+            }
+            // 发出方向丢包高、大家都认识：前一两帧顺带再发（第 34-3 项；和 DRED 一起用，DRED 是压缩过的近似，这个是原包）
+            self.red_copies = if !VOICE_RED_OK.load(Ordering::Relaxed) {
+                0
+            } else if loss >= RED_LOSS_2 {
+                2
+            } else if loss >= RED_LOSS_1 {
+                1
+            } else {
+                0
+            };
+            // 长距离、最近有过突发丢包：丢包还没起来就先开 DRED（第 38-8 项）
+            let mode = if loss >= DRED_LOSS_PCT {
+                loss
+            } else if link.is_some_and(|l| l.long_haul()) {
+                DRED_LOSS_PCT
+            } else {
+                0
+            };
             if mode.abs_diff(self.loss_mode) >= 2 || (mode == 0) != (self.loss_mode == 0) {
                 self.loss_mode = mode;
                 apply_loss_mode(&mut self.enc, mode);
@@ -3598,9 +4213,19 @@ impl Transmitter {
         if let Some(l) = self.state.current_link().filter(|l| l.in_channel.load(Ordering::Relaxed)) {
             // 端到端加密后再发：服务器中转时只看得到密文
             if let Some(e2e) = self.state.e2e.lock().unwrap().clone() {
-                let enc = e2e.lock().unwrap().encrypt_frame(packet);
+                let k = self.red_copies.min(self.recent.len());
+                let enc = if k > 0 {
+                    let older: Vec<&[u8]> = self.recent.iter().skip(self.recent.len() - k).map(|v| v.as_slice()).collect();
+                    e2e.lock().unwrap().encrypt_frame(&udp::voice_red(packet, &older))
+                } else {
+                    e2e.lock().unwrap().encrypt_frame(packet)
+                };
                 l.send_voice(&enc, &mut self.pkt);
             }
+        }
+        self.recent.push_back(packet.to_vec());
+        if self.recent.len() > 2 {
+            self.recent.pop_front();
         }
         if s.loopback.load(Ordering::Relaxed) {
             if let Some(d) = self.loop_dec.as_mut() {
@@ -3779,6 +4404,43 @@ mod epoch_tests {
             .collect()
     }
 
+    /// 第 36-3 / 34-3 项：10 ms 一包，丢了第 3 包，第 4 包里顺带了它 → 原样还原（和没丢时解出来的一样），补出来的长度也是 10 ms
+    #[test]
+    fn red_recovers_lost_10ms_packet() {
+        let mut enc = crate::opusx::Encoder::new_voip(SAMPLE_RATE).unwrap();
+        let pk: Vec<Vec<u8>> = (0..6)
+            .map(|i| {
+                let pcm: Vec<i16> = (0..FRAME_SAMPLES / 2).map(|j| (((i * 480 + j) as f32 * 0.07).sin() * 9000.0) as i16).collect();
+                let mut out = vec![0u8; 1500];
+                let n = enc.encode(&pcm, &mut out).unwrap();
+                out.truncate(n);
+                out
+            })
+            .collect();
+        // 参考：全部收到
+        let mut d0 = UserDecoder::new(crate::opusx::Decoder::new(SAMPLE_RATE).unwrap());
+        let mut pcm = Vec::new();
+        let full: Vec<Vec<i16>> = (0..6).map(|i| decode_with_concealment(&mut d0, i as u16, &pk[i], &mut pcm).unwrap().pop().unwrap().1).collect();
+        assert!(full.iter().all(|f| f.len() == FRAME_SAMPLES / 2));
+        // 丢了第 3 包（序号 2），第 4 包带着第 2、3 包
+        let mut d = UserDecoder::new(crate::opusx::Decoder::new(SAMPLE_RATE).unwrap());
+        for i in 0..2 {
+            decode_with_concealment(&mut d, i as u16, &pk[i], &mut pcm).unwrap();
+        }
+        let red = voc_proto::udp::voice_red(&pk[3], &[&pk[1], &pk[2]]);
+        let got = decode_with_concealment(&mut d, 3, &red, &mut pcm).unwrap();
+        assert_eq!(got.iter().map(|f| f.0).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(got[0].1, full[2], "冗余里的原包还原出来和没丢时一样");
+        assert_eq!(got[1].1, full[3]);
+        // 没有冗余时：补出来的也是 10 ms（按对方的包长），不是 20 ms
+        let mut d = UserDecoder::new(crate::opusx::Decoder::new(SAMPLE_RATE).unwrap());
+        for i in 0..2 {
+            decode_with_concealment(&mut d, i as u16, &pk[i], &mut pcm).unwrap();
+        }
+        let got = decode_with_concealment(&mut d, 3, &pk[3], &mut pcm).unwrap();
+        assert_eq!(got[0].1.len(), FRAME_SAMPLES / 2);
+    }
+
     /// 0.5.1 的「两人互相听不到」：A 说了一阵（序号到 3000），有人进频道 → A 换密钥、序号从 0 开始，
     /// B 这边不能把新包当成旧包丢掉
     #[test]
@@ -3827,6 +4489,95 @@ mod epoch_tests {
 
 #[cfg(test)]
 mod tests {
+    /// 第 37-4 项：打开 DF 发完照常能发（本机回环 MTU 很大，几个大小都收得到）
+    #[test]
+    fn dont_fragment_probe_sends() {
+        let (sock, dual) = super::make_socket("127.0.0.1:1".parse().unwrap()).unwrap();
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        let to = rx.local_addr().unwrap();
+        let pkts: Vec<(Vec<u8>, std::net::SocketAddr)> = [1100usize, 1400, 1472].iter().map(|&n| (vec![7u8; n], to)).collect();
+        super::send_dont_fragment(&sock, dual, &pkts);
+        sock.send_to(b"after", super::wire(to, dual)).unwrap();
+        let mut b = [0u8; 2000];
+        let mut sizes = Vec::new();
+        while let Ok((n, _)) = rx.recv_from(&mut b) {
+            sizes.push(n);
+        }
+        assert_eq!(sizes, vec![1100, 1400, 1472, 5]);
+        assert!(voc_proto::udp::is_mtu_probe(&voc_proto::udp::mtu_probe_payload(5, 1200)));
+        assert!(!voc_proto::udp::is_mtu_probe(&voc_proto::udp::ping_payload(5)));
+    }
+
+    #[test]
+    fn interleave_two_frames() {
+        let f = |t: u8, n: usize| (0..n).map(|i| vec![t, i as u8]).collect::<Vec<_>>();
+        let m = super::interleave_frags(&f(1, 3), &f(2, 2));
+        assert_eq!(m, vec![vec![1, 0], vec![2, 0], vec![1, 1], vec![2, 1], vec![1, 2]]);
+    }
+
+    /// 第 35-2 项：低 TTL 发完 TTL 改回原样；本机回环上 TTL 2 的包照样收得到
+    #[test]
+    fn low_ttl_restores() {
+        use std::net::UdpSocket;
+        let (sock, dual) = super::make_socket("127.0.0.1:1".parse().unwrap()).unwrap();
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        let sr = socket2::SockRef::from(&sock);
+        let before = sr.ttl_v4().unwrap();
+        super::send_low_ttl(&sock, dual, &[(b"hi".to_vec(), rx.local_addr().unwrap())], &[2, 3]).unwrap();
+        assert_eq!(sr.ttl_v4().unwrap(), before, "TTL 改回去了");
+        let mut b = [0u8; 8];
+        let mut got = 0;
+        while rx.recv_from(&mut b).is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, 2, "每个 TTL 发一遍");
+    }
+
+    /// 第 39-2 项：只换端口映射不变、换了 IP 才变的 NAT，有第二个探测点时判成对称型
+    #[test]
+    fn second_probe_finds_address_dependent_mapping() {
+        use super::classify_nat3;
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        let lan = [a("192.168.1.5:5000")];
+        let main = a("1.2.3.4:40000");
+        assert_eq!(classify_nat3(main, main, None, &lan).kind, voc_proto::NAT_CONE);
+        assert_eq!(classify_nat3(main, main, Some(main), &lan).kind, voc_proto::NAT_CONE);
+        let n = classify_nat3(main, main, Some(a("1.2.3.4:40002")), &lan);
+        assert_eq!((n.kind, n.step), (voc_proto::NAT_SYM_PREDICTABLE, 2));
+        assert_eq!(classify_nat3(main, main, Some(a("1.2.3.4:51234")), &lan).kind, voc_proto::NAT_SYM_RANDOM);
+    }
+
+    #[test]
+    fn long_haul_detection() {
+        use super::long_haul_unstable;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert!(!long_haul_unstable(200, None, now), "没丢过包：不算");
+        assert!(long_haul_unstable(200, Some(now - Duration::from_secs(60)), now));
+        assert!(!long_haul_unstable(80, Some(now), now), "近距离：不算");
+        assert!(!long_haul_unstable(200, Some(now - Duration::from_secs(400)), now), "很久没丢包：降回去");
+    }
+
+    /// 第 36-4 项：普通帧摊到一帧时间里（不低于 1.5 倍码率），大帧最多 3 倍，低码率时至少 4 Mbps
+    #[test]
+    fn pace_rate_spreads_frames() {
+        use super::pace_rate_bps;
+        // 20 Mbps、60 帧：一帧平均 41.7 KB。队列里正好一帧 → 1.5 倍（30 Mbps）就能在一帧时间内发完
+        let r = pace_rate_bps(20_000_000, 0, 1, 41_700, 60);
+        assert!((r - 30_000_000.0).abs() < 1.0, "{r}");
+        // 关键帧（10 倍大）：封顶 3 倍
+        assert_eq!(pace_rate_bps(20_000_000, 0, 1, 417_000, 60), 60_000_000.0);
+        // 两帧的量：在 1.5～3 倍之间，一帧时间内发完
+        let r = pace_rate_bps(20_000_000, 0, 1, 83_400, 60);
+        assert!(r > 40_000_000.0 && r < 60_000_000.0, "{r}");
+        // 冗余 100%、两个目标：按 4 倍的量算
+        assert_eq!(pace_rate_bps(20_000_000, 100, 2, 10_000_000, 60), 240_000_000.0);
+        // 低码率：至少 4 Mbps
+        assert_eq!(pace_rate_bps(500_000, 0, 1, 0, 30), 4_000_000.0);
+    }
+
     #[test]
     fn nat_classification_and_strategy() {
         let lan: Vec<SocketAddr> = vec!["192.168.1.5:40000".parse().unwrap()];
@@ -4004,7 +4755,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, None, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             let link = st.current_link().unwrap();
             (link, st, rx)
         };
@@ -4096,7 +4847,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, None, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             (st.current_link().unwrap(), st, rx)
         };
         let (la, sa, rxa) = mk(3, es[0].clone());
@@ -4187,7 +4938,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, None, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             (st.current_link().unwrap(), st, rx)
         };
         let (la, sa, _rxa) = mk(3, ea);
@@ -4224,7 +4975,7 @@ mod tests {
         sink.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let (tx, _rx) = mpsc::channel::<Outgoing>();
         let st = Arc::new(VoiceState::default());
-        connect(sink.local_addr().unwrap(), 0, &keys, 3, false, ea, tx, st.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
+        connect(sink.local_addr().unwrap(), 0, None, &keys, 3, false, ea, tx, st.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
         let l = st.current_link().unwrap();
         l.udp_ok.store(true, Ordering::Relaxed);
         l.set_watchers(vec![7], vec![]);
@@ -4255,11 +5006,11 @@ mod tests {
         let dummy_server: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let (tx, _rx) = mpsc::channel::<Outgoing>();
         let sa = Arc::new(VoiceState::default());
-        connect(dummy_server, 0, &keys, 3, true, ea.clone(), tx, sa.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
+        connect(dummy_server, 0, None, &keys, 3, true, ea.clone(), tx, sa.clone(), Arc::new(Mutex::new(Mixer::default()))).unwrap();
         let (tx, _rx2) = mpsc::channel::<Outgoing>();
         let sb = Arc::new(VoiceState::default());
         let mb = Arc::new(Mutex::new(Mixer::default()));
-        connect(dummy_server, 0, &keys, 7, true, eb, tx, sb.clone(), mb.clone()).unwrap();
+        connect(dummy_server, 0, None, &keys, 7, true, eb, tx, sb.clone(), mb.clone()).unwrap();
         let (la, lb) = (sa.current_link().unwrap(), sb.current_link().unwrap());
         let addr = |l: &Link| format!("127.0.0.1:{}", l.sock.local_addr().unwrap().port());
         la.set_others(vec![7]);
@@ -4412,7 +5163,7 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(800));
         let gain = Arc::new(crate::audio::AtomicF32::new(1.0));
-        let src = crate::streams::start(udp::MUSIC, crate::loopback::Target::Include(player.id()), sa.clone(), gain).expect("start music");
+        let src = crate::streams::start(udp::MUSIC, crate::loopback::Target::Include(player.id()), sa.clone(), gain, false).expect("start music");
         let t = Instant::now();
         while !music_buffered(&mb, 3) {
             assert!(t.elapsed() < Duration::from_secs(4), "program audio did not reach B");
@@ -4448,7 +5199,7 @@ mod tests {
             let (tx, rx) = mpsc::channel::<Outgoing>();
             let st = Arc::new(VoiceState::default());
             let mx = Arc::new(Mutex::new(Mixer::default()));
-            connect(dummy_server, 0, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
+            connect(dummy_server, 0, None, &keys, id, true, e2e, tx, st.clone(), mx).unwrap();
             let link = st.current_link().unwrap();
             (link, st, rx)
         };

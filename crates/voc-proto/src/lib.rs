@@ -57,7 +57,15 @@ pub enum ClientMsg {
     Hello {
         name: String,
         version: u32,
+        /// 会用恢复凭证（第 37-2 项）：断线后服务器先保留 20 秒，重连时带上 resume 就接回原来的身份
+        #[serde(default)]
+        can_resume: bool,
+        /// 换了网络 / 断了一下：接回原来的身份（编号、频道、UDP 密钥都不变，语音不用重新建立）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<ResumeToken>,
     },
+    /// 主动退出（关闭 / 退出登录）：服务器马上把我移除，不保留 20 秒
+    Bye,
     /// 告诉服务器语音走 UDP 还是 TCP（UDP 被封锁/限速时自动切到 TCP）
     Transport {
         udp: bool,
@@ -106,6 +114,10 @@ pub enum ClientMsg {
         ids: Vec<u32>,
         #[serde(default)]
         video: Vec<u32>,
+        /// 屏幕共享声音直连的人（服务器不再转给他们）；None = 跟 video 一样（旧客户端）。
+        /// 只在服务器有 FEATURE_SHARE_AUDIO_ROUTE 时发
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        share_audio: Option<Vec<u32>>,
     },
     /// 开始屏幕共享（desc 例如 "1080p60"，显示给别人看；audio = 同时共享电脑声音；
     /// simulcast = 能同时发一路 360P 低画质层给想省流量的观看者）
@@ -244,6 +256,16 @@ pub enum ServerMsg {
         /// NAT 探测端口（UDP，只回答「我看到你的地址」）；0 = 没有
         #[serde(default)]
         probe_port: u16,
+        /// 第二个公网 IP 上的探测点「IP:端口」（第 39-2 项；服务器有第二个公网 IP 才有，空 = 没有）
+        #[serde(default)]
+        probe2: String,
+        /// 断线恢复凭证（第 37-2 项；客户端说了 can_resume 才有）
+        #[serde(default)]
+        resume: String,
+    },
+    /// 恢复成功（第 37-2 项）：接回原来的身份，之后照常收发
+    Resumed {
+        user_id: u32,
     },
     Error {
         message: String,
@@ -320,6 +342,11 @@ pub enum ServerMsg {
     /// 0.6 语音优先：这些人在你说话时没听到你（直连 / 中转那条路实际不通），先把给他们的语音改经服务器发（有变化才发）
     VoiceFallback {
         ids: Vec<u32>,
+    },
+    /// 服务器马上要停止（重启 / 升级）：客户端显示原因，断开后立刻重连（旧客户端不认识，忽略）
+    Restarting {
+        #[serde(default)]
+        text: String,
     },
 }
 
@@ -410,12 +437,24 @@ pub struct UserInfo {
     pub share_p2p_only: bool,
 }
 
+/// 断线恢复凭证（第 37-2 项）
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ResumeToken {
+    pub id: u32,
+    pub token: String,
+}
+
+/// 恢复失败时服务器回的错误（客户端看到就改走普通重连）
+pub const RESUME_FAILED: &str = "resume_failed";
+
 /// 服务器功能：私聊发图（FileTarget）
 pub const FEATURE_DM_FILE: &str = "dm_file";
 /// 服务器功能：PONG 里附上客户端公网地址
 pub const FEATURE_PONG_ADDR: &str = "pong_addr";
 /// 服务器功能：转发视频补发请求（udp::NACK）、缓存最近的画面分片直接补发、转发冗余校验包
 pub const FEATURE_VIDEO_RTX: &str = "video_rtx";
+/// 服务器功能：共享声音的直连名单单独报（DirectPeers.share_audio），不跟画面的直连名单走（第 54 项）
+pub const FEATURE_SHARE_AUDIO_ROUTE: &str = "share_audio_route";
 
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
     let mut s = serde_json::to_string(msg).expect("serialize");
@@ -449,6 +488,8 @@ mod tests {
     #[test]
     fn json_roundtrip() {
         let m = ClientMsg::Hello {
+            can_resume: false,
+            resume: None,
             name: "小明".into(),
             version: PROTOCOL_VERSION,
         };

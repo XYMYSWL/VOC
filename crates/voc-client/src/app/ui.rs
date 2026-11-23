@@ -10,13 +10,14 @@ impl App {
     /// 网络断开、正在自动重连
     fn ui_reconnecting(&mut self, ui: &mut egui::Ui) {
         let Screen::Reconnecting(r) = &self.screen else { return };
-        let (reason, attempt, busy) = (r.reason.clone(), r.attempt, r.pending.is_some());
+        let (reason, attempt, busy, restart) = (r.reason.clone(), r.attempt, r.pending.is_some(), r.server_restart);
         let wait = r.next_at.saturating_duration_since(std::time::Instant::now()).as_secs() + 1;
         let mut cancel = false;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(th::BG_BASE)).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() * 0.28).max(40.0));
-                ui.label(RichText::new("与服务器的连接断开了").size(22.0).strong().color(th::TEXT));
+                let title = if restart { "服务器正在重启" } else { "与服务器的连接断开了" };
+                ui.label(RichText::new(title).size(22.0).strong().color(th::TEXT));
                 ui.add_space(6.0);
                 ui.label(RichText::new(&reason).size(13.0).color(th::TEXT_DIM));
                 ui.add_space(18.0);
@@ -1112,7 +1113,7 @@ impl App {
             s.send(ClientMsg::Watch { target: id, on, low, route: 0, cursor: true });
             if on {
                 if let Some(view) = self.voice.video.watch(id, true) {
-                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route: 0 });
+                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route: 0, rx_prev: None, rates: Default::default(), gpu: None, popped: false, on_top: false });
                 }
             } else {
                 self.views.remove(&id);
@@ -1276,6 +1277,17 @@ impl App {
                     {
                         self.settings.aec.store(self.cfg.aec, Ordering::Relaxed);
                     }
+                    if ui
+                        .checkbox(&mut self.cfg.low_latency_device, "声卡低延迟模式（实验）")
+                        .on_hover_text("声卡驱动支持时，麦克风和扬声器按约 3 ms 一次处理（普通方式约 10 ms），来回少十几毫秒。\n驱动不支持时自动用普通方式（下方「输入 / 输出」会写明用的是哪种）。")
+                        .changed()
+                    {
+                        crate::audio::LOW_LATENCY_DEVICE.store(self.cfg.low_latency_device, Ordering::Relaxed);
+                        restart = true;
+                    }
+                    ui.checkbox(&mut self.cfg.voice_10ms, "低延迟语音（10 ms 一包）").on_hover_text(
+                        "语音少 10 ms 延迟；每条线路多占约 30 kbps 上行。\n频道里有人用旧版本时自动按 20 ms 一包发（他那边才听得顺）",
+                    );
                     let mut gain = self.cfg.input_gain * 100.0;
                     if ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%").text("麦克风增益")).changed() {
                         self.cfg.input_gain = gain / 100.0;
@@ -1736,6 +1748,12 @@ impl App {
                     if let Some(e) = st.error.lock().unwrap().as_ref() {
                         ui.label(RichText::new(e).color(th::RED));
                     }
+                    if self.cfg.share_audio && crate::loopback::supported() {
+                        ui.add_space(4.0);
+                        let p2p_only = sh.cfg.p2p_only;
+                        share_audio_route_ui(ui, &mut self.cfg.share_audio_route, p2p_only);
+                        ui.checkbox(&mut self.cfg.stream_stereo, "共享声音用立体声").on_hover_text("左右声道分开发；码率 128 kbps，单声道 96 kbps");
+                    }
                     ui.add_space(8.0);
                     let b = egui::Button::new(RichText::new("⏹ 停止共享").strong().color(Color32::WHITE))
                         .fill(th::RED)
@@ -1801,6 +1819,11 @@ impl App {
                 ui.add_enabled(can_audio, egui::Checkbox::new(&mut self.cfg.share_audio, "同时共享电脑声音（不含 VOC 自己的声音）"))
                     .on_hover_text("游戏、视频的声音会一起发给正在看的人；队友的说话声、提示音不会被录进去。")
                     .on_disabled_hover_text("共享电脑声音需要 Windows 11");
+                if self.cfg.share_audio && can_audio {
+                    share_audio_route_ui(ui, &mut self.cfg.share_audio_route, self.cfg.share.p2p_only);
+                    ui.checkbox(&mut self.cfg.stream_stereo, "共享声音用立体声")
+                        .on_hover_text("左右声道分开发（游戏里听方位更准）；码率 128 kbps，单声道 96 kbps。伴奏也一样。\n旧版本的观看者收到会自动混成单声道");
+                }
                 ui.checkbox(&mut self.cfg.share.delay_bwe, "按延迟变化提前降码率").on_hover_text(
                     "画面走的线路往返时间开始变大（排队了、还没丢包）就先降码率，线路空了再升回来，减少卡顿。\n\
                      打开后「原画」的码率也会跟着调（默认原画固定码率、保证清楚）。",
@@ -1878,10 +1901,17 @@ impl App {
         for (id, v) in self.views.iter_mut() {
             if let Some(f) = v.view.frame.lock().unwrap().as_ref() {
                 if f.seq != v.seq {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
-                    match &mut v.tex {
-                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                        None => v.tex = Some(ctx.load_texture(format!("screen-{id}"), img, egui::TextureOptions::LINEAR)),
+                    match &f.nv12 {
+                        // 显卡上转颜色：只记下这一帧，画的时候交给着色器
+                        Some(d) => v.gpu = Some(crate::nv12view::Nv12 { width: f.width as u32, height: f.height as u32, data: d.clone(), seq: f.seq }),
+                        None => {
+                            v.gpu = None;
+                            let img = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
+                            match &mut v.tex {
+                                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                                None => v.tex = Some(ctx.load_texture(format!("screen-{id}"), img, egui::TextureOptions::LINEAR)),
+                            }
+                        }
                     }
                     v.seq = f.seq;
                     v.size = (f.width, f.height);
@@ -1897,11 +1927,17 @@ impl App {
                 egui::Area::new(egui::Id::unique(("fullscreen", *id))).fixed_pos(screen.min).order(egui::Order::Foreground).show(ctx, |ui| {
                     ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
                     let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                    if let Some(t) = &v.tex {
+                    if v.gpu.is_some() || v.tex.is_some() {
                         let (w, h) = (v.size.0.max(1) as f32, v.size.1.max(1) as f32);
                         let scale = (rect.width() / w).min(rect.height() / h);
                         let img = egui::Rect::from_center_size(rect.center(), Vec2::new(w * scale, h * scale));
-                        ui.painter().image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        match (&v.gpu, &v.tex) {
+                            (Some(g), _) => crate::nv12view::paint(ui.painter(), img, *id, g.clone()),
+                            (None, Some(t)) => {
+                                ui.painter().image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            }
+                            _ => {}
+                        }
                         draw_remote_cursor(ui.painter(), img, &v.view);
                     }
                     if resp.double_clicked() {
@@ -1935,53 +1971,109 @@ impl App {
                 continue;
             }
             let mut open = true;
-            egui::Window::new(RichText::new(format!("📺 {name} 的屏幕")).strong())
-                .id(egui::Id::unique(("viewer", *id)))
-                .open(&mut open)
-                .default_size([960.0, 580.0])
-                .resizable(true)
-                .frame(egui::Frame::window(&ctx.global_style()).fill(Color32::BLACK).inner_margin(Margin::same(8)))
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+            let mut toggle_pop = false;
+            let popped = v.popped;
+            let mut body = |ui: &mut egui::Ui| {
+                    ui.horizontal_wrapped(|ui| {
                         th::pill(ui, desc.clone(), th::ACCENT_HOVER, th::ACCENT_SOFT);
                         th::pill(ui, format!("{}×{}", v.size.0, v.size.1), th::TEXT_DIM, th::BG_ELEVATED);
-                        th::pill(ui, format!("{} fps", v.view.fps.load(Ordering::Relaxed)), th::TEXT_DIM, th::BG_ELEVATED);
+                        // 每秒更新一次这一秒的收包情况（掉帧原因用）
+                        if let Some((now_st, _, _)) = voice.video.rx_stats(*id) {
+                            match v.rx_prev {
+                                Some((prev, at)) if at.elapsed() >= std::time::Duration::from_secs(1) => {
+                                    let lost = now_st.data_lost.saturating_sub(prev.data_lost) as f32;
+                                    let total = now_st.data_total.saturating_sub(prev.data_total).max(1) as f32;
+                                    v.rates = th::ViewRates {
+                                        rx_fps: v.view.rx_fps.load(Ordering::Relaxed),
+                                        shown_fps: v.view.fps.load(Ordering::Relaxed),
+                                        loss_pct: lost * 100.0 / total,
+                                        gaps: now_st.gaps.saturating_sub(prev.gaps),
+                                        fec: now_st.fec_recovered.saturating_sub(prev.fec_recovered),
+                                        rtx: now_st.rtx_recovered.saturating_sub(prev.rtx_recovered),
+                                    };
+                                    v.rx_prev = Some((now_st, std::time::Instant::now()));
+                                }
+                                None => v.rx_prev = Some((now_st, std::time::Instant::now())),
+                                _ => {}
+                            }
+                        }
+                        let info = v.view.sharer_info.lock().unwrap().filter(|(_, t)| t.elapsed() < std::time::Duration::from_secs(3)).map(|(i, _)| i);
+                        let why = th::drop_reason(info.as_ref(), &v.rates);
+                        let fps = v.view.fps.load(Ordering::Relaxed);
+                        let (fg, bg) = if why.is_some() { (th::YELLOW, th::BG_ELEVATED) } else { (th::TEXT_DIM, th::BG_ELEVATED) };
+                        let mut tip = String::new();
+                        if let Some(i) = &info {
+                            tip.push_str(&format!(
+                                "共享者：选了 {} 帧 · 屏幕 / 游戏给了 {} 帧 · 采集 {} 帧 · 编码发出 {} 帧\n  画面没变少发 {} 帧 · 码率控制跳过 {} 帧 · 每帧编码 {} ms · 码率 {:.1} Mbps（设定值的 {}%）{}\n",
+                                i.target_fps, i.source_fps, i.capture_fps, i.sent_fps, i.static_skipped, i.rate_skipped, i.encode_ms,
+                                i.kbps as f32 / 1000.0, i.rate_pct, if i.congested { " · 上行拥塞" } else { "" }
+                            ));
+                        } else {
+                            tip.push_str("共享者是旧版本，看不到他那边的采集 / 编码帧数\n");
+                        }
+                        let r = &v.rates;
+                        tip.push_str(&format!(
+                            "你这边：收到 {} 帧 · 显示 {} 帧 · 原始丢包 {:.1}% · 冗余救回 {} 片 · 补发收回 {} 片 · 放弃 {} 帧",
+                            r.rx_fps, r.shown_fps, r.loss_pct, r.fec, r.rtx, r.gaps
+                        ));
+                        // 大概的延迟：共享者编码 + 单程网络（往返的一半）+ 本机解码显示（第 36-6 项）
+                        let rtt = voice.video.rx_stats(*id).map(|s| s.2).unwrap_or(0);
+                        let show = v.view.show_ms.load(Ordering::Relaxed);
+                        let lat = info.map(|i| i.encode_ms as u32).unwrap_or(0) + rtt / 2 + show;
+                        tip.push_str(&format!("\n延迟大约 {lat} ms（共享者编码 + 网络单程约 {} ms + 本机解码显示 {show} ms；不含截屏和显示器本身）", rtt / 2));
+                        if let Some(w) = &why {
+                            tip = format!("掉帧原因：{w}\n\n{tip}");
+                        }
+                        th::pill(ui, format!("{fps} fps · 约 {lat} ms"), fg, bg).on_hover_text(tip);
                         let dec = v.view.decoder.lock().unwrap().clone();
                         if !dec.is_empty() {
                             th::pill(ui, dec, th::TEXT_DIM, th::BG_ELEVATED);
                         }
                         th::pill(ui, "🔒 端到端加密", th::GREEN, th::GREEN_SOFT);
-                        if user.is_some_and(|u| u.simulcast) {
-                            let before = v.low;
-                            ui.selectable_value(&mut v.low, false, "原画").on_hover_text(format!("按共享者设置的 {desc} 观看"));
-                            ui.selectable_value(&mut v.low, true, "流畅").on_hover_text("360P 低画质，省流量、网络差时更不容易卡");
-                            if v.low != before {
-                                relayer.push((*id, v.low, v.route));
-                            }
-                        }
                         {
-                            let before = v.route;
-                            ui.separator();
-                            ui.selectable_value(&mut v.route, 0, "自动").on_hover_text("能直连就直连，否则经服务器（推荐）");
-                            ui.selectable_value(&mut v.route, 1, "P2P").on_hover_text(
-                                "画面直接从共享者发给你，不受对方上行预算限制；和对方打不通时仍经服务器。\n双方都要 0.4.2 以上，服务器也要升级",
-                            );
-                            ui.selectable_value(&mut v.route, 2, "服务器")
-                                .on_hover_text("画面经服务器转给你。直连卡顿、花屏或一直等待画面时试试\n双方都要 0.4.2 以上，服务器也要升级");
-                            if v.route != before {
-                                relayer.push((*id, v.low, v.route));
-                            }
-                            // 播放方式：流畅优先（匀速，默认）/ 延迟优先（到了就显示）
-                            ui.separator();
-                            let mut smooth = v.view.smooth.load(Ordering::Relaxed);
-                            let was = smooth;
-                            ui.selectable_value(&mut smooth, true, "流畅优先")
-                                .on_hover_text("画面成串到达时按原来的间隔匀速显示，看着更顺；网络稳时只多一两帧的延迟");
-                            ui.selectable_value(&mut smooth, false, "延迟优先").on_hover_text("画面一到就显示，延迟最低；网络抖时会一顿一顿的");
-                            if smooth != was {
-                                v.view.smooth.store(smooth, Ordering::Relaxed);
-                                smooth_change = Some(smooth);
-                            }
+                            // 画质 / 线路 / 播放方式收进「⚙」菜单（第 53-4 项：顶栏一行按钮太挤，窗口小了会折行）
+                            let simulcast = user.is_some_and(|u| u.simulcast);
+                            ui.menu_button("⚙ 画质 · 线路", |ui| {
+                                if simulcast {
+                                    ui.label(RichText::new("画质").size(12.0).color(th::TEXT_DIM));
+                                    let before = v.low;
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(&mut v.low, false, "原画").on_hover_text(format!("按共享者设置的 {desc} 观看"));
+                                        ui.selectable_value(&mut v.low, true, "流畅").on_hover_text("360P 低画质，省流量、网络差时更不容易卡");
+                                    });
+                                    if v.low != before {
+                                        relayer.push((*id, v.low, v.route));
+                                    }
+                                    ui.separator();
+                                }
+                                ui.label(RichText::new("画面线路").size(12.0).color(th::TEXT_DIM));
+                                let before = v.route;
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut v.route, 0, "自动").on_hover_text("能直连就直连，否则经服务器（推荐）");
+                                    ui.selectable_value(&mut v.route, 1, "P2P").on_hover_text(
+                                        "画面直接从共享者发给你，不受对方上行预算限制；和对方打不通时仍经服务器。\n双方都要 0.4.2 以上，服务器也要升级",
+                                    );
+                                    ui.selectable_value(&mut v.route, 2, "服务器")
+                                        .on_hover_text("画面经服务器转给你。直连卡顿、花屏或一直等待画面时试试\n双方都要 0.4.2 以上，服务器也要升级");
+                                });
+                                if v.route != before {
+                                    relayer.push((*id, v.low, v.route));
+                                }
+                                // 播放方式：流畅优先（匀速，默认）/ 延迟优先（到了就显示）
+                                ui.separator();
+                                ui.label(RichText::new("播放方式").size(12.0).color(th::TEXT_DIM));
+                                let mut smooth = v.view.smooth.load(Ordering::Relaxed);
+                                let was = smooth;
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut smooth, true, "流畅优先")
+                                        .on_hover_text("画面成串到达时按原来的间隔匀速显示，看着更顺；网络稳时只多一两帧的延迟");
+                                    ui.selectable_value(&mut smooth, false, "延迟优先").on_hover_text("画面一到就显示，延迟最低；网络抖时会一顿一顿的");
+                                });
+                                if smooth != was {
+                                    v.view.smooth.store(smooth, Ordering::Relaxed);
+                                    smooth_change = Some(smooth);
+                                }
+                            });
                             let p2p_only = user.is_some_and(|u| u.share_p2p_only);
                             match voice.video_direct(*id) {
                                 Some(true) => th::pill(ui, "⇄ 直连中", th::GREEN, th::GREEN_SOFT),
@@ -1990,7 +2082,7 @@ impl App {
                                 Some(false) => th::pill(ui, "经服务器", th::TEXT_DIM, th::BG_ELEVATED),
                                 None => th::pill(ui, "没收到画面", th::YELLOW, th::BG_ELEVATED),
                             }
-                            .on_hover_text("现在画面实际走的线路（最近 2 秒）");
+                            .on_hover_text(th::video_route_explain(voice.video_direct(*id), voice.current_link().and_then(|l| l.direct_peers().get(id).copied()).as_ref(), v.route, p2p_only));
                             if p2p_only {
                                 th::pill(ui, "共享者只走 P2P", th::TEXT_DIM, th::BG_ELEVATED)
                                     .on_hover_text("共享者设置了画面不经服务器：和他打不通直连、也没有别的观看者能转给你时看不了");
@@ -2024,9 +2116,24 @@ impl App {
                                     m.set_volume(sid, vol / 100.0);
                                 }
                                 ui.label(RichText::new("共享声音").size(12.0).color(th::TEXT_DIM));
+                                // 共享声音的播放情况（第 54-d 项）：分清杂音是网络丢包、播放缓冲见底，还是共享者那边录音丢数据
+                                let a = m.stream_stats(sid).unwrap_or_default();
+                                let glitch = v.view.sharer_info.lock().unwrap().map(|(i, _)| i.audio_glitches).unwrap_or(0);
+                                let audio_tip = format!(
+                                    "只调你听到的共享声音大小（游戏、视频的声音），不影响他说话的音量；右键他的名字也能调\n\n\
+                                     共享声音：缓冲 {} ms（目标 {}）· 丢包补音 {} 帧 · 播空 {} 次 · 积压丢弃 {} 次 · 播放速度 {:+.1}%\n\
+                                     共享者那边录音没跟上：最近一秒 {glitch} 次\n\
+                                     有「咔哒」声时：补音、播空多 = 网络问题；录音没跟上 = 共享者电脑太忙",
+                                    a.buffered_ms,
+                                    a.target_ms,
+                                    a.concealed,
+                                    a.underruns,
+                                    a.drops,
+                                    a.rate_permille as f32 / 10.0
+                                );
                                 if ui
                                     .add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").fixed_decimals(0))
-                                    .on_hover_text("只调你听到的共享声音大小（游戏、视频的声音），不影响他说话的音量；右键他的名字也能调")
+                                    .on_hover_text(audio_tip)
                                     .on_disabled_hover_text("对方没有勾选「同时共享电脑声音」")
                                     .changed()
                                 {
@@ -2037,9 +2144,33 @@ impl App {
                         if ui.button("全屏").on_hover_text("全屏观看（双击画面也可以；Esc 退出）").clicked() {
                             go_full = Some(*id);
                         }
+                        let (pop_text, pop_tip) = if popped {
+                            ("⤓ 收回", "收回到 VOC 主窗口里")
+                        } else {
+                            ("⤢ 弹出", "弹出成独立窗口：可以拖到另一个显示器、置顶，主窗口照常聊天")
+                        };
+                        if ui.button(pop_text).on_hover_text(pop_tip).clicked() {
+                            toggle_pop = true;
+                        }
+                        if popped && ui.checkbox(&mut v.on_top, "置顶").on_hover_text("这个窗口总在最前面（打游戏时也看得到）").changed() {
+                            let level = if v.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                        }
                     });
-                    match &v.tex {
-                        Some(t) => {
+                    match (&v.gpu, &v.tex) {
+                        (Some(g), _) => {
+                            let avail = ui.available_size();
+                            let (w, h) = (v.size.0.max(1) as f32, v.size.1.max(1) as f32);
+                            let scale = (avail.x / w).min(avail.y / h).max(0.05);
+                            let (area, r) = ui.allocate_exact_size(avail, Sense::click());
+                            let img = egui::Rect::from_center_size(area.center(), Vec2::new(w * scale, h * scale));
+                            crate::nv12view::paint(ui.painter(), img, *id, g.clone());
+                            draw_remote_cursor(ui.painter(), img, &v.view);
+                            if r.double_clicked() {
+                                go_full = Some(*id);
+                            }
+                        }
+                        (None, Some(t)) => {
                             let avail = ui.available_size();
                             let (w, h) = (v.size.0.max(1) as f32, v.size.1.max(1) as f32);
                             let scale = (avail.x / w).min(avail.y / h).max(0.05);
@@ -2053,11 +2184,33 @@ impl App {
                                 }
                             });
                         }
-                        None => {
+                        (None, None) => {
                             ui.centered_and_justified(|ui| ui.label(RichText::new("正在等待画面…").color(th::TEXT_DIM)));
                         }
                     }
+            };
+            if popped {
+                // 独立窗口（第 53-4 项）：系统的窗口，能拖到另一个显示器；关掉 = 停止观看
+                let vid = egui::ViewportId::from_hash_of(("viewer-window", *id));
+                let title = format!("{name} 的屏幕 - VOC");
+                ctx.show_viewport_immediate(vid, egui::ViewportBuilder::default().with_title(title).with_inner_size([1100.0, 680.0]).with_min_inner_size([480.0, 300.0]), |vctx, _| {
+                    egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK).inner_margin(Margin::same(8))).show(vctx, |ui| body(ui));
+                    if vctx.input(|i| i.viewport().close_requested()) {
+                        open = false;
+                    }
                 });
+            } else {
+                egui::Window::new(RichText::new(format!("📺 {name} 的屏幕")).strong())
+                    .id(egui::Id::unique(("viewer", *id)))
+                    .open(&mut open)
+                    .default_size([960.0, 580.0])
+                    .resizable(true)
+                    .frame(egui::Frame::window(&ctx.global_style()).fill(Color32::BLACK).inner_margin(Margin::same(8)))
+                    .show(ctx, |ui| body(ui));
+            }
+            if toggle_pop {
+                v.popped = !v.popped;
+            }
             if !open {
                 close.push(*id);
             }
@@ -2071,6 +2224,7 @@ impl App {
         }
         for id in close {
             self.views.remove(&id);
+            crate::nv12view::forget(id);
             self.voice.video.watch(id, false);
             s.send(ClientMsg::Watch { target: id, on: false, low: false, route: 0, cursor: false });
         }
@@ -2302,6 +2456,26 @@ impl eframe::App for App {
 }
 
 /// 在观看画面上画共享者单独发来的鼠标（0.6 秒没收到就不画：共享者那边把鼠标画进画面了）
+/// 共享声音走哪条线路（第 54 项；共享者统一选，和画面的线路分开）
+fn share_audio_route_ui(ui: &mut egui::Ui, route: &mut u8, p2p_only: bool) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("共享声音线路").size(12.5).color(th::TEXT_DIM));
+        ui.add_enabled_ui(!p2p_only, |ui| {
+            ui.selectable_value(route, crate::voice::SHARE_AUDIO_AUTO, "自动")
+                .on_hover_text("跟你和他的语音走同一条线路：语音判成不稳、改走中转时声音也跟着改；直连有一点丢包时两条路同时发（推荐）");
+            ui.selectable_value(route, crate::voice::SHARE_AUDIO_SERVER, "服务器")
+                .on_hover_text("共享声音一律经服务器转发：多一点延迟，但不受直连丢包影响。占服务器带宽（每个观看者约 70 kbps）");
+            ui.selectable_value(route, crate::voice::SHARE_AUDIO_DIRECT, "直连")
+                .on_hover_text("能打通直连的人一律直连发，不看直连稳不稳；打不通的人还是经服务器");
+        })
+        .response
+        .on_disabled_hover_text("你选了「只通过 P2P 直连发送」：共享声音也只走直连");
+    });
+    if !crate::voice::SERVER_SHARE_AUDIO_ROUTE.load(Ordering::Relaxed) && *route != crate::voice::SHARE_AUDIO_AUTO && !p2p_only {
+        ui.label(RichText::new("服务器版本较旧：要升级到 0.6.2 这个选项才生效，现在共享声音跟着画面的线路走").size(11.5).color(th::YELLOW));
+    }
+}
+
 fn draw_remote_cursor(p: &egui::Painter, img: egui::Rect, view: &crate::video::View) {
     use voc_proto::udp::*;
     let Some((x, y, shape, visible, at)) = *view.cursor.lock().unwrap() else { return };

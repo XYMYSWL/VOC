@@ -111,18 +111,61 @@ pub fn log(msg: impl AsRef<str>) {
         let _ = std::fs::rename(&path, path.with_extension("old.log"));
     }
     let ms = voc_proto::now_millis();
-    let secs = ms / 1000 + 8 * 3600;
-    let line = format!("[{} {:02}:{:02}:{:02}.{:03}] {}\n", day(ms), (secs / 3600) % 24, (secs / 60) % 60, secs % 60, ms % 1000, msg.as_ref());
+    let t = local_time(ms);
+    let line = format!("[{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}] {}\n", t.0, t.1, t.2, t.3, t.4, t.5, ms % 1000, msg.as_ref());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
 }
 
-/// 日期（北京时间，和界面上的时间一致）
-fn day(ms: u64) -> String {
-    let days = (ms / 1000 + 8 * 3600) / 86_400;
-    // 1970-01-01 起的天数 → 年月日（公历）
-    let z = days as i64 + 719_468;
+/// Unix 毫秒 → 电脑本地时区的（年, 月, 日, 时, 分, 秒）；拿不到时区时按 UTC
+pub fn local_time(ms: u64) -> (i64, u32, u32, u32, u32, u32) {
+    #[cfg(windows)]
+    if let Some(t) = win_local(ms) {
+        return t;
+    }
+    utc_time(ms)
+}
+
+/// 电脑现在的时区，例如「UTC+9」「UTC+5:30」（诊断信息用）
+pub fn tz_label() -> String {
+    let ms = voc_proto::now_millis();
+    let (y, mo, d, h, mi, _) = local_time(ms);
+    let local = days_from_civil(y, mo, d) * 86_400 + h as i64 * 3600 + mi as i64 * 60;
+    let utc = (ms / 1000) as i64 / 60 * 60;
+    let off = (local - utc) / 60;
+    let (sign, off) = if off < 0 { ('-', -off) } else { ('+', off) };
+    if off % 60 == 0 {
+        format!("UTC{sign}{}", off / 60)
+    } else {
+        format!("UTC{sign}{}:{:02}", off / 60, off % 60)
+    }
+}
+
+#[cfg(windows)]
+fn win_local(ms: u64) -> Option<(i64, u32, u32, u32, u32, u32)> {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    let ticks = ms * 10_000 + 116_444_736_000_000_000;
+    let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let mut utc = SYSTEMTIME::default();
+    let mut loc = SYSTEMTIME::default();
+    unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut loc).ok()?;
+    }
+    Some((loc.wYear as i64, loc.wMonth as u32, loc.wDay as u32, loc.wHour as u32, loc.wMinute as u32, loc.wSecond as u32))
+}
+
+fn utc_time(ms: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let secs = ms / 1000;
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    (y, m, d, ((secs / 3600) % 24) as u32, ((secs / 60) % 60) as u32, (secs % 60) as u32)
+}
+
+/// 1970-01-01 起的天数 → 年月日（公历）
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -131,7 +174,18 @@ fn day(ms: u64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{:04}-{:02}-{:02}", if m <= 2 { y + 1 } else { y }, m, d)
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// 年月日 → 1970-01-01 起的天数
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// 最后 n 行（导出诊断用）
@@ -148,9 +202,13 @@ mod tests {
 
     #[test]
     fn dates() {
-        assert_eq!(day(0), "1970-01-01");
-        // 2026-11-22 00:30 北京时间 = 2026-11-21 16:30 UTC
-        assert_eq!(day(1_795_278_600_000), "2026-11-22");
-        assert_eq!(day(951_782_400_000), "2000-02-29"); // 闰日（UTC 00:00 = 北京 08:00）
+        assert_eq!(utc_time(0), (1970, 1, 1, 0, 0, 0));
+        assert_eq!(utc_time(1_795_278_600_000), (2026, 11, 21, 16, 30, 0));
+        assert_eq!(utc_time(951_782_400_000), (2000, 2, 29, 0, 0, 0)); // 闰日
+        for days in [-1000i64, 0, 11_016, 20_413, 60_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+        println!("本机时区 {}，现在 {:?}", tz_label(), local_time(voc_proto::now_millis()));
     }
 }

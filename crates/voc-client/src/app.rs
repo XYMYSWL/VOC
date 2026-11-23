@@ -50,6 +50,14 @@ struct Persisted {
     aec: bool,
     /// 屏幕共享时同时共享电脑声音
     share_audio: bool,
+    /// 共享声音的线路（第 54 项）：0 自动（跟语音走），1 总是经服务器，2 总是直连
+    share_audio_route: u8,
+    /// 共享声音、伴奏用立体声发（第 55-b 项；多占一点流量）
+    stream_stereo: bool,
+    /// 语音 10 ms 一包（第 36-3 项：少 10 ms 延迟，每条路多约 30 kbps）
+    voice_10ms: bool,
+    /// 声卡低延迟模式（第 36 项语音第 1 条：IAudioClient3 最小周期，驱动不支持自动退回）
+    low_latency_device: bool,
     /// 按键说话：虚拟键码，0 = 语音激活
     ptt_vk: u32,
     /// 被 @、收到私聊时弹 Windows 通知
@@ -160,6 +168,10 @@ impl Default for Persisted {
             close_to_tray: true,
             aec: true,
             share_audio: true,
+            share_audio_route: 0,
+            stream_stereo: false,
+            voice_10ms: false,
+            low_latency_device: false,
             ptt_vk: 0,
             notify: true,
             mute_key: crate::hotkey::Hotkey::ctrl(0x4D),
@@ -255,6 +267,12 @@ fn apply_image_events(s: &mut Session, events: Vec<crate::images::ImageEvent>, c
 struct Session {
     /// 演示模式下为 None
     conn: Option<Conn>,
+    /// 服务器说它马上要重启（第 53-5 项）：(说明, 收到的时间)。之后断线就显示这句、马上重连
+    restarting: Option<(String, std::time::Instant)>,
+    /// 断线恢复凭证（第 37-2 项）：(我的编号, 凭证)；旧服务器没有
+    resume: Option<(u32, String)>,
+    /// 正在用凭证恢复：(连接结果, 开始的时间)。这期间界面、语音都不断
+    resuming: Option<(Receiver<ConnectResult>, std::time::Instant)>,
     /// 上一次看到的（我所在频道, 同频道其他人），用来判断谁进谁出、播提示音
     last_members: Option<(Option<u32>, Vec<u32>)>,
     events: Receiver<NetEvent>,
@@ -393,9 +411,14 @@ struct Reconnect {
     next_at: std::time::Instant,
     /// 正在进行的连接
     pending: Option<Receiver<ConnectResult>>,
+    /// 是服务器重启造成的断开（服务器事先通知了）
+    server_restart: bool,
 }
 
 /// 第 n 次失败后等多久再试：1、2、5、10、20、30 秒，之后一直 30 秒
+/// 断开原因前面加这个标记 = 服务器事先通知了重启（begin_reconnect 去掉它）
+const RESTART_MARK: &str = "\u{1}restart\u{1}";
+
 pub fn reconnect_delay(attempt: u32) -> Duration {
     const STEPS: [u64; 6] = [1, 2, 5, 10, 20, 30];
     Duration::from_secs(STEPS[(attempt as usize).min(STEPS.len() - 1)])
@@ -515,6 +538,8 @@ pub struct App {
     settings_tab: u8,
     sfx_seq: u16,
     updater: crate::update::Updater,
+    /// 要用这个凭证做断线恢复（下一帧开始，第 37-2 项）
+    pending_resume: Option<(u32, String)>,
     /// Wi-Fi 低延迟模式（第 37-1 项）：Some = 在频道里试过（里面的 None = 没有 Wi-Fi / 不支持）
     wifi: Option<Option<crate::wifi::LowLatency>>,
     /// 上次点「复制诊断信息」的时间（显示「已复制」）
@@ -588,11 +613,20 @@ struct Viewer {
     low: bool,
     /// 画面线路：0 自动，1 P2P 直连，2 走服务器
     route: u8,
+    /// 掉帧原因用：上次的累计统计和时间、这一秒的速率
+    rx_prev: Option<(crate::vrecv::RxStats, std::time::Instant)>,
+    /// 最新一帧是 NV12（在显卡上转颜色画）
+    gpu: Option<crate::nv12view::Nv12>,
+    /// 弹出成独立窗口了（第 53-4 项）、独立窗口置顶
+    popped: bool,
+    on_top: bool,
+    rates: crate::theme::ViewRates,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::setup_fonts(&cc.egui_ctx);
+        crate::nv12view::init(cc);
         crate::theme::apply(&cc.egui_ctx);
         // 测试模式（VOC_AUTOLOGIN）从默认配置开始、每次新身份：不受本机真实设置影响（例如真实配置开着「只走 P2P」），
         // 几个测试客户端也不会共用同一个身份
@@ -645,6 +679,7 @@ impl App {
         }
         video::HW_DECODE.store(cfg.hw_decode, Ordering::Relaxed);
         video::SMOOTH_PLAYBACK.store(cfg.smooth_playback, Ordering::Relaxed);
+        audio::LOW_LATENCY_DEVICE.store(cfg.low_latency_device, Ordering::Relaxed);
         voice.video.set_ctx(cc.egui_ctx.clone()); // 收到新视频帧时唤醒界面
         let (frames_tx, frames_rx) = mpsc::sync_channel(100);
         let denoise: DenoiseSlot = Arc::new(Mutex::new(None));
@@ -680,6 +715,7 @@ impl App {
             sfx_seq: 0,
             updater: crate::update::Updater::default(),
             wifi: None,
+            pending_resume: None,
             diag_copied: None,
             diag_names: false,
             log_path_copied: None,
@@ -801,6 +837,11 @@ impl App {
 
     /// 后台建立连接，结果从返回的通道里取
     fn spawn_connect(&self) -> Receiver<ConnectResult> {
+        self.spawn_connect_with(None)
+    }
+
+    /// resume = 断线恢复凭证（第 37-2 项）
+    fn spawn_connect_with(&self, resume: Option<(u32, String)>) -> Receiver<ConnectResult> {
         let ctx = &self.egui_ctx;
         let addr = self.cfg.server.clone();
         let name = self.cfg.name.clone();
@@ -816,6 +857,7 @@ impl App {
                 &addr,
                 &name,
                 &code,
+                resume,
                 move || notify_ctx.request_repaint(),
                 move |kind, payload| match kind {
                     voc_proto::crypto::KIND_VIDEO => voice::on_server_video(payload, &voice, false),
@@ -832,6 +874,10 @@ impl App {
 
     /// 离开主界面前：关掉共享 / 观看 / 语音，把聊天存起来（重新连上同一个服务器时接着显示）
     fn leave_main(&mut self) {
+        // 主动离开：告诉服务器马上移除我（不用保留 20 秒等恢复，第 37-2 项）
+        if let Screen::Main(s) = &self.screen {
+            s.send(ClientMsg::Bye);
+        }
         self.stop_music();
         self.share_audio_src = None;
         self.fullscreen = None;
@@ -855,11 +901,15 @@ impl App {
             self.rejoin = s.me().and_then(|u| u.channel_id);
         }
         self.leave_main();
+        // 服务器事先通知了重启：不等，马上开始重连（连不上再按原来的间隔）
+        let server_restart = reason.starts_with(RESTART_MARK);
+        let reason = reason.trim_start_matches(RESTART_MARK).to_string();
         self.screen = Screen::Reconnecting(Box::new(Reconnect {
             reason,
             attempt: 0,
-            next_at: std::time::Instant::now() + reconnect_delay(0),
+            next_at: std::time::Instant::now() + if server_restart { Duration::from_millis(300) } else { reconnect_delay(0) },
             pending: None,
+            server_restart,
         }));
     }
 
@@ -878,6 +928,9 @@ impl App {
             dms,
             chat_tab: None,
             chat_input: String::new(),
+            restarting: None,
+            resume: None,
+            resuming: None,
             new_channel: String::new(),
             server_key,
             e2e: None,
@@ -946,6 +999,10 @@ impl App {
     /// VOC_TEST_SHARE=720 / 1080 进频道后自动共享屏幕；VOC_TEST_WATCH=main / low 自动看第一个在共享的人；
     /// VOC_TEST_LOG=文件 每秒追加一行共享 / 观看状态
     fn test_share_and_watch(&mut self) {
+        // VOC_TEST_OUT_VOL=百分比：播放音量（本机两个客户端测共享声音时设 0，免得观看端放出来又被共享端录回去）
+        if let Some(v) = std::env::var("VOC_TEST_OUT_VOL").ok().and_then(|v| v.parse::<f32>().ok()) {
+            self.settings.output_volume.set(v / 100.0);
+        }
         let Screen::Main(s) = &mut self.screen else { return };
         if s.me().and_then(|u| u.channel_id).is_none() {
             return;
@@ -963,9 +1020,14 @@ impl App {
             cfg.auto_res = env("VOC_TEST_AUTO_RES").map(|v| v != 0).unwrap_or(cfg.auto_res);
             cfg.p2p_only = env("VOC_TEST_P2P_ONLY").map(|v| v != 0).unwrap_or(cfg.p2p_only);
             let rtx = env("VOC_TEST_RTX") != Some(0);
+            // VOC_TEST_SHARE_AUDIO=1 同时共享电脑声音；VOC_TEST_SHARE_AUDIO_ROUTE=0/1/2；VOC_TEST_STEREO=0/1
+            let audio = env("VOC_TEST_SHARE_AUDIO") == Some(1);
+            self.cfg.share_audio = audio;
+            self.cfg.share_audio_route = env("VOC_TEST_SHARE_AUDIO_ROUTE").map(|v| v as u8).unwrap_or(self.cfg.share_audio_route);
+            self.cfg.stream_stereo = env("VOC_TEST_STEREO").map(|v| v != 0).unwrap_or(self.cfg.stream_stereo);
             match Sharer::start(cfg.clone(), self.voice.clone()) {
                 Ok(sh) => {
-                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio: false, simulcast: true, rtx, bps: cfg.bitrate(), p2p_only: cfg.p2p_only });
+                    s.send(ClientMsg::ShareStart { desc: cfg.desc(), audio, simulcast: true, rtx, bps: cfg.bitrate(), p2p_only: cfg.p2p_only });
                     self.sharer = Some(sh);
                 }
                 Err(e) => eprintln!("VOC_TEST_SHARE 失败：{e}"),
@@ -981,7 +1043,7 @@ impl App {
                 };
                 s.send(ClientMsg::Watch { target: id, on: true, low, route, cursor: true });
                 if let Some(view) = self.voice.video.watch(id, true) {
-                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route });
+                    self.views.insert(id, Viewer { view, tex: None, seq: 0, size: (0, 0), low, route, rx_prev: None, rates: Default::default(), gpu: None, popped: false, on_top: false });
                 }
             }
         }
@@ -1016,7 +1078,7 @@ impl App {
             }
         );
         if let Some(l) = self.voice.current_link() {
-            line += &format!("NAT {:?} ", *l.nat.lock().unwrap());
+            line += &format!("NAT {:?} 第二探测点 {:?} 线路最大包 {:?} ", *l.nat.lock().unwrap(), l.nat_detail(), l.path_mtu());
             // 三人测试：每个人的语音这一秒放了几帧（满分 50）、其中补出来的几帧；中转路线；语音优先改走服务器的人
             let mut rx: Vec<(u32, (u32, u32))> = std::mem::take(&mut *self.voice.voice_rx.lock().unwrap()).into_iter().collect();
             rx.sort();
@@ -1077,6 +1139,20 @@ impl App {
                 v.view.cursor.lock().unwrap().map(|c| (c.0, c.1, c.2, c.3, c.4.elapsed().as_millis())),
                 self.voice.video.rx_stats(*id).map(|(s, k, rtt)| (s.fec_recovered, s.rtx_recovered, s.gaps, k, rtt, self.voice.video.recovered_count(*id)))
             );
+            // 0.6.2：显卡转颜色、共享者状态、共享声音播放情况
+            let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
+            line += &format!(
+                "要补发 {} 片 显卡转颜色 {} 收到 {} fps 显示耗时 {} ms 共享者 {:?} 共享声音 {:?} ",
+                self.voice.video.rx_stats(*id).map(|(s, _, _)| s.nack_frags).unwrap_or(0),
+                f.as_ref().is_some_and(|f| f.nv12.is_some()),
+                v.view.rx_fps.load(Ordering::Relaxed),
+                v.view.show_ms.load(Ordering::Relaxed),
+                v.view.sharer_info.lock().unwrap().map(|(i, _)| i),
+                self.mixer.lock().unwrap().stream_stats(sid)
+            );
+        }
+        if self.share_audio_src.is_some() {
+            line += &format!("| 共享声音在发 录音不连续 {} ", crate::loopback::GLITCHES.load(Ordering::Relaxed));
         }
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -1129,6 +1205,11 @@ impl App {
         let _ = writeln!(d, "版本：{}", crate::update::VERSION);
         let _ = writeln!(d, "系统：{}", os_version());
         let _ = writeln!(d, "安装方式：{}", if crate::update::is_packaged() { "安装版（MSIX）" } else { "绿色版" });
+        let _ = writeln!(d, "时区：{}（日志和聊天时间按这个时区显示）", crate::applog::tz_label());
+        if let Some(st) = &self.streams {
+            // 播放设备不是 48 kHz 时要变采样率（第 55-a 项）
+            let _ = writeln!(d, "声卡：输入 {} · 输出 {}", st.input_desc, st.output_desc);
+        }
         let _ = writeln!(d, "\n[网络]");
         let _ = writeln!(d, "Wi-Fi 低延迟模式：{}", crate::wifi::state_text());
         match (&self.screen, self.voice.current_link()) {
@@ -1140,6 +1221,21 @@ impl App {
                 };
                 let _ = writeln!(d, "已连接：是 · 传输 {tr} · 到服务器 {} ms", self.voice.ping_ms.load(Ordering::Relaxed));
                 let _ = writeln!(d, "低带宽模式：{}", if self.cfg.low_bandwidth { "开" } else { "关" });
+                if let Some(t) = l.nat_detail() {
+                    let _ = writeln!(d, "NAT（第二个探测点）：{t}");
+                }
+                // 第 37-4 项：线路能走多大的包（加密后的 UDP 字节数）
+                let (mtus, max_sent) = l.path_mtu();
+                if !mtus.is_empty() {
+                    let list: Vec<String> = mtus.iter().map(|(k, m)| format!("{} {m}", k.map(|i| format!("#{i}")).unwrap_or("服务器".into()))).collect();
+                    let _ = writeln!(d, "线路能走的最大包（字节）：{} · VOC 实际发过最大 {max_sent}", list.join(" · "));
+                    for (k, m) in &mtus {
+                        if *m > 0 && *m < max_sent {
+                            let who = k.map(|i| format!("和 #{i} 的直连")).unwrap_or("到服务器的线路".into());
+                            let _ = writeln!(d, "⚠ {who}只能走 {m} 字节的包（可能在用 VPN），比 VOC 发的大包小：大包会被拆开或丢掉，画面可能卡");
+                        }
+                    }
+                }
                 let _ = writeln!(d, "P2P：{} · 上行预算 {} Mbps · 帮队友中转：{}", if l.p2p_on() { "开" } else { "关" }, self.cfg.p2p_budget_mbps, if self.cfg.relay { "开" } else { "关" });
                 let states = l.punch_states();
                 let count = |f: &dyn Fn(&voice::PunchState) -> bool| states.values().filter(|s| f(s)).count();
@@ -1201,12 +1297,30 @@ impl App {
                     }
                 }
                 let _ = writeln!(d, "伴奏：{}", if self.music.is_some() { "正在放" } else { "没放" });
+                if self.share_audio_src.is_some() {
+                    let route = ["自动（跟语音走）", "总是经服务器", "总是直连"][self.cfg.share_audio_route.min(2) as usize];
+                    let _ = writeln!(
+                        d,
+                        "共享声音：在发 · 线路 {route}{} · {} {} kbps · 录音数据不连续 {} 次",
+                        if voice::SERVER_SHARE_AUDIO_ROUTE.load(Ordering::Relaxed) { "" } else { "（服务器旧，实际跟画面走）" },
+                        if self.cfg.stream_stereo { "立体声" } else { "单声道" },
+                        crate::streams::bitrate(self.cfg.stream_stereo, self.cfg.low_bandwidth) / 1000,
+                        crate::loopback::GLITCHES.load(Ordering::Relaxed)
+                    );
+                }
                 let loss = self.voice.current_link().map(|l| l.voice_path_loss()).unwrap_or(0);
                 let _ = writeln!(
                     d,
                     "语音抗丢包：{}（发出方向线路丢包约 {loss}%）",
 
                     if self.voice.dred_active.load(Ordering::Relaxed) { "DRED 深度冗余" } else { "带内 FEC" }
+                );
+                let _ = writeln!(
+                    d,
+                    "语音包：{}（设置{}）· 同频道都认识带冗余的语音包：{}",
+                    if voice::VOICE_10MS.load(Ordering::Relaxed) { "10 ms" } else { "20 ms" },
+                    if self.cfg.voice_10ms { "开" } else { "关" },
+                    if voice::VOICE_RED_OK.load(Ordering::Relaxed) { "是" } else { "否" }
                 );
                 let _ = writeln!(d, "在看别人的共享：{} 路", self.views.len());
                 if let Some(l) = self.voice.current_link() {
@@ -1223,6 +1337,19 @@ impl App {
                     }
                 }
                 for id in self.views.keys() {
+                    let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
+                    if let Some(a) = self.mixer.lock().unwrap().stream_stats(sid) {
+                        let _ = writeln!(
+                            d,
+                            "  #{id} 的共享声音：缓冲 {} ms（目标 {}）· 丢包补音 {} 帧 · 播空 {} 次 · 积压丢弃 {} 次 · 播放速度 {:+.1}%",
+                            a.buffered_ms,
+                            a.target_ms,
+                            a.concealed,
+                            a.underruns,
+                            a.drops,
+                            a.rate_permille as f32 / 10.0
+                        );
+                    }
                     if let Some((st, keys, rtt)) = self.voice.video.rx_stats(*id) {
                         let rtx_on = self.voice.rtx_sharers.lock().unwrap().contains(id);
                         let loss = if st.data_total > 0 { st.data_lost as f64 * 100.0 / st.data_total as f64 } else { 0.0 };
@@ -1393,13 +1520,35 @@ impl App {
             self.test_share_and_watch();
         }
         // 屏幕共享的声音：共享时开，停了就关（录除了 VOC 自己以外的全部声音）
+        voice::SHARE_AUDIO_ROUTE.store(self.cfg.share_audio_route.min(2), Ordering::Relaxed);
+        // 语音 10 ms 一包 / 带冗余：同频道的人都认识才用（旧版本按 20 ms 一包估抖动、不认识冗余包）
+        if let Screen::Main(s) = &self.screen {
+            let my_ch = s.me().and_then(|u| u.channel_id);
+            let others: Vec<u32> = s.users.iter().filter(|u| u.id != s.user_id && my_ch.is_some() && u.channel_id == my_ch).map(|u| u.id).collect();
+            let (ten, red) = match &s.e2e {
+                Some(e) => {
+                    let e = e.lock().unwrap();
+                    (
+                        others.iter().all(|id| e.member_has(*id, voc_proto::e2e::FEATURE_VOICE10)),
+                        others.iter().all(|id| e.member_has(*id, voc_proto::e2e::FEATURE_VOICE_RED)),
+                    )
+                }
+                None => (false, false),
+            };
+            voice::VOICE_10MS.store(self.cfg.voice_10ms && ten, Ordering::Relaxed);
+            voice::VOICE_RED_OK.store(red, Ordering::Relaxed);
+        }
         let want_share_audio = self.sharer.is_some() && self.cfg.share_audio && crate::loopback::supported();
+        // 改了立体声 / 单声道：重新开一路
+        if self.share_audio_src.as_ref().is_some_and(|s| s.stereo != self.cfg.stream_stereo) {
+            self.share_audio_src = None;
+        }
         if !want_share_audio {
             self.share_audio_src = None;
             self.share_audio_failed = false;
         } else if self.share_audio_src.is_none() && !self.share_audio_failed {
             let target = crate::loopback::Target::Exclude(std::process::id());
-            match crate::streams::start(voc_proto::udp::SHARE_AUDIO, target, self.voice.clone(), Arc::new(audio::AtomicF32::new(1.0))) {
+            match crate::streams::start(voc_proto::udp::SHARE_AUDIO, target, self.voice.clone(), Arc::new(audio::AtomicF32::new(1.0)), self.cfg.stream_stereo) {
                 Ok(src) => self.share_audio_src = Some(src),
                 Err(e) => {
                     self.share_audio_failed = true;
@@ -1540,7 +1689,7 @@ impl App {
     pub(crate) fn start_music(&mut self, pid: u32, name: String) {
         self.stop_music();
         let gain = Arc::new(audio::AtomicF32::new(1.0));
-        match crate::streams::start(voc_proto::udp::MUSIC, crate::loopback::Target::Include(pid), self.voice.clone(), gain.clone()) {
+        match crate::streams::start(voc_proto::udp::MUSIC, crate::loopback::Target::Include(pid), self.voice.clone(), gain.clone(), self.cfg.stream_stereo) {
             Ok(src) => {
                 let prev_volume = crate::loopback::app_volume(pid).unwrap_or(1.0);
                 if let Screen::Main(s) = &self.screen {
@@ -1715,18 +1864,72 @@ impl App {
             }
         }
 
+        // 断线恢复（第 37-2 项）：后台在用凭证重连，界面和语音都不动
+        if let Some(r) = self.pending_resume.take() {
+            let rx = self.spawn_connect_with(Some(r));
+            if let Screen::Main(s) = &mut self.screen {
+                s.resuming = Some((rx, std::time::Instant::now()));
+            }
+        }
+        if let Screen::Main(s) = &mut self.screen {
+            if let Some((rx, at)) = &s.resuming {
+                match rx.try_recv() {
+                    Ok(Ok((conn, events))) => {
+                        if let Some(l) = self.voice.current_link() {
+                            l.set_tcp(conn.tx.clone());
+                        }
+                        s.conn = Some(conn);
+                        s.events = events;
+                        s.resuming = None;
+                    }
+                    Ok(Err(e)) => {
+                        crate::applog::log(format!("断线恢复没成功（{e}），改成重新登录"));
+                        s.resuming = None;
+                        return Some(Dropped { reason: "与服务器的连接断开了".into(), retry: true });
+                    }
+                    Err(mpsc::TryRecvError::Empty) if at.elapsed() > Duration::from_secs(18) => {
+                        crate::applog::log("断线恢复超时，改成重新登录");
+                        s.resuming = None;
+                        return Some(Dropped { reason: "与服务器的连接断开了".into(), retry: true });
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        s.resuming = None;
+                        return Some(Dropped { reason: "与服务器的连接断开了".into(), retry: true });
+                    }
+                }
+            }
+        }
         let Screen::Main(s) = &mut self.screen else { return None };
         while let Ok(ev) = s.events.try_recv() {
             match ev {
-                NetEvent::Closed(reason) => return Some(Dropped { reason, retry: true }),
+                NetEvent::Closed(reason) => {
+                    // 服务器事先说了要重启：显示服务器给的说明（不是网络问题）
+                    let restarting = s.restarting.as_ref().filter(|(_, at)| at.elapsed() < Duration::from_secs(20)).map(|(t, _)| t.clone());
+                    // 网络断了 / 换了网络，服务器给过恢复凭证：先试着接回原来的身份，语音不断（第 37-2 项）
+                    if let (None, Some(r), false) = (&restarting, &s.resume, self.demo.active) {
+                        crate::applog::log("和服务器的连接断了：用恢复凭证重连（语音照常走 UDP）");
+                        s.chat.push(ChatLine::System("网络断了一下，正在恢复连接…（语音尽量不断）".into()));
+                        self.pending_resume = Some(r.clone());
+                        self.egui_ctx.request_repaint();
+                        break;
+                    }
+                    let reason = match restarting {
+                        Some(text) => format!("{RESTART_MARK}{text}"),
+                        None => reason,
+                    };
+                    return Some(Dropped { reason, retry: true });
+                }
                 NetEvent::File(data) => {
                     let ev = self.images.on_chunk(&data);
                     apply_image_events(s, ev, &self.egui_ctx);
                 }
                 NetEvent::Msg(msg) => match msg {
-                    ServerMsg::Welcome { user_id, udp_port, server_name, features, probe_port } => {
+                    ServerMsg::Welcome { user_id, udp_port, server_name, features, probe_port, probe2, resume } => {
+                        s.resume = (!resume.is_empty()).then(|| (user_id, resume));
                         s.user_id = user_id;
                         self.voice.server_rtx.store(features.iter().any(|f| f == voc_proto::FEATURE_VIDEO_RTX), Ordering::Relaxed);
+                        voice::SERVER_SHARE_AUDIO_ROUTE.store(features.iter().any(|f| f == voc_proto::FEATURE_SHARE_AUDIO_ROUTE), Ordering::Relaxed);
                         crate::applog::log(format!("登录成功：服务器「{server_name}」，功能 {features:?}，NAT 探测端口 {}", if probe_port > 0 { "有" } else { "没有" }));
                         s.features = features;
                         s.server_name = server_name;
@@ -1747,6 +1950,7 @@ impl App {
                         if let Err(e) = voice::connect(
                             udp_addr,
                             probe_port,
+                            probe2.parse().ok(),
                             &conn.keys,
                             user_id,
                             self.cfg.p2p,
@@ -1905,6 +2109,16 @@ impl App {
                         if let Some(l) = self.voice.current_link() {
                             l.set_relays(routes);
                         }
+                    }
+                    ServerMsg::Resumed { user_id } => {
+                        crate::applog::log(format!("断线恢复成功（#{user_id}），语音没有重新建立"));
+                        s.chat.push(ChatLine::System("已恢复连接".into()));
+                    }
+                    ServerMsg::Restarting { text } => {
+                        let text = if text.is_empty() { "服务器正在重启，几秒后会自动重新连上".to_string() } else { text };
+                        crate::applog::log(format!("服务器通知：{text}"));
+                        s.chat.push(ChatLine::System(text.clone()));
+                        s.restarting = Some((text, std::time::Instant::now()));
                     }
                     ServerMsg::VoiceFallback { ids } => {
                         if let Some(l) = self.voice.current_link() {
@@ -2092,6 +2306,9 @@ impl App {
                 ChatLine::User { from: "Mia".into(), text: "1080p60 好清楚 👍".into(), ts: now - 30_000, mine: false, id: Some((5, 1)), reactions: vec![("❤".into(), vec![2])] },
             ],
             chat_input: String::new(),
+            restarting: None,
+            resume: None,
+            resuming: None,
             new_channel: String::new(),
             server_key: "voc.example.com".into(),
             e2e: None,
@@ -2150,8 +2367,8 @@ impl App {
                     rgba[i + 3] = 255;
                 }
             }
-            *view.frame.lock().unwrap() = Some(video::DecodedFrame { width: w, height: h, rgba, seq: 1 });
-            self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0), low: false, route: 0 });
+            *view.frame.lock().unwrap() = Some(video::DecodedFrame { width: w, height: h, rgba, nv12: None, seq: 1 });
+            self.views.insert(2, Viewer { view, tex: None, seq: 0, size: (0, 0), low: false, route: 0, rx_prev: None, rates: Default::default(), gpu: None, popped: false, on_top: false });
             if kind == "fullscreen" {
                 self.fullscreen = Some(2); // 演示只画全屏界面，不真的切换窗口全屏
             }

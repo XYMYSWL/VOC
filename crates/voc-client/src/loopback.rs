@@ -1,7 +1,7 @@
 //! 按程序采集声音（Windows 进程回环录音，WASAPI Process Loopback）。
 //! - 伴奏：只录某个程序（含它的子进程）发出的声音；
 //! - 屏幕共享声音：录除了 VOC 自己以外的全部声音（队友的说话声、提示音不会被录回去）。
-//! 输出 48 kHz 单声道，每 20 ms 一帧（960 个样本）。需要 Windows 10 build 20348 以上（实际上是 Windows 11）。
+//! 输出 48 kHz 立体声（左右交错），每 20 ms 一帧（960 × 2 个样本）。需要 Windows 10 build 20348 以上（实际上是 Windows 11）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,7 +16,10 @@ pub enum Target {
 }
 
 pub const RATE: u32 = 48_000;
+/// 每帧每个声道的样本数（20 ms）
 pub const FRAME: usize = 960;
+/// 录音时 Windows 报告「数据不连续」（录音线程没及时取、丢了一段）的累计次数（第 54-c 项）
+pub static GLITCHES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 正在采集；drop 即停止
 pub struct Capture {
@@ -62,7 +65,7 @@ pub fn os_build() -> u32 {
     0
 }
 
-/// 开始采集；每凑满 20 ms 调一次 on_frame（在采集线程里）
+/// 开始采集；每凑满 20 ms 调一次 on_frame（在采集线程里，左右交错的立体声）
 pub fn start(target: Target, on_frame: impl FnMut(&[f32]) + Send + 'static) -> Result<Capture, String> {
     if !supported() {
         return Err("按程序录音需要 Windows 11（Windows 10 build 20348 以上）".into());
@@ -191,7 +194,9 @@ mod win {
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
                     AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-                    200_000, // 20 ms（100 ns 单位）
+                    // 系统录音缓冲 150 ms（100 ns 单位）：共享者打游戏、CPU 忙时录音线程晚一点取也不丢声音（原来 20 ms，第 54-c 项）。
+                    // 用事件通知，平时照样每 10 ms 左右就取走，不会多出延迟
+                    1_500_000,
                     0,
                     &fmt,
                     None,
@@ -229,7 +234,8 @@ mod win {
             }
         };
         let _ = ready.send(Ok(()));
-        let mut acc: Vec<f32> = Vec::with_capacity(FRAME * 2);
+        let mut acc: Vec<f32> = Vec::with_capacity(FRAME * 4);
+        let mut glitches = 0u32;
         while !stop.load(Ordering::Relaxed) {
             if unsafe { WaitForSingleObject(ev, 100) } != WAIT_OBJECT_0 {
                 continue;
@@ -243,18 +249,26 @@ mod win {
                     break;
                 }
                 let silent = flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+                // 「数据不连续」：录音线程没及时取，系统丢了一段（观看者会听到「咔哒」）。记次数和日志（第 54-c 项）
+                if flags & (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32) != 0 && glitches < u32::MAX {
+                    glitches += 1;
+                    GLITCHES.fetch_add(1, Ordering::Relaxed);
+                    if glitches == 1 || glitches.is_power_of_two() {
+                        crate::applog::log(format!("按程序录音：数据不连续（录音没跟上，丢了一段声音），这次共 {glitches} 次"));
+                    }
+                }
                 if silent || data.is_null() {
-                    acc.extend(std::iter::repeat_n(0.0, frames as usize));
+                    acc.extend(std::iter::repeat_n(0.0, frames as usize * 2));
                 } else {
                     let s = unsafe { std::slice::from_raw_parts(data as *const i16, frames as usize * 2) };
-                    acc.extend(s.chunks(2).map(|lr| (lr[0] as f32 + lr[1] as f32) / 65536.0));
+                    acc.extend(s.iter().map(|&x| x as f32 / 32768.0));
                 }
                 unsafe {
                     let _ = cap.ReleaseBuffer(frames);
                 }
-                while acc.len() >= FRAME {
-                    on_frame(&acc[..FRAME]);
-                    acc.drain(..FRAME);
+                while acc.len() >= FRAME * 2 {
+                    on_frame(&acc[..FRAME * 2]);
+                    acc.drain(..FRAME * 2);
                 }
             }
         }

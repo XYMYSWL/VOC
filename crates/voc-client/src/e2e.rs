@@ -113,7 +113,8 @@ impl E2e {
         // 刚建立加密的人：发一次能力公告
         let new: Vec<u32> = self.pairs.keys().copied().filter(|id| self.trusted(*id) && !self.hello_sent.contains(id)).collect();
         if !new.is_empty() {
-            let hello = serde_json::to_vec(&e2e::Hello { features: vec![e2e::FEATURE_CHAT2.into()] }).expect("hello json");
+            let hello = serde_json::to_vec(&e2e::Hello { features: vec![e2e::FEATURE_CHAT2.into(), e2e::FEATURE_VOICE10.into(), e2e::FEATURE_VOICE_RED.into(), e2e::FEATURE_VIDEO_INTERLEAVE.into()] })
+                .expect("hello json");
             for id in new {
                 let blob = e2e::seal_blob(&self.pairs[&id].blob, e2e::BLOB_HELLO, &hello);
                 self.out.push(ClientMsg::E2eBlob { to: id, blob: b64(&blob) });
@@ -121,6 +122,11 @@ impl E2e {
             }
         }
         std::mem::take(&mut self.out)
+    }
+
+    /// 对方声明过某个能力（端到端加密的 Hello 里）
+    pub fn member_has(&self, id: u32, feature: &str) -> bool {
+        self.members.get(&id).is_some_and(|m| m.features.iter().any(|f| f == feature))
     }
 
     /// 对方认识带编号的聊天和表情回应

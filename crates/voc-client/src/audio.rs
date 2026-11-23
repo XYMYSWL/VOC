@@ -137,92 +137,145 @@ impl Default for Settings {
 
 // ---------------------------------------------------------------- 重采样
 
-/// RBJ 双二阶低通，用于降采样前抗混叠
-struct Biquad {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-    z1: f32,
-    z2: f32,
+/// 带限插值（加 Kaiser 窗的 sinc）的系数表：SINC_PHASES 个相位 × SINC_TAPS 个点。
+/// 截止频率取两边采样率中较低一边的 45%：降采样时滤掉会折回来的高频（原来的直线插值没滤，音乐里听得出「沙沙」底噪，第 55-a 项），
+/// 升采样时滤掉镜像
+const SINC_TAPS: usize = 32;
+const SINC_PHASES: usize = 256;
+
+struct SincTable {
+    /// [相位][点]，相位 p 对应小数位置 p / SINC_PHASES
+    coef: Vec<[f32; SINC_TAPS]>,
 }
 
-impl Biquad {
-    fn lowpass(sample_rate: f32, cutoff: f32) -> Self {
-        let w0 = std::f32::consts::TAU * cutoff / sample_rate;
-        let (s, c) = w0.sin_cos();
-        let alpha = s / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
-        let a0 = 1.0 + alpha;
-        Self {
-            b0: (1.0 - c) / 2.0 / a0,
-            b1: (1.0 - c) / a0,
-            b2: (1.0 - c) / 2.0 / a0,
-            a1: -2.0 * c / a0,
-            a2: (1.0 - alpha) / a0,
-            z1: 0.0,
-            z2: 0.0,
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term) = (1.0, 1.0);
+    let q = x * x / 4.0;
+    for k in 1..50 {
+        term *= q / (k * k) as f64;
+        sum += term;
+        if term < 1e-12 * sum {
+            break;
         }
     }
-    fn process(&mut self, x: f32) -> f32 {
-        let y = self.b0 * x + self.z1;
-        self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
-        y
+    sum
+}
+
+impl SincTable {
+    /// cutoff：截止频率占输入采样率的比例（< 0.5）
+    fn new(cutoff: f64) -> Self {
+        const BETA: f64 = 8.0;
+        let half = (SINC_TAPS / 2) as f64;
+        let i0b = bessel_i0(BETA);
+        let coef = (0..=SINC_PHASES)
+            .map(|p| {
+                let frac = p as f64 / SINC_PHASES as f64;
+                let mut row = [0f32; SINC_TAPS];
+                let mut sum = 0.0;
+                let mut vals = [0f64; SINC_TAPS];
+                for (k, v) in vals.iter_mut().enumerate() {
+                    // 点 k 对应输入样本 n - half + 1 + k，离插值位置 n + frac 的距离
+                    let t = k as f64 - (half - 1.0) - frac;
+                    let x = 2.0 * cutoff * t;
+                    let sinc = if x.abs() < 1e-9 { 1.0 } else { (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x) };
+                    let r = t / half;
+                    let w = if r.abs() >= 1.0 { 0.0 } else { bessel_i0(BETA * (1.0 - r * r).sqrt()) / i0b };
+                    *v = sinc * w;
+                    sum += *v;
+                }
+                // 每个相位单独归一化：直流增益正好 1，不会随相位起伏（否则会调制出噪声）
+                for (o, v) in row.iter_mut().zip(vals) {
+                    *o = (v / sum) as f32;
+                }
+                row
+            })
+            .collect();
+        Self { coef }
+    }
+
+    /// hist：最近 SINC_TAPS 个输入（最旧的在前），在倒数第 SINC_TAPS/2 个样本之后 frac 处插值
+    fn interp(&self, hist: &[f32; SINC_TAPS], frac: f64) -> f32 {
+        let p = frac * SINC_PHASES as f64;
+        let i = (p as usize).min(SINC_PHASES - 1);
+        let t = (p - i as f64) as f32;
+        let (a, b) = (&self.coef[i], &self.coef[i + 1]);
+        let mut s = 0.0f32;
+        for k in 0..SINC_TAPS {
+            s += hist[k] * (a[k] + (b[k] - a[k]) * t);
+        }
+        s
     }
 }
 
-/// 推式线性重采样（采集端：设备采样率 -> 16 kHz）
+fn cutoff_for(in_rate: u32, out_rate: u32) -> f64 {
+    0.45 * in_rate.min(out_rate) as f64 / in_rate as f64
+}
+
+fn push_hist(hist: &mut [f32; SINC_TAPS], x: f32) {
+    hist.copy_within(1.., 0);
+    hist[SINC_TAPS - 1] = x;
+}
+
+/// 推式重采样（采集端：设备采样率 -> 48 kHz）。两边采样率一样时原样输出
 pub struct PushResampler {
     step: f64,
     pos: f64,
-    last: f32,
-    lp: Option<(Biquad, Biquad)>,
+    hist: [f32; SINC_TAPS],
+    table: Option<SincTable>,
 }
 
 impl PushResampler {
     pub fn new(in_rate: u32, out_rate: u32) -> Self {
-        let lp = (in_rate > out_rate).then(|| {
-            let c = out_rate as f32 * 0.45;
-            (Biquad::lowpass(in_rate as f32, c), Biquad::lowpass(in_rate as f32, c))
-        });
-        Self { step: in_rate as f64 / out_rate as f64, pos: 0.0, last: 0.0, lp }
+        let table = (in_rate != out_rate).then(|| SincTable::new(cutoff_for(in_rate, out_rate)));
+        Self { step: in_rate as f64 / out_rate as f64, pos: 0.0, hist: [0.0; SINC_TAPS], table }
     }
 
     /// 处理一个输入样本，可能产生 0 个或多个输出样本
-    pub fn push(&mut self, mut x: f32, mut out: impl FnMut(f32)) {
-        if let Some((a, b)) = &mut self.lp {
-            x = b.process(a.process(x));
-        }
-        // 在 [last, x] 之间插值，pos ∈ [0,1) 表示相对 last 的位置
+    pub fn push(&mut self, x: f32, mut out: impl FnMut(f32)) {
+        let Some(t) = &self.table else {
+            out(x);
+            return;
+        };
+        push_hist(&mut self.hist, x);
+        // pos ∈ [0,1)：相对 hist 里插值基准样本的位置
         while self.pos < 1.0 {
-            out(self.last + (x - self.last) * self.pos as f32);
+            out(t.interp(&self.hist, self.pos));
             self.pos += self.step;
         }
         self.pos -= 1.0;
-        self.last = x;
     }
 }
 
-/// 拉式线性重采样（播放端：16 kHz -> 设备采样率）
+/// 拉式重采样（播放端：48 kHz -> 设备采样率，左右两路）。两边采样率一样时原样输出
 pub struct PullResampler {
     step: f64,
     pos: f64,
-    a: f32,
-    b: f32,
+    hist: [[f32; SINC_TAPS]; 2],
+    table: Option<SincTable>,
 }
 
 impl PullResampler {
     pub fn new(in_rate: u32, out_rate: u32) -> Self {
-        Self { step: in_rate as f64 / out_rate as f64, pos: 1.0, a: 0.0, b: 0.0 }
+        let table = (in_rate != out_rate).then(|| SincTable::new(cutoff_for(in_rate, out_rate)));
+        Self { step: in_rate as f64 / out_rate as f64, pos: 1.0, hist: [[0.0; SINC_TAPS]; 2], table }
     }
+    /// 单声道
+    #[cfg(test)]
     pub fn next(&mut self, mut src: impl FnMut() -> f32) -> f32 {
+        self.next2(|| {
+            let v = src();
+            [v, v]
+        })[0]
+    }
+    pub fn next2(&mut self, mut src: impl FnMut() -> [f32; 2]) -> [f32; 2] {
+        let Some(t) = &self.table else { return src() };
         while self.pos >= 1.0 {
-            self.a = self.b;
-            self.b = src();
+            let x = src();
+            push_hist(&mut self.hist[0], x[0]);
+            push_hist(&mut self.hist[1], x[1]);
             self.pos -= 1.0;
         }
-        let v = self.a + (self.b - self.a) * self.pos as f32;
+        let v = [t.interp(&self.hist[0], self.pos), t.interp(&self.hist[1], self.pos)];
         self.pos += self.step;
         v
     }
@@ -232,13 +285,23 @@ impl PullResampler {
 
 /// 每帧时长（ms）
 const FRAME_MS: f32 = FRAME_SAMPLES as f32 * 1000.0 / SAMPLE_RATE as f32;
-/// 抖动缓冲目标的上下限（ms）
+/// 抖动缓冲目标的上下限（ms）：语音
 const JB_MIN_MS: f32 = 20.0;
 const JB_MAX_MS: f32 = 160.0;
+/// 伴奏 / 共享声音：连续的声音，多缓冲几十毫秒换不断音（第 54-b 项）
+const STREAM_JB_MIN_MS: f32 = 70.0;
+const STREAM_JB_MAX_MS: f32 = 250.0;
 /// 提示音 / 麦克风测试这种本地声音：固定 20 ms
 const LOCAL_PREBUFFER: usize = FRAME_SAMPLES;
-/// 缓冲比目标多出这么多（ms）就丢掉多余部分，把延迟拉回来
-const JB_EXCESS_MS: f32 = 60.0;
+/// 缓冲比目标多出这么多（ms）才直接丢掉多余部分（带淡入淡出）；少于这个靠稍微加快播放慢慢吃掉
+const JB_EXCESS_MS: f32 = 200.0;
+const STREAM_EXCESS_MS: f32 = 400.0;
+/// 变速播放（第 36-2 / 54-b 项）：按「缓冲 - 目标」微调播放速度。语音最多快 / 慢 3%（几乎听不出），
+/// 连续的音乐最多 0.5%（主要吃掉两台电脑声卡时钟的差别，音高变化听不出）
+const VOICE_MAX_RATE: f64 = 0.03;
+const STREAM_MAX_RATE: f64 = 0.005;
+/// 播空时淡出、恢复时淡入的时长（样本）：约 4 ms，不再「啪」一声
+const FADE_SAMPLES: f32 = 192.0;
 
 /// 自适应抖动缓冲：按到达间隔的抖动决定先攒多少再播。
 /// 目标 = 一帧 + 3 × 抖动估计 + 欠载补偿；欠载（播空）一次补偿加 20 ms，稳定时每秒减 1 ms。
@@ -250,22 +313,28 @@ pub struct JitterEstimator {
     /// 欠载后额外加的缓冲（ms）
     penalty_ms: f32,
     last_decay: std::time::Instant,
+    min_ms: f32,
+    max_ms: f32,
 }
 
 impl Default for JitterEstimator {
     fn default() -> Self {
-        Self { last_arrival: None, jitter_ms: 0.0, penalty_ms: 0.0, last_decay: std::time::Instant::now() }
+        Self::with_range(JB_MIN_MS, JB_MAX_MS)
     }
 }
 
 impl JitterEstimator {
-    /// 收到 `frames` 帧（丢包补出来的帧会一次到好几帧）
-    pub fn on_arrival(&mut self, now: std::time::Instant, frames: usize) {
+    fn with_range(min_ms: f32, max_ms: f32) -> Self {
+        Self { last_arrival: None, jitter_ms: 0.0, penalty_ms: 0.0, last_decay: std::time::Instant::now(), min_ms, max_ms }
+    }
+
+    /// 收到 `samples` 个样本的声音（10 / 20 ms 一包；丢包补出来的会一次到好几包）
+    pub fn on_arrival(&mut self, now: std::time::Instant, samples: usize) {
         if let Some(last) = self.last_arrival {
             let gap = now.duration_since(last).as_secs_f32() * 1000.0;
             // 说话停顿后的第一包不算抖动
             if gap < 400.0 {
-                let expected = FRAME_MS * frames.max(1) as f32;
+                let expected = samples.max(1) as f32 * 1000.0 / SAMPLE_RATE as f32;
                 let d = (gap - expected).abs();
                 self.jitter_ms += (d - self.jitter_ms) / 16.0;
             }
@@ -284,7 +353,7 @@ impl JitterEstimator {
 
     /// 当前的缓冲目标（ms）
     pub fn target_ms(&self) -> f32 {
-        (FRAME_MS + 3.0 * self.jitter_ms + self.penalty_ms).clamp(JB_MIN_MS, JB_MAX_MS)
+        (FRAME_MS + 3.0 * self.jitter_ms + self.penalty_ms).clamp(self.min_ms, self.max_ms)
     }
 }
 
@@ -292,22 +361,149 @@ fn ms_to_samples(ms: f32) -> usize {
     (ms * SAMPLE_RATE as f32 / 1000.0) as usize
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// 本地声音（提示音 / 麦克风测试），不做自适应
+    Local,
+    Voice,
+    /// 伴奏 / 共享声音
+    Stream,
+}
+
+/// 一路声音的播放统计（第 54-d 项）
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StreamStats {
+    /// 网络原因播空的次数（说完话停下不算）
+    pub underruns: u32,
+    /// 丢包后靠补音（DRED / FEC / PLC）补出来的帧
+    pub concealed: u32,
+    /// 积压太多直接丢掉的次数
+    pub drops: u32,
+    /// 当前缓冲（ms）和目标（ms）
+    pub buffered_ms: u32,
+    pub target_ms: u32,
+    /// 当前播放速度偏差（千分之几，正 = 加快）
+    pub rate_permille: i32,
+}
+
+/// 一个立体声样本（左, 右）；单声道的声音两边一样
+type Frame2 = [f32; 2];
+
 struct Stream {
-    buf: VecDeque<f32>,
+    buf: VecDeque<Frame2>,
     playing: bool,
     last_seq: Option<u16>,
     jitter: JitterEstimator,
-    /// 本地声音（提示音 / 麦克风测试），不做自适应
-    local: bool,
+    kind: Kind,
+    /// 变速播放：读位置的小数部分、上一个已读样本（插值要用）、当前速度
+    frac: f64,
+    prev: Frame2,
+    rate: f64,
+    /// 淡入增益（0 → 1）、播空后淡出的尾巴
+    gain: f32,
+    tail: Frame2,
+    last_out: Frame2,
+    stats: StreamStats,
 }
 
 impl Stream {
-    fn prebuffer(&self) -> usize {
-        if self.local {
-            LOCAL_PREBUFFER
-        } else {
-            ms_to_samples(self.jitter.target_ms())
+    fn new(kind: Kind) -> Self {
+        let jitter = match kind {
+            Kind::Stream => JitterEstimator::with_range(STREAM_JB_MIN_MS, STREAM_JB_MAX_MS),
+            _ => JitterEstimator::default(),
+        };
+        Self {
+            buf: VecDeque::with_capacity(FRAME_SAMPLES * 16),
+            playing: false,
+            last_seq: None,
+            jitter,
+            kind,
+            frac: 0.0,
+            prev: [0.0; 2],
+            rate: 1.0,
+            gain: 0.0,
+            tail: [0.0; 2],
+            last_out: [0.0; 2],
+            stats: StreamStats::default(),
         }
+    }
+
+    fn prebuffer(&self) -> usize {
+        match self.kind {
+            Kind::Local => LOCAL_PREBUFFER,
+            _ => ms_to_samples(self.jitter.target_ms()),
+        }
+    }
+
+    /// 按缓冲多少调播放速度（每收到一包调一次）
+    fn update_rate(&mut self) {
+        if self.kind == Kind::Local {
+            self.rate = 1.0;
+            return;
+        }
+        let target = self.prebuffer().max(1) as f64;
+        let err = (self.buf.len() as f64 - target) / target;
+        let max = if self.kind == Kind::Stream { STREAM_MAX_RATE } else { VOICE_MAX_RATE };
+        // 多了 50% 以上时用满最大加速；少了就放慢（最多一半的幅度，避免越放越空）
+        let want = (err * max * 2.0).clamp(-max / 2.0, max);
+        self.rate += (1.0 + want - self.rate) * 0.2;
+        self.stats.rate_permille = ((self.rate - 1.0) * 1000.0).round() as i32;
+    }
+
+    /// 读一个样本（带变速插值、淡入淡出）。None = 这一路现在没声音
+    fn next(&mut self) -> Option<Frame2> {
+        if !self.playing {
+            if self.buf.len() >= self.prebuffer().max(4) {
+                self.playing = true;
+                self.gain = 0.0;
+            } else {
+                return self.fade_tail();
+            }
+        }
+        // 4 点 Hermite 插值要 prev、buf[0..3]
+        if self.buf.len() < 3 {
+            // 播空：重新预缓冲。距上一包很近说明是网络抖动（不是说完话），加大缓冲
+            self.playing = false;
+            if self.kind != Kind::Local && self.jitter.last_arrival.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(200)) {
+                self.jitter.on_underrun();
+                self.stats.underruns += 1;
+            }
+            self.tail = self.last_out;
+            return self.fade_tail();
+        }
+        let t = self.frac as f32;
+        let mut out = [0.0f32; 2];
+        for (c, o) in out.iter_mut().enumerate() {
+            let (xm1, x0, x1, x2) = (self.prev[c], self.buf[0][c], self.buf[1][c], self.buf[2][c]);
+            let c1 = 0.5 * (x1 - xm1);
+            let c2 = xm1 - 2.5 * x0 + 2.0 * x1 - 0.5 * x2;
+            let c3 = 0.5 * (x2 - xm1) + 1.5 * (x0 - x1);
+            *o = ((c3 * t + c2) * t + c1) * t + x0;
+        }
+        self.frac += self.rate;
+        while self.frac >= 1.0 {
+            self.prev = self.buf.pop_front().unwrap_or([0.0; 2]);
+            self.frac -= 1.0;
+        }
+        if self.gain < 1.0 {
+            self.gain = (self.gain + 1.0 / FADE_SAMPLES).min(1.0);
+        }
+        let out = [out[0] * self.gain, out[1] * self.gain];
+        self.last_out = out;
+        // 恢复播放时上一段的尾巴还没淡完：叠在一起（交叉淡化）
+        let tail = self.fade_tail().unwrap_or([0.0; 2]);
+        Some([out[0] + tail[0], out[1] + tail[1]])
+    }
+
+    /// 播空 / 被截断后上一段声音的尾巴：几毫秒内平滑降到 0，不硬切成 0
+    fn fade_tail(&mut self) -> Option<Frame2> {
+        if self.tail[0].abs() < 1e-5 && self.tail[1].abs() < 1e-5 {
+            self.tail = [0.0; 2];
+            return None;
+        }
+        let k = 1.0 - 4.0 / FADE_SAMPLES;
+        self.tail = [self.tail[0] * k, self.tail[1] * k];
+        Some(self.tail)
     }
 }
 
@@ -320,14 +516,21 @@ pub struct Mixer {
 }
 
 impl Mixer {
+    /// 单声道的一帧
     pub fn push(&mut self, user: u32, seq: u16, pcm: &[i16]) {
-        let s = self.streams.entry(user).or_insert_with(|| Stream {
-            buf: VecDeque::with_capacity(FRAME_SAMPLES * 12),
-            playing: false,
-            last_seq: None,
-            jitter: JitterEstimator::default(),
-            local: user == LOOPBACK_ID || user == SFX_ID,
-        });
+        self.push_ch(user, seq, pcm, 1);
+    }
+
+    /// channels = 1（单声道）或 2（左右交错）
+    pub fn push_ch(&mut self, user: u32, seq: u16, pcm: &[i16], channels: usize) {
+        let kind = if user == LOOPBACK_ID || user == SFX_ID {
+            Kind::Local
+        } else if user & (MUSIC_FLAG | SHARE_FLAG) != 0 {
+            Kind::Stream
+        } else {
+            Kind::Voice
+        };
+        let s = self.streams.entry(user).or_insert_with(|| Stream::new(kind));
         if let Some(last) = s.last_seq {
             // 乱序/重复包直接丢弃（距离太远则视为重新开始）
             if !seq_newer(seq, last) && last.wrapping_sub(seq) < 100 {
@@ -335,21 +538,56 @@ impl Mixer {
             }
         }
         s.last_seq = Some(seq);
-        if !s.local {
-            s.jitter.on_arrival(std::time::Instant::now(), pcm.len().div_ceil(FRAME_SAMPLES));
+        let samples = pcm.len() / channels.max(1);
+        if s.kind != Kind::Local {
+            s.jitter.on_arrival(std::time::Instant::now(), samples);
         }
-        s.buf.extend(pcm.iter().map(|&x| x as f32 / 32768.0));
-        // 攒得比目标多太多（网络恢复后一下子到了一堆）：丢掉旧的，把延迟拉回目标
-        if !s.local {
-            let target = s.prebuffer();
-            if s.buf.len() > target + ms_to_samples(JB_EXCESS_MS) {
-                let drop = s.buf.len() - target;
-                s.buf.drain(..drop);
+        if channels >= 2 {
+            s.buf.extend(pcm.chunks_exact(channels).map(|c| [c[0] as f32 / 32768.0, c[1] as f32 / 32768.0]));
+        } else {
+            s.buf.extend(pcm.iter().map(|&x| {
+                let v = x as f32 / 32768.0;
+                [v, v]
+            }));
+        }
+        match s.kind {
+            Kind::Local => {
+                if s.buf.len() > FRAME_SAMPLES * 50 {
+                    let drop = s.buf.len() - FRAME_SAMPLES * 50;
+                    s.buf.drain(..drop);
+                }
             }
-        } else if s.buf.len() > FRAME_SAMPLES * 50 {
-            let drop = s.buf.len() - FRAME_SAMPLES * 50;
-            s.buf.drain(..drop);
+            _ => {
+                // 积压一点点：稍微加快播放慢慢吃掉。积压特别多（网络卡了很久一下子到了一堆）才丢旧的，
+                // 丢的时候旧的淡出、新的淡入，不会「咔」一声
+                let target = s.prebuffer();
+                let excess = if s.kind == Kind::Stream { STREAM_EXCESS_MS } else { JB_EXCESS_MS };
+                if s.buf.len() > target + ms_to_samples(excess) {
+                    let drop = s.buf.len() - target;
+                    s.buf.drain(..drop);
+                    s.tail = s.last_out;
+                    s.gain = 0.0;
+                    s.stats.drops += 1;
+                }
+                s.update_rate();
+            }
         }
+    }
+
+    /// 丢包后补出来的帧数（统计用）
+    pub fn note_concealed(&mut self, user: u32, frames: u32) {
+        if let Some(s) = self.streams.get_mut(&user) {
+            s.stats.concealed += frames;
+        }
+    }
+
+    /// 某一路的播放统计（第 54-d 项）
+    pub fn stream_stats(&self, user: u32) -> Option<StreamStats> {
+        self.streams.get(&user).map(|s| StreamStats {
+            buffered_ms: (s.buf.len() as f32 * 1000.0 / SAMPLE_RATE as f32).round() as u32,
+            target_ms: s.jitter.target_ms().round() as u32,
+            ..s.stats
+        })
     }
 
     /// 对方换了密钥、序号从头开始：忘掉上一包的序号（缓冲里已有的声音照常播完）
@@ -383,31 +621,20 @@ impl Mixer {
         self.streams.clear();
     }
 
-    /// 取出一个混音样本
-    fn next_sample(&mut self) -> f32 {
-        let mut sum = 0.0;
+    /// 取出一个混音样本（左, 右）
+    fn next_frame(&mut self) -> Frame2 {
+        let mut sum = [0.0f32; 2];
         for (id, s) in self.streams.iter_mut() {
             if self.suppressed.contains(id) {
                 s.buf.clear();
                 s.playing = false;
+                s.tail = [0.0; 2];
                 continue;
             }
-            if !s.playing {
-                if s.buf.len() >= s.prebuffer() {
-                    s.playing = true;
-                } else {
-                    continue;
-                }
-            }
-            match s.buf.pop_front() {
-                Some(x) => sum += x * self.volumes.get(id).copied().unwrap_or(1.0),
-                None => {
-                    // 欠载：重新预缓冲。距上一包很近说明是网络抖动（不是说完话），加大缓冲
-                    s.playing = false;
-                    if !s.local && s.jitter.last_arrival.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(200)) {
-                        s.jitter.on_underrun();
-                    }
-                }
+            if let Some(x) = s.next() {
+                let v = self.volumes.get(id).copied().unwrap_or(1.0);
+                sum[0] += x[0] * v;
+                sum[1] += x[1] * v;
             }
         }
         sum
@@ -481,9 +708,19 @@ fn find_device(input: bool, name: Option<&str>) -> Option<cpal::Device> {
 }
 
 /// 持有音频流；drop 即停止
+/// 打开着的声卡流：cpal 的，或者自己用 IAudioClient3 打开的低延迟流（第 36 项语音第 1 条）。只是拿着，drop 时关掉
+#[allow(dead_code)]
+pub enum Held {
+    Cpal(cpal::Stream),
+    Ll(crate::wasapi_ll::LlStream),
+}
+
+/// 设置「声卡低延迟模式」：驱动支持时用 IAudioClient3 的最小周期（约 3 ms）打开，不支持自动退回
+pub static LOW_LATENCY_DEVICE: AtomicBool = AtomicBool::new(false);
+
 pub struct AudioStreams {
-    _input: Option<cpal::Stream>,
-    _output: Option<cpal::Stream>,
+    _input: Option<Held>,
+    _output: Option<Held>,
     pub input_desc: String,
     pub output_desc: String,
     /// 实际打开的设备名（没打开为空）
@@ -625,6 +862,53 @@ fn start_input(
     frames_tx: SyncSender<Vec<f32>>,
     health: StreamHealth,
     small: bool,
+) -> Result<(Held, String, String), String> {
+    if small && LOW_LATENCY_DEVICE.load(Ordering::Relaxed) {
+        match start_input_ll(name, frames_tx.clone(), health.clone()) {
+            Ok(x) => return Ok(x),
+            Err(e) => crate::applog::log(format!("麦克风低延迟模式不可用，用普通方式：{e}")),
+        }
+    }
+    let (s, d, n) = start_input_cpal(name, frames_tx, health, small)?;
+    Ok((Held::Cpal(s), d, n))
+}
+
+/// 低延迟模式打开麦克风：混成单声道 → 变采样率到 48 kHz → 每 10 ms 一帧交给编码线程
+fn start_input_ll(name: Option<&str>, frames_tx: SyncSender<Vec<f32>>, health: StreamHealth) -> Result<(Held, String, String), String> {
+    let rs = Arc::new(Mutex::new(None::<PushResampler>));
+    let rs2 = rs.clone();
+    let mut frame = Vec::with_capacity(CAPTURE_FRAME);
+    let (s, (rate, ch, period, dname)) = crate::wasapi_ll::start_capture(
+        name,
+        move |data, ch| {
+            let mut g = rs2.lock().unwrap();
+            let Some(r) = g.as_mut() else { return };
+            for chunk in data.chunks(ch) {
+                let mono = chunk.iter().sum::<f32>() / ch as f32;
+                r.push(mono, |y| {
+                    frame.push(y);
+                    if frame.len() == CAPTURE_FRAME {
+                        let full = std::mem::replace(&mut frame, Vec::with_capacity(CAPTURE_FRAME));
+                        let _ = frames_tx.try_send(full);
+                    }
+                });
+            }
+        },
+        move |e| {
+            crate::applog::log(format!("麦克风低延迟模式出错：{e}"));
+            health.failed.store(true, Ordering::Relaxed);
+        },
+    )?;
+    *rs.lock().unwrap() = Some(PushResampler::new(rate, CAPTURE_RATE));
+    let desc = format!("{dname}（{rate} Hz, {ch} 声道，低延迟模式 {:.1} ms 周期）", period as f32 * 1000.0 / rate as f32);
+    Ok((Held::Ll(s), desc, dname))
+}
+
+fn start_input_cpal(
+    name: Option<&str>,
+    frames_tx: SyncSender<Vec<f32>>,
+    health: StreamHealth,
+    small: bool,
 ) -> Result<(cpal::Stream, String, String), String> {
     let dev = find_device(true, name).ok_or("找不到输入设备")?;
     let dname = dev.description().map(|d| d.name().to_string()).unwrap_or_default();
@@ -691,6 +975,73 @@ fn start_output(
     settings: Arc<Settings>,
     health: StreamHealth,
     small: bool,
+) -> Result<(Held, String, String), String> {
+    if small && LOW_LATENCY_DEVICE.load(Ordering::Relaxed) {
+        match start_output_ll(name, mixer.clone(), settings.clone(), health.clone()) {
+            Ok(x) => return Ok(x),
+            Err(e) => crate::applog::log(format!("扬声器低延迟模式不可用，用普通方式：{e}")),
+        }
+    }
+    let (s, d, n) = start_output_cpal(name, mixer, settings, health, small)?;
+    Ok((Held::Cpal(s), d, n))
+}
+
+/// 低延迟模式打开扬声器：和普通方式一样从混音器取声音（变采样率、回声消除参考、软削波）
+fn start_output_ll(name: Option<&str>, mixer: Arc<Mutex<Mixer>>, settings: Arc<Settings>, health: StreamHealth) -> Result<(Held, String, String), String> {
+    let rs = Arc::new(Mutex::new(None::<PullResampler>));
+    let rs2 = rs.clone();
+    let mut tap: Vec<f32> = Vec::with_capacity(crate::aec::AEC_FRAME);
+    let (s, (rate, ch, period, dname)) = crate::wasapi_ll::start_render(
+        name,
+        move |out, ch| {
+            let mut g = rs2.lock().unwrap();
+            let (Some(rs), Ok(mut m)) = (g.as_mut(), mixer.lock()) else {
+                out.fill(0.0);
+                return;
+            };
+            if settings.deafened.load(Ordering::Relaxed) {
+                m.clear();
+                out.fill(0.0);
+                return;
+            }
+            let vol = settings.output_volume.get();
+            for frame in out.chunks_mut(ch) {
+                let [l, r] = rs.next2(|| {
+                    let x = m.next_frame();
+                    tap.push((x[0] + x[1]) * 0.5 * vol);
+                    if tap.len() == crate::aec::AEC_FRAME {
+                        crate::aec::push_render(std::mem::replace(&mut tap, Vec::with_capacity(crate::aec::AEC_FRAME)));
+                    }
+                    x
+                });
+                let (l, r) = (soft_clip(l * vol), soft_clip(r * vol));
+                if ch >= 2 {
+                    frame[0] = l;
+                    frame[1] = r;
+                    for x in frame.iter_mut().skip(2) {
+                        *x = (l + r) * 0.5;
+                    }
+                } else {
+                    frame[0] = (l + r) * 0.5;
+                }
+            }
+        },
+        move |e| {
+            crate::applog::log(format!("扬声器低延迟模式出错：{e}"));
+            health.failed.store(true, Ordering::Relaxed);
+        },
+    )?;
+    *rs.lock().unwrap() = Some(PullResampler::new(SAMPLE_RATE, rate));
+    let desc = format!("{dname}（{rate} Hz, {ch} 声道，低延迟模式 {:.1} ms 周期）", period as f32 * 1000.0 / rate as f32);
+    Ok((Held::Ll(s), desc, dname))
+}
+
+fn start_output_cpal(
+    name: Option<&str>,
+    mixer: Arc<Mutex<Mixer>>,
+    settings: Arc<Settings>,
+    health: StreamHealth,
+    small: bool,
 ) -> Result<(cpal::Stream, String, String), String> {
     let dev = find_device(false, name).ok_or("找不到输出设备")?;
     let dname = dev.description().map(|d| d.name().to_string()).unwrap_or_default();
@@ -744,20 +1095,26 @@ where
                 return;
             }
             for frame in data.chunks_mut(ch) {
-                let v = soft_clip(
-                    rs.next(|| {
-                        let x = m.next_sample();
-                        // 回声消除的远端参考：按播放音量，10 ms 一帧
-                        tap.push(x * vol);
-                        if tap.len() == crate::aec::AEC_FRAME {
-                            crate::aec::push_render(std::mem::replace(&mut tap, Vec::with_capacity(crate::aec::AEC_FRAME)));
-                        }
-                        x
-                    }) * vol,
-                );
-                let s = T::from_sample(v);
-                for x in frame.iter_mut() {
-                    *x = s;
+                let [l, r] = rs.next2(|| {
+                    let x = m.next_frame();
+                    // 回声消除的远端参考：按播放音量，10 ms 一帧（左右平均）
+                    tap.push((x[0] + x[1]) * 0.5 * vol);
+                    if tap.len() == crate::aec::AEC_FRAME {
+                        crate::aec::push_render(std::mem::replace(&mut tap, Vec::with_capacity(crate::aec::AEC_FRAME)));
+                    }
+                    x
+                });
+                let (l, r) = (soft_clip(l * vol), soft_clip(r * vol));
+                // 两个以上声道：前两个放左右，其余放平均（单声道设备只放平均）
+                if ch >= 2 {
+                    frame[0] = T::from_sample(l);
+                    frame[1] = T::from_sample(r);
+                    let mid = T::from_sample((l + r) * 0.5);
+                    for x in frame.iter_mut().skip(2) {
+                        *x = mid;
+                    }
+                } else {
+                    frame[0] = T::from_sample((l + r) * 0.5);
                 }
             }
         },
@@ -862,12 +1219,104 @@ mod tests {
         let f = vec![16384i16; FRAME_SAMPLES];
         let half = vec![16384i16; FRAME_SAMPLES / 2];
         m.push(5, 1, &half);
-        assert_eq!(m.next_sample(), 0.0); // 不到一帧（20 ms）：还在预缓冲
+        assert_eq!(m.next_frame()[0], 0.0); // 不到一帧（20 ms）：还在预缓冲
         m.push(5, 0, &f); // 旧包丢弃
         // 测试里两包是同时到的（真实网络约隔 20 ms），会算出一点抖动，所以攒到一帧多一点就开播
         m.push(5, 2, &f);
-        assert!((m.next_sample() - 0.5).abs() < 1e-6);
+        // 开播时淡入：几毫秒后到满音量
+        let first = m.next_frame()[0];
+        assert!(first > 0.0 && first < 0.05, "{first}");
+        let mut last = 0.0;
+        for _ in 0..400 {
+            last = m.next_frame()[0];
+        }
+        assert!((last - 0.5).abs() < 0.01, "{last}");
         assert!(m.buffer_ms(5).unwrap() <= 25);
+    }
+
+    /// 立体声：左右分开放
+    #[test]
+    fn stereo_stream() {
+        let mut m = Mixer::default();
+        let id = SHARE_FLAG | 4;
+        let f: Vec<i16> = (0..FRAME_SAMPLES).flat_map(|_| [16384i16, -8192]).collect();
+        for seq in 0..6u16 {
+            m.push_ch(id, seq, &f, 2);
+        }
+        let mut x = [0.0; 2];
+        for _ in 0..400 {
+            x = m.next_frame();
+        }
+        assert!((x[0] - 0.5).abs() < 0.01 && (x[1] + 0.25).abs() < 0.01, "{x:?}");
+    }
+
+    /// 播空时不硬切成 0：相邻两个样本的跳变很小（第 54-b 项）
+    #[test]
+    fn underrun_fades_out() {
+        let mut m = Mixer::default();
+        let id = SHARE_FLAG | 7;
+        let f = vec![20000i16; FRAME_SAMPLES];
+        for seq in 0..5u16 {
+            m.push(id, seq, &f);
+        }
+        let mut prev = 0.0f32;
+        let mut max_step = 0.0f32;
+        for _ in 0..FRAME_SAMPLES * 8 {
+            let x = m.next_frame()[0];
+            max_step = max_step.max((x - prev).abs());
+            prev = x;
+        }
+        assert!(prev.abs() < 1e-3, "播完后安静：{prev}");
+        assert!(max_step < 0.02, "开头淡入、结尾淡出，没有大跳变：{max_step}");
+        assert_eq!(m.stream_stats(id).unwrap().underruns, 1);
+    }
+
+    /// 积压不多时不丢包，靠稍微加快播放吃掉（第 36-2 / 54-b 项）
+    #[test]
+    fn excess_played_faster_not_dropped() {
+        let mut m = Mixer::default();
+        let id = SHARE_FLAG | 3;
+        let f = vec![1000i16; FRAME_SAMPLES];
+        for seq in 0..12u16 {
+            m.push(id, seq, &f); // 240 ms，目标 70 ms
+        }
+        let st = m.stream_stats(id).unwrap();
+        assert_eq!(st.drops, 0);
+        assert!(st.rate_permille > 0 && st.rate_permille <= 5, "{st:?}");
+        let before = m.streams[&id].buf.len();
+        for _ in 0..4800 {
+            m.next_frame()[0];
+        }
+        let used = before - m.streams[&id].buf.len();
+        assert!(used > 4800 && used < 4800 + 30, "100 ms 吃掉 {used} 个样本");
+    }
+
+    /// 重采样：1 kHz 正弦 48k → 44.1k 失真很小；22 kHz（44.1k 放不下）被滤掉，不会折回来成底噪（第 55-a 项）
+    #[test]
+    fn sinc_resampler_quality() {
+        let tone = |f: f64, rate: u32, n: usize| (0..n).map(move |i| (std::f64::consts::TAU * f * i as f64 / rate as f64).sin() as f32 * 0.5);
+        let mut pr = PullResampler::new(48_000, 44_100);
+        let mut src = tone(1000.0, 48_000, 200_000);
+        let out: Vec<f32> = (0..44_100).map(|_| pr.next(|| src.next().unwrap_or(0.0))).collect();
+        // 和理想正弦比（对齐延迟：16 个输入样本）
+        let delay = 16.0 / 48_000.0;
+        let (mut sig, mut err) = (0.0f64, 0.0f64);
+        for (i, &y) in out.iter().enumerate().skip(1000) {
+            let t = i as f64 / 44_100.0 - delay;
+            let ideal = (std::f64::consts::TAU * 1000.0 * t).sin() * 0.5;
+            sig += ideal * ideal;
+            err += (y as f64 - ideal).powi(2);
+        }
+        let snr = 10.0 * (sig / err).log10();
+        assert!(snr > 60.0, "SNR {snr:.1} dB");
+        let mut pr = PullResampler::new(48_000, 44_100);
+        let mut src = tone(22_500.0, 48_000, 200_000);
+        let out: Vec<f32> = (0..44_100).map(|_| pr.next(|| src.next().unwrap_or(0.0))).collect();
+        let rms = (out.iter().skip(1000).map(|x| (*x as f64).powi(2)).sum::<f64>() / 43_100.0).sqrt();
+        assert!(rms < 0.5 * 0.707 * 0.03, "22.5 kHz 应被滤掉：rms {rms}");
+        // 一样的采样率：原样输出
+        let mut pr = PullResampler::new(48_000, 48_000);
+        assert_eq!(pr.next(|| 0.25), 0.25);
     }
 
     #[test]
@@ -877,14 +1326,14 @@ mod tests {
         // 每 20 ms 准时到：目标保持最小 20 ms
         let mut j = JitterEstimator::default();
         for i in 0..100u64 {
-            j.on_arrival(t0 + Duration::from_millis(20 * i), 1);
+            j.on_arrival(t0 + Duration::from_millis(20 * i), FRAME_SAMPLES);
         }
         assert_eq!(j.target_ms().round() as u32, 20);
         // 到达时间忽早忽晚 ±15 ms：目标明显变大，但不超过上限
         let mut j = JitterEstimator::default();
         for i in 0..200u64 {
             let wobble = if i % 2 == 0 { 0 } else { 30 };
-            j.on_arrival(t0 + Duration::from_millis(20 * i + wobble), 1);
+            j.on_arrival(t0 + Duration::from_millis(20 * i + wobble), FRAME_SAMPLES);
         }
         let t = j.target_ms();
         assert!(t > 60.0 && t <= JB_MAX_MS, "{t}");
@@ -894,8 +1343,8 @@ mod tests {
         assert!(j.target_ms() >= (before + 19.0).min(JB_MAX_MS));
         // 说话停顿后的第一包不算抖动
         let mut j = JitterEstimator::default();
-        j.on_arrival(t0, 1);
-        j.on_arrival(t0 + Duration::from_secs(3), 1);
+        j.on_arrival(t0, FRAME_SAMPLES);
+        j.on_arrival(t0 + Duration::from_secs(3), FRAME_SAMPLES);
         assert_eq!(j.target_ms().round() as u32, 20);
     }
 
@@ -903,11 +1352,12 @@ mod tests {
     fn jitter_buffer_drains_excess() {
         let mut m = Mixer::default();
         let f = vec![1000i16; FRAME_SAMPLES];
-        // 网络卡了一下，一次到了 10 帧（200 ms）：只保留目标量，不把延迟一直拖着
-        for seq in 0..10u16 {
+        // 网络卡了很久，一次到了 20 帧（400 ms）：只保留目标量，不把延迟一直拖着
+        for seq in 0..20u16 {
             m.push(9, seq, &f);
         }
         let len = m.streams[&9].buf.len();
         assert!(len <= ms_to_samples(m.streams[&9].jitter.target_ms() + JB_EXCESS_MS), "{len}");
+        assert_eq!(m.stream_stats(9).unwrap().drops, 1);
     }
 }

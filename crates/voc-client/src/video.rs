@@ -927,36 +927,76 @@ fn cursor_now() -> Option<(i32, i32, u8, bool)> {
     Some((ci.ptScreenPos.x, ci.ptScreenPos.y, shape, visible))
 }
 
-/// 截屏不带鼠标时，每 16 ms 看一次鼠标，有变化就发给观看者（没变化也每 250 ms 发一次，观看端据此知道还在）
-fn cursor_loop(device: String, state: Arc<VoiceState>, stop: Arc<AtomicBool>, in_video: Arc<AtomicBool>) {
+/// 截屏不带鼠标时，每 16 ms 看一次鼠标，有变化就发给观看者（没变化也每 250 ms 发一次，观看端据此知道还在）。
+/// 不管鼠标画没画进画面，每秒都附带一次共享状态（采集 / 编码帧数等，观看端用来说明为什么掉帧，第 53-1 项）
+fn cursor_loop(device: String, state: Arc<VoiceState>, stop: Arc<AtomicBool>, in_video: Arc<AtomicBool>, stats: Arc<ShareStats>, target_fps: u32) {
     let mut rect = monitor_rect(&device);
     let (mut last, mut last_sent, mut rect_at) = (None, Instant::now(), Instant::now());
+    let mut info_at = Instant::now();
+    let mut glitches_prev = crate::loopback::GLITCHES.load(Ordering::Relaxed);
     let mut buf = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(16));
-        if in_video.load(Ordering::Relaxed) {
+        let Some(link) = state.current_link() else { continue };
+        if !link.has_watchers() {
             continue;
         }
+        let info_due = info_at.elapsed() >= Duration::from_secs(1);
+        let separate = !in_video.load(Ordering::Relaxed);
         if rect_at.elapsed() > Duration::from_secs(5) {
             rect = monitor_rect(&device); // 改了分辨率 / 显示器排列
             rect_at = Instant::now();
         }
-        let (Some((rx, ry, rw, rh)), Some((x, y, shape, vis)), Some(link)) = (rect, cursor_now(), state.current_link()) else { continue };
-        if !link.has_watchers() {
+        // 鼠标画在画面里时只发状态（visible = false：观看端不另外画鼠标）
+        let now = match (separate, rect, cursor_now()) {
+            (true, Some((rx, ry, rw, rh)), Some((x, y, shape, vis))) => {
+                let inside = x >= rx && y >= ry && x < rx + rw && y < ry + rh;
+                let nx = (((x - rx).clamp(0, rw) as f32 / rw.max(1) as f32) * 65535.0) as u16;
+                let ny = (((y - ry).clamp(0, rh) as f32 / rh.max(1) as f32) * 65535.0) as u16;
+                Some((nx, ny, shape, vis && inside))
+            }
+            _ => None,
+        };
+        let cursor_due = separate && now.is_some() && (now != last || last_sent.elapsed() >= Duration::from_millis(250));
+        if !cursor_due && !info_due {
             continue;
         }
-        let inside = x >= rx && y >= ry && x < rx + rw && y < ry + rh;
-        let nx = (((x - rx).clamp(0, rw) as f32 / rw.max(1) as f32) * 65535.0) as u16;
-        let ny = (((y - ry).clamp(0, rh) as f32 / rh.max(1) as f32) * 65535.0) as u16;
-        let now = (nx, ny, shape, vis && inside);
-        if Some(now) == last && last_sent.elapsed() < Duration::from_millis(250) {
-            continue;
+        let (nx, ny, shape, vis) = now.unwrap_or((0, 0, udp::CURSOR_ARROW, false));
+        let payload = if info_due {
+            info_at = Instant::now();
+            let g = crate::loopback::GLITCHES.load(Ordering::Relaxed);
+            let mut info = share_info(&stats, target_fps);
+            info.audio_glitches = g.wrapping_sub(glitches_prev).min(255) as u8;
+            glitches_prev = g;
+            udp::cursor_with_info(nx, ny, shape, vis, &info)
+        } else {
+            udp::cursor_payload(nx, ny, shape, vis).to_vec()
+        };
+        if separate {
+            last = now;
+            last_sent = Instant::now();
         }
-        last = Some(now);
-        last_sent = Instant::now();
         let Some(e2e) = state.e2e.lock().unwrap().clone() else { continue };
-        let blob = e2e.lock().unwrap().encrypt_stream(voc_proto::e2e::STREAM_CURSOR, &udp::cursor_payload(nx, ny, shape, now.3));
+        let blob = e2e.lock().unwrap().encrypt_stream(voc_proto::e2e::STREAM_CURSOR, &payload);
         link.send_stream(udp::CURSOR, &blob, &mut buf);
+    }
+}
+
+/// 共享者这一秒的状态（发给观看者）
+fn share_info(st: &ShareStats, target_fps: u32) -> udp::ShareInfo {
+    let b = |v: u32| v.min(255) as u8;
+    udp::ShareInfo {
+        target_fps: b(target_fps),
+        source_fps: b(st.source_fps.load(Ordering::Relaxed)),
+        capture_fps: b(st.capture_fps.load(Ordering::Relaxed)),
+        sent_fps: b(st.fps.load(Ordering::Relaxed)),
+        static_skipped: b(st.static_skipped.load(Ordering::Relaxed)),
+        rate_skipped: b(st.skipped.load(Ordering::Relaxed)),
+        encode_ms: b(st.encode_ms.load(Ordering::Relaxed)),
+        congested: st.congested.load(Ordering::Relaxed),
+        kbps: st.kbps.load(Ordering::Relaxed).min(65_535) as u16,
+        rate_pct: b(st.rate_pct.load(Ordering::Relaxed)),
+        audio_glitches: 0,
     }
 }
 
@@ -1000,13 +1040,14 @@ impl Sharer {
                 .map_err(|e| e.to_string())?;
         }
         {
-            let (stop, now, st) = (stop.clone(), cursor_in_video.clone(), state.clone());
-            let _ = std::thread::Builder::new().name("cursor".into()).spawn(move || cursor_loop(device, st, stop, now));
+            let (stop, now, st, stats, fps) = (stop.clone(), cursor_in_video.clone(), state.clone(), stats.clone(), cfg.fps);
+            let _ = std::thread::Builder::new().name("cursor".into()).spawn(move || cursor_loop(device, st, stop, now, stats, fps));
         }
 
         // 画面码率计入 P2P 上行预算
         if let Some(l) = state.current_link() {
             l.set_video_bps(cfg.bitrate());
+            crate::voice::VIDEO_FPS.store(cfg.fps, Ordering::Relaxed);
         }
         crate::voice::SHARE_P2P_ONLY.store(cfg.p2p_only, Ordering::Relaxed);
         let (st, fk, sp, stx, c2, kr) = (state.clone(), force_key.clone(), stop.clone(), stats.clone(), cfg.clone(), key_requests.clone());
@@ -1036,6 +1077,12 @@ impl Drop for Sharer {
 
 /// Reed-Solomon 冗余比例（校验片 / 数据片），按观看者回报的原始丢包率（千分之几，最近 5 秒最大值）：
 /// 不到 0.5% 不加；30% 丢包时 1.2 倍（一组 k 片数据配 1.2k 片校验，收到任意 k 片就能还原）
+/// 第 34-5 项：观看者回报的原画层丢包（千分之几）到这么多就跨帧交错
+const INTERLEAVE_LOSS: u16 = 150;
+
+/// 第 38-8 项：不稳的长距离线路上至少留这么多冗余
+const LONG_HAUL_FEC: f32 = 0.15;
+
 pub fn fec_ratio(loss_permille: u16) -> f32 {
     match loss_permille {
         0..5 => 0.0,
@@ -1446,6 +1493,28 @@ fn encode_loop(
             // 冗余比例按各层观看者回报的丢包率；丢包很高的直连观看者两条路同时发
             let (loss_main, loss_low) = (link.layer_loss(false), link.layer_loss(true));
             (fec_main, fec_low) = (fec_ratio(loss_main), fec_ratio(loss_low));
+            // 长距离、最近有过突发丢包：先留 15% 冗余，不等丢了再加（第 38-8 项；拥塞时下面会压回去）
+            if loss_main.max(loss_low) >= 30 {
+                link.note_loss_burst();
+            }
+            // 跨帧交错（第 34-5 项）：原画层观看者丢包 ≥ 15%、不是拥塞、所有观看者都认识交错标记时打开
+            // （旧版本不认识标记，会把交替到达当成丢包、多要很多补发）。VOC_TEST_INTERLEAVE=0/1 强制
+            let inter = match std::env::var("VOC_TEST_INTERLEAVE").ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => {
+                    loss_main >= INTERLEAVE_LOSS
+                        && !congested
+                        && state.e2e.lock().unwrap().clone().is_some_and(|e| {
+                            let e = e.lock().unwrap();
+                            link.watcher_ids().iter().all(|w| e.member_has(*w, voc_proto::e2e::FEATURE_VIDEO_INTERLEAVE))
+                        })
+                }
+            };
+            link.set_interleave(inter);
+            if link.long_haul() && !congested {
+                (fec_main, fec_low) = (fec_main.max(LONG_HAUL_FEC), fec_low.max(LONG_HAUL_FEC));
+            }
             // 拥塞时不加冗余（冗余也占带宽，越加越堵；第 40-2 项）：最多保持中等冗余，先靠降码率 / 控速
             if congested {
                 (fec_main, fec_low) = (fec_main.min(CONGESTED_FEC_CAP), fec_low.min(CONGESTED_FEC_CAP));
@@ -1501,7 +1570,10 @@ fn split_dims(codec: Codec, data: &[u8]) -> Option<(u32, u32, &[u8])> {
 pub struct DecodedFrame {
     pub width: usize,
     pub height: usize,
+    /// CPU 上转好的 RGBA；nv12 有值时为空
     pub rgba: Vec<u8>,
+    /// 硬解出来的 NV12，界面在显卡上转颜色（第 53-2 项）
+    pub nv12: Option<Arc<Vec<u8>>>,
     pub seq: u64,
 }
 
@@ -1516,6 +1588,11 @@ pub struct View {
     pub decoder: Mutex<String>,
     /// 共享者单独发来的鼠标：(x, y 0–1, 形状, 显示着, 收到时间)
     pub cursor: Mutex<Option<(f32, f32, u8, bool, Instant)>>,
+    /// 共享者每秒发来的状态（采集 / 编码帧数等）和收到的时间
+    pub sharer_info: Mutex<Option<(udp::ShareInfo, Instant)>>,
+    /// 观看端这一秒：收到完整的帧、解码失败 / 等不到放弃的帧、从收到到显示的平均耗时（ms）
+    pub rx_fps: AtomicU32,
+    pub show_ms: AtomicU32,
     /// 播放方式（第 36 项）：true = 流畅优先（默认）：帧成串到达时按原来的间隔匀速显示，缓冲自动伸缩（网络稳时一两帧）；
     /// false = 延迟优先：到了就显示，积压时直接跳到最新一帧（0.5.x 的做法）
     pub smooth: AtomicBool,
@@ -1649,9 +1726,12 @@ impl VideoRx {
         self.streams.lock().unwrap().get(&from).map(|s| (s.asm.stats, s.key_requests, s.asm.rtt() as u32))
     }
 
-    /// 收到共享者的鼠标位置
-    pub fn set_cursor(&self, from: u32, x: u16, y: u16, shape: u8, visible: bool) {
+    /// 收到共享者的鼠标位置（和每秒一次的共享状态）
+    pub fn set_cursor(&self, from: u32, x: u16, y: u16, shape: u8, visible: bool, info: Option<udp::ShareInfo>) {
         if let Some(s) = self.streams.lock().unwrap().get(&from) {
+            if let Some(i) = info {
+                *s.view.sharer_info.lock().unwrap() = Some((i, Instant::now()));
+            }
             *s.view.cursor.lock().unwrap() = Some((x as f32 / 65535.0, y as f32 / 65535.0, shape, visible, Instant::now()));
             if let Some(c) = &*self.ctx.lock().unwrap() {
                 c.request_repaint();
@@ -1762,6 +1842,8 @@ fn make_decoder(codec: Codec, hw: bool, w: u32, h: u32) -> Option<Dec> {
 fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe::egui::Context>) {
     let mut dec: Option<(Codec, bool, (u32, u32), Dec)> = None;
     let (mut sec_start, mut sec_frames) = (Instant::now(), 0u32);
+    // 这一秒收到了几帧、显示的帧从交给解码到显示一共等了多久
+    let (mut sec_rx, mut sec_show) = (0u32, Duration::ZERO);
     let mut spare: Vec<u8> = Vec::new();
     // 硬解连续出错这么多次：这一路改用软解（有的显卡驱动对某些码流解不了）
     const HW_FAIL_LIMIT: u32 = 5;
@@ -1785,6 +1867,7 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
             }
         }
         last_arrival = Some(now);
+        sec_rx += batch.len() as u32;
         let smooth = view.smooth.load(Ordering::Relaxed);
         for (i, (cid, bits)) in batch.iter().enumerate() {
             let codec = Codec::from_id(*cid);
@@ -1802,10 +1885,12 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
             }
             let Some((_, _, _, d)) = dec.as_mut() else { continue };
             let show = if smooth { i + SMOOTH_MAX_BACKLOG > last } else { i == last };
-            let mut publish = |w: usize, h: usize, fill: &mut dyn FnMut(&mut Vec<u8>)| {
+            let mut publish = |w: usize, h: usize, nv12: Option<Vec<u8>>, fill: &mut dyn FnMut(&mut Vec<u8>)| {
                 let mut rgba = std::mem::take(&mut spare);
-                rgba.resize(w * h * 4, 0);
-                fill(&mut rgba);
+                if nv12.is_none() {
+                    rgba.resize(w * h * 4, 0);
+                    fill(&mut rgba);
+                }
                 if smooth {
                     // 按估计的帧间隔匀速放（略快一点，缓冲会慢慢消掉、延迟不会越积越多）
                     if let Some(p) = next_present {
@@ -1817,10 +1902,12 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
                     next_present = Some(Instant::now() + interval.mul_f32(0.85));
                 }
                 let seq = view.seq.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(o) = view.frame.lock().unwrap().replace(DecodedFrame { width: w, height: h, rgba, seq }) {
+                let nv12 = nv12.map(Arc::new);
+                if let Some(o) = view.frame.lock().unwrap().replace(DecodedFrame { width: w, height: h, rgba, nv12, seq }) {
                     spare = o.rgba; // 复用缓冲
                 }
                 sec_frames += 1;
+                sec_show += now.elapsed();
                 if let Some(c) = &ctx {
                     c.request_repaint();
                 }
@@ -1829,18 +1916,24 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
                 Dec::Open(o) => match o.decode(bits) {
                     Ok(Some(yuv)) if show => {
                         let (w, h) = yuv.dimensions();
-                        publish(w, h, &mut |buf| yuv.write_rgba8(buf));
+                        publish(w, h, None, &mut |buf| yuv.write_rgba8(buf));
                     }
                     Ok(_) => {}
                     Err(_) => view.decode_failed.store(true, Ordering::Relaxed),
                 },
                 Dec::Mf(m) => match m.decode(bits) {
-                    Ok(frames) => {
+                    Ok(mut frames) => {
                         if !frames.is_empty() {
                             hw_fails = 0;
                         }
-                        if let (true, Some(f)) = (show, frames.last()) {
-                            publish(f.width, f.height, &mut |buf| nv12_to_rgba(&f.data, f.width, f.height, buf));
+                        if let (true, Some(mut f)) = (show, frames.pop()) {
+                            // 界面能在显卡上转颜色：直接交 NV12（第 53-2 项）；否则在这里用 CPU 转成 RGBA
+                            if crate::nv12view::GPU_NV12.load(Ordering::Relaxed) && f.width % 2 == 0 && f.height % 2 == 0 && f.data.len() >= f.width * f.height * 3 / 2 {
+                                let data = std::mem::take(&mut f.data);
+                                publish(f.width, f.height, Some(data), &mut |_| {});
+                            } else {
+                                publish(f.width, f.height, None, &mut |buf| nv12_to_rgba(&f.data, f.width, f.height, buf));
+                            }
                         }
                     }
                     Err(_) => {
@@ -1857,8 +1950,11 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>)>, view: Arc<View>, ctx: Option<eframe:
             }
         }
         if sec_start.elapsed() >= Duration::from_secs(1) {
-            view.fps.store((sec_frames as f64 / sec_start.elapsed().as_secs_f64()).round() as u32, Ordering::Relaxed);
-            (sec_start, sec_frames) = (Instant::now(), 0);
+            let secs = sec_start.elapsed().as_secs_f64();
+            view.fps.store((sec_frames as f64 / secs).round() as u32, Ordering::Relaxed);
+            view.rx_fps.store((sec_rx as f64 / secs).round() as u32, Ordering::Relaxed);
+            view.show_ms.store((sec_show.as_secs_f64() * 1000.0 / sec_frames.max(1) as f64).round() as u32, Ordering::Relaxed);
+            (sec_start, sec_frames, sec_rx, sec_show) = (Instant::now(), 0, 0, Duration::ZERO);
         }
     }
 }

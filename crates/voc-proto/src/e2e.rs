@@ -60,6 +60,12 @@ pub struct Profile {
 
 /// 能力：认识 BLOB_CHAT2 / BLOB_REACT
 pub const FEATURE_CHAT2: &str = "chat2";
+/// 能力：收得了 10 ms 一包的语音（按实际时长估抖动、补包），第 36-3 项
+pub const FEATURE_VOICE10: &str = "voice10";
+/// 能力：认识画面的交错标记（udp::VIDEO_INTERLEAVED，第 34-5 项）
+pub const FEATURE_VIDEO_INTERLEAVE: &str = "video_il";
+/// 能力：认识带冗余的语音包（udp::voice_red，上一两帧顺带塞进下一包），第 34-3 项
+pub const FEATURE_VOICE_RED: &str = "voice_red";
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct Hello {

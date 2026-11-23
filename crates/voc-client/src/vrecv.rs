@@ -456,6 +456,10 @@ impl Assembler {
                     if n == newest && now.duration_since(p.first) < tail_wait {
                         continue;
                     }
+                    // 跨帧交错的帧（第 34-5 项）：它和下一帧的分片是交替来的，下一帧开始到了不代表它的原包丢了，等这一对都到得差不多再要
+                    if p.flags & udp::VIDEO_INTERLEAVED != 0 && newest.wrapping_sub(n) <= 1 && now.duration_since(p.first) < tail_wait * 2 {
+                        continue;
+                    }
                     if p.last_nack.is_some_and(|t| now.duration_since(t) < retry) {
                         continue;
                     }
@@ -492,6 +496,36 @@ mod tests {
     fn feed(a: &mut Assembler, pkt: &[u8], now: Instant) {
         let (f, d) = read_video_frag(pkt).unwrap();
         a.add(f, d, now);
+    }
+
+    /// 第 34-5 项：交错发的两帧，第二帧开始到了、第一帧还缺片：带交错标记的先不要补发，不带标记的照旧马上要
+    #[test]
+    fn interleaved_pair_waits_before_nack() {
+        use voc_proto::udp::{VIDEO_FLAGS_AT, VIDEO_INTERLEAVED};
+        for il in [false, true] {
+            let mut a = Assembler::default();
+            let t = Instant::now();
+            let (_, f0) = frame(0, true, 1080 * 4);
+            let (_, mut f1) = frame(1, false, 1080 * 4);
+            let (_, f2) = frame(2, false, 1080 * 4);
+            let mut f0 = f0;
+            if il {
+                for f in f0.iter_mut().chain(f1.iter_mut()) {
+                    f[VIDEO_FLAGS_AT] |= VIDEO_INTERLEAVED;
+                }
+            }
+            for f in &f0 {
+                feed(&mut a, f, t);
+            }
+            a.poll(t, 0, true);
+            // 帧 1 只到了第 0、2 片（第 1 片在路上），帧 2 开始到了
+            feed(&mut a, &f1[0], t);
+            feed(&mut a, &f1[2], t);
+            feed(&mut a, &f2[0], t + Duration::from_millis(2));
+            let out = a.poll(t + Duration::from_millis(3), 0, true);
+            let asked = out.nacks.iter().any(|(n, _)| *n == 1);
+            assert_eq!(asked, !il, "交错 = {il}");
+        }
     }
 
     #[test]
