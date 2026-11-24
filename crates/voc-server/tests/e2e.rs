@@ -1088,7 +1088,7 @@ fn lossy_listener_gets_duplicate_voice() {
 #[test]
 fn voice_fallback_when_listener_does_not_hear() {
     use voc_proto::PeerStat;
-    let srv = Server::start(9);
+    let srv = Server::start(42);
     let codes = srv.gen_codes(2);
     let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
     let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
@@ -1137,7 +1137,7 @@ fn voice_fallback_when_listener_does_not_hear() {
 #[test]
 fn member_relay_is_planned_and_server_stops_forwarding() {
     use voc_proto::{PeerStat, RelayRoute};
-    let srv = Server::start(9);
+    let srv = Server::start(43);
     let codes = srv.gen_codes(3);
     let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
     let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
@@ -1353,7 +1353,7 @@ fn p2p_only_share_is_not_forwarded() {
 /// UDP 不通的人：伴奏经 TCP 发上来、也经 TCP 收到（0.6 起；以前这种人收不到伴奏和共享声音）
 #[test]
 fn music_over_tcp_when_udp_is_blocked() {
-    let srv = Server::start(11);
+    let srv = Server::start(44);
     let codes = srv.gen_codes(2);
     let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
     let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
@@ -1376,7 +1376,7 @@ fn music_over_tcp_when_udp_is_blocked() {
 /// 伴奏：发给同频道所有没静音的人（发送者闭麦也照转）；屏幕共享声音只发给观看者
 #[test]
 fn music_and_share_audio_forwarding() {
-    let srv = Server::start(11);
+    let srv = Server::start(45);
     let codes = srv.gen_codes(4);
     let mut a = Client::connect(srv.port, &codes[0], "alice").unwrap();
     let mut b = Client::connect(srv.port, &codes[1], "bob").unwrap();
