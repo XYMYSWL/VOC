@@ -15,7 +15,7 @@ use crate::net::Outgoing;
 use crate::video::VideoRx;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -323,6 +323,41 @@ impl NatEmu {
         }
         None
     }
+}
+
+/// 一层画面发给各人的冗余比例（第 65-2 项）
+#[derive(Clone, Debug, Default)]
+pub struct FecPlan {
+    /// 经服务器的那一份（按多数人）
+    pub server: f32,
+    pub has_server: bool,
+    /// 直连的各人
+    pub direct: HashMap<u32, f32>,
+}
+
+impl FecPlan {
+    /// 编码用的比例：所有人里最高的
+    pub fn max(&self) -> f32 {
+        self.direct.values().copied().fold(if self.has_server { self.server } else { 0.0 }, f32::max)
+    }
+
+    pub fn adjusted(&self, f: impl Fn(f32) -> f32) -> FecPlan {
+        FecPlan { server: f(self.server), has_server: self.has_server, direct: self.direct.iter().map(|(k, v)| (*k, f(*v))).collect() }
+    }
+}
+
+/// 测试用的上行限速（令牌桶，桶深 50 ms）
+fn test_up_allow(len: usize) -> bool {
+    static CFG: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let Some(bps) = *CFG.get_or_init(|| std::env::var("VOC_TEST_UP_KBPS").ok().and_then(|v| v.parse::<f64>().ok()).map(|k| k * 1000.0)) else { return true };
+    static BUCKET: Mutex<Option<(f64, Instant)>> = Mutex::new(None);
+    let mut b = BUCKET.lock().unwrap();
+    let now = Instant::now();
+    let (tokens, last) = b.unwrap_or((bps / 8.0 * 0.05, now));
+    let tokens = (tokens + now.duration_since(last).as_secs_f64() * bps / 8.0).min(bps / 8.0 * 0.05);
+    let ok = tokens >= len as f64;
+    *b = Some((if ok { tokens - len as f64 } else { tokens }, now));
+    ok
 }
 
 /// 低 TTL 先发（第 35-2 项）用的 TTL：只够走到自己的路由器 / 运营商 NAT，到不了对方。
@@ -951,9 +986,13 @@ pub static SHARE_P2P_ONLY: AtomicBool = AtomicBool::new(false);
 pub static VOICE_10MS: AtomicBool = AtomicBool::new(false);
 /// 同频道的人都认识带冗余的语音包（第 34-3 项）
 pub static VOICE_RED_OK: AtomicBool = AtomicBool::new(false);
-/// 发出方向丢包 ≥ 15%：前一帧顺带再发一份；≥ 35%：前两帧
-const RED_LOSS_1: u8 = 15;
-const RED_LOSS_2: u8 = 35;
+/// 服务器说：同频道里收我语音丢得最多的人丢了多少（%，第 70 项）
+pub static LISTEN_LOSS: AtomicU8 = AtomicU8::new(0);
+/// 发出方向丢包 ≥ 10%：前一帧顺带再发一份；≥ 20%：前两帧；≥ 35%：前三帧（第 70 项：以前 15% / 35% 才带一 / 两帧，
+/// 丢 30% 时补出来的帧有两成，听着发糊）。语音包很小，带三帧也只多几十 kbps
+const RED_LOSS_1: u8 = 10;
+const RED_LOSS_2: u8 = 20;
+const RED_LOSS_3: u8 = 35;
 
 /// 共享声音的线路（第 54 项，共享者在设置里选）：0 自动（跟语音的线路走，直连有丢包时两条路同时发），
 /// 1 总是经服务器，2 总是直连（打不通的人还是经服务器）
@@ -1142,6 +1181,8 @@ pub struct Link {
     video_frags_nacked: AtomicU32,
     /// 观看者回报的收画面情况：观看者 → (原始丢包率 千分之几, 往返 ms, 时间)
     video_reports: Mutex<HashMap<u32, (u16, u32, Instant)>>,
+    /// 每层发给各人的冗余（第 65-2 项）：[原画, 低画质]
+    fec_plan: Mutex<[Option<FecPlan>; 2]>,
     /// 画面直连 + 经服务器两条路同时发的观看者（丢包很高时）
     dual_video: Mutex<std::collections::HashSet<u32>>,
     /// 语音直连 + 经服务器两条路同时发的人（直连有丢包但还没到「不稳」时）
@@ -1237,6 +1278,10 @@ impl Link {
     }
 
     fn send_raw(&self, buf: &[u8], to: SocketAddr) {
+        // 测试：VOC_TEST_UP_KBPS=千比特每秒 模拟上行带宽（超出的直接丢，像出口被限速的路由器；第 71 项）
+        if !test_up_allow(buf.len()) {
+            return;
+        }
         // 测试用的模拟路由器（第 60-4 项）：记下发给了谁（过滤用）；对称型每个新目标开一个新端口，从那个端口发
         if let Some(emu) = &self.nat_emu {
             emu.note_sent(to);
@@ -1332,6 +1377,22 @@ impl Link {
     /// 断线恢复后换成新的 TCP 连接（第 37-2 项）
     pub fn set_tcp(&self, tx: Sender<Outgoing>) {
         *self.tcp.lock().unwrap() = tx;
+    }
+
+    /// 测上行带宽（第 71 项）：通知服务器开始 / 结束
+    pub fn speed_control(&self, start: bool) {
+        self.tcp_send(Outgoing::Msg(ClientMsg::SpeedTest { start }));
+    }
+
+    /// 测上行带宽：往服务器发一个测速包
+    pub fn speed_probe(&self, size: usize) {
+        let mut buf = Vec::with_capacity(size + 64);
+        self.send_server(udp::SPEED, &vec![0u8; size], &mut buf);
+    }
+
+    /// 到服务器的往返（ms）
+    pub fn server_rtt_ms(&self) -> u32 {
+        self.server_rtt.load(Ordering::Relaxed)
     }
 
     fn tcp_send(&self, o: Outgoing) {
@@ -1669,7 +1730,12 @@ impl Link {
                     .collect()
             };
             for (id, path) in &targets {
+                let ratio = self.fec_for(low, Some(*id));
                 for f in frags {
+                    // 只带他那一份校验片（第 65-2 项）
+                    if ratio.is_some_and(|r| !udp::rs_keep_for(f, r)) {
+                        continue;
+                    }
                     self.send_paced(*path, SealFor::Peer(*id), udp::VIDEO, udp::server_video(self.my_id, f));
                 }
             }
@@ -1690,7 +1756,12 @@ impl Link {
             return; // 都送到了；或者选了只走 P2P（打不通的人看不了，不经服务器）
         }
         let udp_ok = self.udp_ok.load(Ordering::Relaxed);
+        let ratio = self.fec_for(low, None);
         for f in frags {
+            // 经服务器的那一份按多数人的冗余（第 65-2 项；网差的人服务器另外补）
+            if ratio.is_some_and(|r| !udp::rs_keep_for(f, r)) {
+                continue;
+            }
             if udp_ok {
                 self.send_paced(self.server, SealFor::Server, udp::VIDEO, f.clone());
             } else {
@@ -1881,6 +1952,58 @@ impl Link {
     }
 
     /// 某一层观看者最近 5 秒回报的最大原始丢包率（千分之几）
+    /// 这一层各观看者该用的冗余（第 65-2 项）：直连的人按各自的丢包 / 往返；经服务器的按多数人（中位数，偏低的那个）
+    pub fn layer_fec_plan(&self, low: bool) -> FecPlan {
+        let ids = self.layer_watchers(low);
+        let direct: std::collections::HashSet<u32> = self.alloc.lock().unwrap().1.iter().copied().collect();
+        let r = self.video_reports.lock().unwrap();
+        let mut plan = FecPlan::default();
+        let mut server: Vec<f32> = Vec::new();
+        for id in ids {
+            let ratio = match r.get(&id).filter(|x| x.2.elapsed() < Duration::from_secs(5)) {
+                Some(x) => voc_proto::udp::viewer_fec_ratio(x.0, x.1),
+                None => 0.0,
+            };
+            if direct.contains(&id) {
+                plan.direct.insert(id, ratio);
+            } else {
+                server.push(ratio);
+            }
+        }
+        server.sort_by(|a, b| a.total_cmp(b));
+        plan.server = if server.is_empty() { 0.0 } else { server[(server.len() - 1) / 2] };
+        plan.has_server = !server.is_empty();
+        plan
+    }
+
+    /// 测试日志：(原画层计划, 各观看者回报的 (编号, 丢包千分比, 往返 ms))
+    pub fn fec_plan_debug(&self) -> (Option<FecPlan>, Vec<(u32, u16, u32)>) {
+        let mut r: Vec<(u32, u16, u32)> = self.video_reports.lock().unwrap().iter().map(|(k, v)| (*k, v.0, v.1)).collect();
+        r.sort();
+        (self.fec_plan.lock().unwrap()[0].clone(), r)
+    }
+
+    pub fn set_fec_plan(&self, low: bool, plan: FecPlan) {
+        self.fec_plan.lock().unwrap()[low as usize] = Some(plan);
+    }
+
+    /// 发给某人（None = 服务器）时，这一层的校验片带多少（没有计划时全带）
+    fn fec_for(&self, low: bool, to: Option<u32>) -> Option<f32> {
+        let p = self.fec_plan.lock().unwrap();
+        let plan = p[low as usize].as_ref()?;
+        Some(match to {
+            Some(id) => plan.direct.get(&id).copied().unwrap_or(plan.server),
+            None => plan.server,
+        })
+    }
+
+    /// 这一层观看者回报的最长往返时间（ms，最近 5 秒；没有回报时 0）
+    pub fn layer_rtt(&self, low: bool) -> u32 {
+        let ids = self.layer_watchers(low);
+        let r = self.video_reports.lock().unwrap();
+        ids.iter().filter_map(|i| r.get(i)).filter(|x| x.2.elapsed() < Duration::from_secs(5)).map(|x| x.1).max().unwrap_or(0)
+    }
+
     pub fn layer_loss(&self, low: bool) -> u16 {
         let ids = self.layer_watchers(low);
         let r = self.video_reports.lock().unwrap();
@@ -2975,11 +3098,13 @@ struct UserDecoder {
     old_epochs: Vec<u16>,
     /// 对方一包多少样本（10 ms = 480，20 ms = 960）：补丢包时补这么长
     frame_len: usize,
+    /// 丢了的帧里有多少是用包里顺带的旧包原样还原的（不算「补出来的」，第 70 项统计用）
+    red_restored: u32,
 }
 
 impl UserDecoder {
     fn new(dec: crate::opusx::Decoder) -> Self {
-        Self { dec, last_seq: None, epoch: None, old_epochs: Vec::new(), frame_len: FRAME_SAMPLES }
+        Self { dec, last_seq: None, epoch: None, old_epochs: Vec::new(), frame_len: FRAME_SAMPLES, red_restored: 0 }
     }
 
     /// 这一包（已解密验证过）用的是哪把密钥：
@@ -3066,6 +3191,7 @@ fn conceal_gap(d: &mut UserDecoder, last: u16, gap: u16, cur: u16, older: &[&[u8
         if (1..=older.len()).contains(&back) {
             if let Some(n) = d.dec.decode(older[older.len() - back], &mut pcm[..], false) {
                 frames.push((seq, pcm[..n].to_vec()));
+                d.red_restored += 1;
                 continue;
             }
         }
@@ -3171,6 +3297,7 @@ impl VoiceState {
     }
 
     pub fn disconnect(&self) {
+        LISTEN_LOSS.store(0, Ordering::Relaxed);
         if let Some(l) = self.link.lock().unwrap().take() {
             l.close();
         }
@@ -3202,14 +3329,16 @@ pub fn on_stream_audio(kind: u8, payload: &[u8], state: &VoiceState, mixer: &Mut
     if !keep {
         return;
     }
+    let red0 = d.red_restored;
     let Some(frames) = decode_stream_stereo(d, seq, &data, pcm) else { return };
+    let red = d.red_restored.wrapping_sub(red0);
     drop(decs);
     let id = crate::audio::stream_mixer_id(kind, from);
     let mut m = mixer.lock().unwrap();
     if rekeyed {
         m.restart_seq(id);
     }
-    let concealed = frames.len().saturating_sub(1) as u32;
+    let concealed = (frames.len().saturating_sub(1) as u32).saturating_sub(red);
     for (s, f) in frames {
         m.push_ch(id, s, &f, 2);
     }
@@ -3531,7 +3660,7 @@ fn apply_video_actions(state: &VoiceState, acts: crate::video::RxActions) {
         l.request_keyframe(from);
     }
     for (target, loss, rtt) in acts.reports {
-        l.tcp_send(Outgoing::Msg(ClientMsg::VideoReport { target, loss, rtt }));
+        l.tcp_send(Outgoing::Msg(ClientMsg::VideoReport { target, loss, rtt, rs_ext: true }));
     }
     for (target, frame) in acts.ltr_acks {
         l.tcp_send(Outgoing::Msg(ClientMsg::VideoLtr { target, ack: Some(frame), recover: false }));
@@ -3568,14 +3697,16 @@ pub fn on_server_voice(payload: &[u8], state: &VoiceState, mixer: &Mutex<Mixer>,
     if !keep {
         return;
     }
+    let red0 = d.red_restored;
     let Some(frames) = decode_with_concealment(d, seq, data, pcm) else { return };
+    let red = d.red_restored.wrapping_sub(red0);
     drop(decs);
     {
-        // 测试日志用：这个人的语音一共放了多少帧、其中多少是补出来的（DRED / FEC / PLC）
+        // 测试日志用：这个人的语音一共放了多少帧、其中多少是补出来的（DRED / FEC / PLC；用顺带的旧包原样还原的不算）
         let mut r = state.voice_rx.lock().unwrap();
         let e = r.entry(from).or_default();
         e.0 += frames.len() as u32;
-        e.1 += frames.len().saturating_sub(1) as u32;
+        e.1 += (frames.len().saturating_sub(1) as u32).saturating_sub(red);
     }
     let mut m = mixer.lock().unwrap();
     if rekeyed {
@@ -3694,6 +3825,7 @@ pub fn connect(
         video_frags_sent: AtomicU32::new(0),
         video_frags_nacked: AtomicU32::new(0),
         video_reports: Mutex::new(HashMap::new()),
+        fec_plan: Mutex::new([None, None]),
         dual_video: Mutex::new(Default::default()),
         dual_voice: Mutex::new(Default::default()),
         ltr_acks: Mutex::new(Vec::new()),
@@ -4392,7 +4524,8 @@ struct Transmitter {
     hang: u32,
     loop_seq: u16,
     /// 编码器当前是否按低带宽码率
-    low: bool,
+    /// 编码器现在的码率
+    bitrate: i32,
     /// 连续多久（ms）完全没有声音（全 0）
     zero_ms: u32,
     /// 最近发出的几包（带冗余时顺带塞进下一包），停止说话就清空
@@ -4415,7 +4548,7 @@ impl Transmitter {
             pkt: Vec::with_capacity(udp::MAX_PACKET),
             hang: 0,
             loop_seq: 0,
-            low: false,
+            bitrate: OPUS_BITRATE,
             zero_ms: 0,
             recent: std::collections::VecDeque::new(),
             red_copies: 0,
@@ -4462,16 +4595,22 @@ impl Transmitter {
             return;
         }
 
+        // 语音码率：设置里选的「语音音质」（第 68 项，默认 96 kbps）；低带宽模式固定 12 kbps
         let low = crate::audio::LOW_BANDWIDTH.load(Ordering::Relaxed);
-        if low != self.low {
-            self.low = low;
-            self.enc.set_bitrate(if low { LOW_OPUS_BITRATE } else { OPUS_BITRATE });
+        let want = if low { LOW_OPUS_BITRATE } else { crate::audio::VOICE_BITRATE.load(Ordering::Relaxed) as i32 };
+        if want != self.bitrate {
+            self.bitrate = want;
+            self.enc.set_bitrate(want);
         }
         // 每秒看一次线路丢包，变了就调编码器（FEC / DRED）
         if self.loss_checked.elapsed() >= Duration::from_secs(1) {
             self.loss_checked = Instant::now();
             let link = self.state.current_link();
-            let loss = link.as_ref().map(|l| l.voice_path_loss()).unwrap_or(0);
+            // 自己这一头测到的丢包，和听的人那一头丢的（服务器转告），取大的（第 70 项）
+            // VOC_TEST_OLD_RED=1：按 0.6.4 的做法（只看自己这一头、15% / 35%），对比测试用
+            let old_red = std::env::var_os("VOC_TEST_OLD_RED").is_some();
+            let own = link.as_ref().map(|l| l.voice_path_loss()).unwrap_or(0);
+            let loss = if old_red { own } else { own.max(LISTEN_LOSS.load(Ordering::Relaxed)) };
             if loss >= 3 {
                 if let Some(l) = &link {
                     l.note_loss_burst();
@@ -4480,6 +4619,16 @@ impl Transmitter {
             // 发出方向丢包高、大家都认识：前一两帧顺带再发（第 34-3 项；和 DRED 一起用，DRED 是压缩过的近似，这个是原包）
             self.red_copies = if !VOICE_RED_OK.load(Ordering::Relaxed) {
                 0
+            } else if old_red {
+                if loss >= 35 {
+                    2
+                } else if loss >= 15 {
+                    1
+                } else {
+                    0
+                }
+            } else if loss >= RED_LOSS_3 {
+                3
             } else if loss >= RED_LOSS_2 {
                 2
             } else if loss >= RED_LOSS_1 {
@@ -4517,7 +4666,7 @@ impl Transmitter {
             }
         }
         self.recent.push_back(packet.to_vec());
-        if self.recent.len() > 2 {
+        if self.recent.len() > 3 {
             self.recent.pop_front();
         }
         if s.loopback.load(Ordering::Relaxed) {

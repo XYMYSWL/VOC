@@ -7,6 +7,7 @@ mod audio;
 mod autostart;
 mod denoise;
 mod glass;
+mod speedtest;
 mod hotkey;
 mod icons;
 mod images;

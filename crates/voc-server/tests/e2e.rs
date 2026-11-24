@@ -130,7 +130,7 @@ impl Client {
         let code = AuthCode::parse(code).unwrap();
         let mut s = TcpStream::connect((host, port)).unwrap();
         // 全部测试一起跑时机器很忙，服务器握手可能回得慢：多等一会儿
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut hs = ClientHandshake::start(code.psk());
         s.write_all(hs.first_flight()).unwrap();
         let mut prefix = [0u8; SERVER_PREFIX_LEN];
@@ -139,7 +139,7 @@ impl Client {
         let mut rest = vec![0u8; need];
         s.read_exact(&mut rest).unwrap();
         let keys = hs.finish(&rest).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
 
         let udp = UdpSocket::bind(if host == "127.0.0.1" { "127.0.0.1:0" } else { "0.0.0.0:0" }).unwrap();
         udp.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
@@ -227,7 +227,8 @@ impl Client {
 
     /// 等到某条消息满足条件
     fn wait_for(&mut self, mut f: impl FnMut(&ServerMsg) -> bool) -> ServerMsg {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // GitHub 的测试机有时很慢（三个人同时进频道、等名单曾经 10 秒没等到）：放宽到 30 秒，只在出错时才会等这么久（第 65-7 项）
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(Instant::now() < deadline, "timeout waiting for message");
             let m = self.recv_json();
@@ -1247,7 +1248,9 @@ fn status_command_shows_running_state() {
     let out = Command::new(EXE).args(["status", "--codes"]).arg(&srv.codes).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("在线 1 人"), "{text}");
-    assert!(text.contains("alice"), "{text}");
+    // 第 60-6 项：状态里只写编号，不写昵称
+    assert!(text.contains("#1"), "{text}");
+    assert!(!text.contains("alice"), "{text}");
     assert!(text.contains("NAT 探测"), "{text}");
     assert!(text.contains("画面"), "{text}");
 }

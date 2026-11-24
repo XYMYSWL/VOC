@@ -88,6 +88,13 @@ struct User {
     last_video_relays: Vec<RelayRoute>,
     /// 我最近发出的画面分片（观看者补发请求先从这里找，找不到再转给我）
     video_cache: VideoCache,
+    /// 我看的各共享者：我最近回报的 (丢包千分比, 往返 ms, 时间)，只记认识「另外补的校验片」的新客户端（第 65-2 项）
+    video_loss: HashMap<u32, (u16, u32, Instant)>,
+    /// 上次告诉他的「别人收他语音最多丢多少」（第 70 项）
+    listen_loss_sent: u8,
+    /// 测上行带宽（第 71 项）：正在数的话 (开始时间, 每 250 ms 收到的字节)；上次测的时间（30 秒最多一次）
+    speed: Option<(Instant, Vec<u64>)>,
+    speed_last: Option<Instant>,
     /// 上次发给我的观看者名单（我是共享者时）：全部、要低画质的、选了 P2P 的、选了走服务器的、自己画鼠标的
     last_watchers: (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>),
     /// 能解码的视频格式
@@ -127,6 +134,35 @@ const VIDEO_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const VIDEO_CACHE_FRAMES: usize = 240;
 
 impl VideoCache {
+    /// 这一帧的数据片是不是都到了（只数，不拼）
+    fn has_all_data(&self, layer: u8, frame: u32) -> bool {
+        let Some(m) = self.frames.get(&(layer, frame)) else { return false };
+        let Some(count) = m.values().next().and_then(|f| udp::read_video_frag(f)).map(|(h, _)| h.count) else { return false };
+        m.keys().filter(|i| **i < count).count() == count as usize
+    }
+
+    /// 这一帧的数据片是不是都到了：都到了返回 (分片数, flags, 按顺序拼好的整帧数据, 每组已有的校验片数 {组的第一片: 最多到第几片+1})
+    fn whole_frame(&self, layer: u8, frame: u32) -> Option<(u16, u8, Vec<u8>, HashMap<usize, usize>)> {
+        let m = self.frames.get(&(layer, frame))?;
+        let (h, _) = m.values().next().and_then(|f| udp::read_video_frag(f))?;
+        let count = h.count;
+        let mut data = Vec::new();
+        for i in 0..count {
+            let (_, d) = udp::read_video_frag(m.get(&i)?)?;
+            data.extend_from_slice(d);
+        }
+        let mut have: HashMap<usize, usize> = HashMap::new();
+        for f in m.values() {
+            if let Some((fh, d)) = udp::read_video_frag(f) {
+                if let Some((p, _)) = udp::read_rs_parity(&fh, d) {
+                    let e = have.entry(p.first).or_insert(0);
+                    *e = (*e).max(p.j + 1);
+                }
+            }
+        }
+        Some((count, h.flags, data, have))
+    }
+
     fn insert(&mut self, layer: u8, frame: u32, idx: u16, frag: &[u8]) {
         let key = (layer, frame);
         let e = self.frames.entry(key).or_insert_with(|| {
@@ -315,6 +351,7 @@ impl State {
             .users
             .iter()
             .map(|(id, u)| UserInfo {
+                tag: code_tag(&u.code_id),
                 id: *id,
                 name: u.name.clone(),
                 channel_id: u.channel,
@@ -724,8 +761,16 @@ impl State {
         let simulcast = u.simulcast;
         let direct = u.direct_video.clone();
         let payload = udp::server_video(from, frag);
+        // 数据片补齐了一整帧：给经服务器看、网差的人另外补校验片（第 65-2 项），每帧只做一次
+        let mut whole = None;
+        let topup = f.idx < f.count && self.users.values().any(|v| v.video_loss.contains_key(&from));
         if let Some(u) = self.users.get_mut(&from) {
-            u.video_cache.insert(f.flags & udp::VIDEO_LOW, f.frame, f.idx, frag);
+            let layer = f.flags & udp::VIDEO_LOW;
+            let was_whole = topup && u.video_cache.has_all_data(layer, f.frame);
+            u.video_cache.insert(layer, f.frame, f.idx, frag);
+            if topup && !was_whole && u.video_cache.has_all_data(layer, f.frame) {
+                whole = u.video_cache.whole_frame(layer, f.frame);
+            }
         }
         let mut out = Vec::new();
         let relayed: HashSet<u32> = self.video_relays.keys().filter(|(s, _)| *s == from).map(|(_, t)| *t).collect();
@@ -742,6 +787,27 @@ impl State {
                     let mut pkt = Vec::with_capacity(payload.len() + 64);
                     other.udp_seal.seal(udp::VIDEO, &payload, &mut pkt);
                     out.push((addr, pkt));
+                    // 这个人网差、共享者发上来的校验片不够他用：服务器按他的丢包另外算几片补给他（只走 UDP 的人）
+                    if let (Some((count, flags, data, have)), Some((loss, rtt, at))) = (&whole, other.video_loss.get(&from).copied()) {
+                        if at.elapsed() < Duration::from_secs(5) {
+                            let r = udp::viewer_fec_ratio(loss, rtt);
+                            let r = if flags & udp::VIDEO_KEY != 0 { udp::key_fec_ratio(r) } else { r };
+                            if r > 0.0 {
+                                for extra in udp::rs_parities(f.frame, *flags, data, r) {
+                                    let Some((eh, ed)) = udp::read_video_frag(&extra) else { continue };
+                                    let Some((p, _)) = udp::read_rs_parity(&eh, ed) else { continue };
+                                    if eh.count != *count || p.j < have.get(&p.first).copied().unwrap_or(0) {
+                                        continue; // 共享者发上来的已经有了
+                                    }
+                                    let ep = udp::server_video(from, &extra);
+                                    let mut pkt = Vec::with_capacity(ep.len() + 64);
+                                    other.udp_seal.seal(udp::VIDEO, &ep, &mut pkt);
+                                    out.push((addr, pkt));
+                                    self.sec_bytes.1 += ep.len() as u64 + 60;
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => other.send_media(Out::Video(payload.clone())),
             }
@@ -759,6 +825,30 @@ impl State {
     }
 
     /// 每秒：统计转发带宽；超过画面上限时让一个经服务器看原画的人改看「流畅」，宽松 10 秒后放回一个
+    /// 每秒：告诉每个人「同频道其他人收语音最多丢了多少」（第 70 项），变了才发
+    fn push_listen_loss(&mut self) {
+        let mut want: Vec<(u32, u8)> = Vec::new();
+        for (id, u) in &self.users {
+            let Some(ch) = u.channel else { continue };
+            let worst = self
+                .users
+                .iter()
+                .filter(|(o, v)| *o != id && v.channel == Some(ch))
+                .filter_map(|(_, v)| v.stats.as_ref().filter(|r| r.at.elapsed() < STATS_TTL).map(|r| r.voice_loss))
+                .max()
+                .unwrap_or(0);
+            if worst != u.listen_loss_sent {
+                want.push((*id, worst));
+            }
+        }
+        for (id, pct) in want {
+            if let Some(u) = self.users.get_mut(&id) {
+                u.listen_loss_sent = pct;
+                u.send(ServerMsg::ListenLoss { pct });
+            }
+        }
+    }
+
     fn balance_video_cap(&mut self) {
         self.last_sec_bytes = std::mem::take(&mut self.sec_bytes);
         let Some(cap) = self.max_video_bps else {
@@ -860,10 +950,11 @@ impl State {
         for c in chans {
             let mut names: Vec<String> = self
                 .users
-                .values()
-                .filter(|u| u.channel == Some(c.id))
-                .map(|u| {
-                    let mut n = u.name.clone();
+                .iter()
+                .filter(|(_, u)| u.channel == Some(c.id))
+                .map(|(id, u)| {
+                    // 日志 / 状态只写编号（第 60-6 项）
+                    let mut n = format!("#{id}");
                     if u.deafened {
                         n += "（静音）";
                     } else if u.muted {
@@ -890,8 +981,8 @@ impl State {
             let relayed = watchers.iter().filter(|w| self.video_relays.contains_key(&(*id, **w))).count();
             let _ = writeln!(
                 t,
-                "  {} 的屏幕：{} 人在看（直连 {direct}，观看者转发 {relayed}，经服务器 {}）",
-                u.name,
+                "  #{} 的屏幕：{} 人在看（直连 {direct}，观看者转发 {relayed}，经服务器 {}）",
+                id,
                 watchers.len(),
                 watchers.len() - direct - relayed
             );
@@ -1662,7 +1753,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         return Ok(());
     }
     let user_id = if let Some(id) = resumed {
-        println!("[{addr}] {name} (#{id}) 断线后恢复了连接");
+        println!("[{addr}] #{id} 断线后恢复了连接");
         id
     } else {
         let mut st = state.lock().unwrap();
@@ -1686,6 +1777,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 voc_proto::FEATURE_VIDEO_RTX.into(),
                 voc_proto::FEATURE_SHARE_AUDIO_ROUTE.into(),
                 voc_proto::FEATURE_PUNCH.into(),
+                voc_proto::FEATURE_SPEEDTEST.into(),
             ],
             probe_port: st.probe_port,
             probe2: st.probe2.clone(),
@@ -1717,6 +1809,10 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
                 detached: None,
                 last_peers: Vec::new(),
                 sharing: None,
+                speed: None,
+                speed_last: None,
+                listen_loss_sent: 0,
+                video_loss: HashMap::new(),
                 watching: HashSet::new(),
                 watch_low: HashSet::new(),
                 watch_route: HashMap::new(),
@@ -1743,7 +1839,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
         st.broadcast_state();
         st.system(format!("{name} 加入了服务器"));
         st.push_peers();
-        println!("[{addr}] {name} (#{id}, 授权码 {} {}) 已连接", entry.id, entry.note);
+        println!("[{addr}] #{id}（授权码 {} {}）已连接", entry.id, entry.note);
         id
     };
 
@@ -1865,7 +1961,7 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
     }
     // 发送队列的 Sender 已随 User 释放，写任务会把剩余消息（例如踢下线原因）发完再退出
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
-    println!("[{addr}] {name} (#{user_id}) 已断开");
+    println!("[{addr}] #{user_id} 已断开");
     Ok(())
 }
 
@@ -2119,7 +2215,15 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 t.send(ServerMsg::VideoLtr { by: uid, ack, recover });
             }
         }
-        ClientMsg::VideoReport { target, loss, rtt } => {
+        ClientMsg::VideoReport { target, loss, rtt, rs_ext } => {
+            // 记下来：经服务器看的人网差时服务器另外给他补校验片（第 65-2 项；客户端认识才补）
+            if let Some(u) = st.users.get_mut(&uid) {
+                if rs_ext {
+                    u.video_loss.insert(target, (loss.min(1000), rtt.min(10_000), Instant::now()));
+                } else {
+                    u.video_loss.remove(&target);
+                }
+            }
             let watching = st.users.get(&uid).is_some_and(|u| u.watching.contains(&target));
             if let (true, Some(t)) = (watching, st.users.get(&target)) {
                 t.send(ServerMsg::VideoReport { by: uid, loss: loss.min(1000), rtt: rtt.min(10_000) });
@@ -2158,6 +2262,21 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
                 voice_loss: voice_loss.min(100),
             });
             st.check_voice_heard(uid);
+        }
+        ClientMsg::SpeedTest { start } => {
+            let Some(u) = st.users.get_mut(&uid) else { return };
+            if start {
+                // 30 秒最多测一次：免得被当成往服务器灌流量的办法
+                if u.speed_last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+                    u.send(ServerMsg::SpeedTestResult { kbps: Vec::new() });
+                    return;
+                }
+                u.speed_last = Some(Instant::now());
+                u.speed = Some((Instant::now(), Vec::new()));
+            } else if let Some((_, b)) = u.speed.take() {
+                let kbps = b.iter().map(|x| (x * 8 * 4 / 1000) as u32).collect();
+                u.send(ServerMsg::SpeedTestResult { kbps });
+            }
         }
         ClientMsg::PunchResult { peer, ok, ms } => {
             let (Some(a), Some(b)) = (st.users.get(&uid), st.users.get(&peer)) else { return };
@@ -2203,7 +2322,7 @@ async fn revocation_loop(state: Shared) {
             .collect();
         for (id, why) in bad {
             if let Some(u) = st.remove_user(id) {
-                println!("[VOC] 踢出 {}：{why}", u.name);
+                println!("[VOC] 踢出 #{id}：{why}");
                 u.send(ServerMsg::Error { message: why });
                 u.kick.notify_one();
                 let name = u.name.clone();
@@ -2292,6 +2411,16 @@ fn parse_p2p_days(t: &str) -> Vec<(String, u64, u64)> {
     v.sort_by(|a, b| b.0.cmp(&a.0));
     v.truncate(P2P_DAYS_KEEP);
     v
+}
+
+/// 授权码的标记（第 60-6 项）：FNV-1a 64 位，稳定、看不出授权码；客户端按它记身份（不按昵称）
+fn code_tag(code_id: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in b"voc-tag:".iter().chain(code_id.as_bytes()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// 通知双方「过这么久同时开打」（第 62-2 项）：要比两边到服务器的单程延迟都长，才能都等到同一刻
@@ -2420,6 +2549,7 @@ async fn relay_loop(state: Shared) {
         st.push_relays();
         st.push_video_relays();
         st.balance_video_cap();
+        st.push_listen_loss();
     }
 }
 
@@ -2552,6 +2682,18 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
                     out = st.forward_video(uid, &data)
                 }
                 udp::NACK => out = st.on_nack(uid, &data),
+                udp::SPEED => {
+                    // 测上行带宽（第 71 项）：只数字节，最多数 6 秒
+                    if let Some((t0, b)) = st.users.get_mut(&uid).and_then(|u| u.speed.as_mut()) {
+                        let slot = (t0.elapsed().as_millis() / 250) as usize;
+                        if slot < 24 {
+                            if b.len() <= slot {
+                                b.resize(slot + 1, 0);
+                            }
+                            b[slot] += data.len() as u64 + 28;
+                        }
+                    }
+                }
                 udp::MUSIC | udp::SHARE_AUDIO | udp::CURSOR => {
                     if let Some((seq, f)) = udp::read_client_voice(&data) {
                         out = st.forward_stream(uid, kind, seq, f);

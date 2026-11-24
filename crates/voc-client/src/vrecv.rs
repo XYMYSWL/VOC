@@ -165,6 +165,9 @@ pub struct Output {
     pub gap: bool,
     /// 要请求补发的：(帧号, 缺的分片号)
     pub nacks: Vec<(u32, Vec<u16>)>,
+    /// 卡住的帧（第 69-c 项）：队头这一帧缺片、后面的帧已经到了、已经等了一个多来回——补发可能也丢了，
+    /// 上层可以先要恢复帧（和补发并行：补发先到就照常交出，恢复帧到了也能照常解）
+    pub stalled: Option<u32>,
 }
 
 pub struct Assembler {
@@ -346,8 +349,16 @@ impl Assembler {
             if f.is_rs_parity() {
                 if let Some((info, sh)) = udp::read_rs_parity(&f, data) {
                     let e = p.rs.entry(info.first).or_insert_with(|| (info, vec![None; info.m]));
-                    if e.0 == (udp::RsParity { j: e.0.j, ..info }) && info.j < e.1.len() && e.1[info.j].is_none() {
-                        e.1[info.j] = Some(sh.to_vec());
+                    // 同一组可能收到校验片数不同的校验包（共享者按多数人编、服务器给网差的人另外补，第 65-2 项）：
+                    // 校验片前 m 片和校验片数无关，取更大的那个合在一起用
+                    if e.0.k == info.k && e.0.total_len == info.total_len {
+                        if info.m > e.0.m {
+                            e.0.m = info.m;
+                            e.1.resize(info.m, None);
+                        }
+                        if info.j < e.1.len() && e.1[info.j].is_none() {
+                            e.1[info.j] = Some(sh.to_vec());
+                        }
                     }
                 }
             } else if f.is_parity() {
@@ -435,6 +446,11 @@ impl Assembler {
                 continue;
             }
             break;
+        }
+        if let Some(p) = self.pending.get(&next) {
+            if !p.complete() && next != self.newest && now.duration_since(p.first).as_secs_f32() * 1000.0 > self.rtt() * 1.2 + 40.0 {
+                out.stalled = Some(next);
+            }
         }
         self.next = Some(next);
         if self.pending.is_empty() {

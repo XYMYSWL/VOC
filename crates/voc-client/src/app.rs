@@ -67,6 +67,16 @@ struct Persisted {
     ptt_tail_ms: u32,
     /// 被 @、收到私聊时弹 Windows 通知
     notify: bool,
+    /// 语音音质（千比特每秒，第 68 项）：32 / 64 / 96 / 128，默认 96
+    voice_kbps: u32,
+    /// 对服务器隐藏昵称（第 60-6 项，默认开）：服务器和旧版本的人只看到「成员-XXXX」，真名只经端到端加密发给成员
+    hide_name: bool,
+    /// DeepFilterNet3 降噪强度（denoise::DFN_LEVELS 的下标，默认 1 = 高）
+    dfn_level: u8,
+    /// 0.6.5：老配置里默认的 RNNoise（老版）换成新版一次（第 68 项）
+    denoise_v2_migrated: bool,
+    /// 观看诊断记录（第 69-d 项）：看共享时每秒把观看数据写一行进日志
+    view_diag_log: bool,
     /// 外观（第 59 项）：0 跟随系统，1 浅色，2 深色
     theme: u8,
     /// 配色风格（第 63 项）：theme::STYLES 的下标
@@ -198,7 +208,10 @@ impl Default for Persisted {
             vad_threshold_db: -45.0,
             input_gain: 1.0,
             output_volume: 1.0,
-            denoise: DenoiseMode::Rnnoise,
+            denoise: DenoiseMode::Rnnoise2,
+            denoise_v2_migrated: true,
+            dfn_level: 1,
+            hide_name: true,
             denoise_plugin: String::new(),
             denoise_model: String::new(),
             servers: Vec::new(),
@@ -220,6 +233,8 @@ impl Default for Persisted {
             ptt_key: Default::default(),
             ptt_tail_ms: 200,
             notify: true,
+            view_diag_log: false,
+            voice_kbps: 96,
             theme: 0,
             palette: 2,
             glass: false,
@@ -316,6 +331,8 @@ fn apply_image_events(s: &mut Session, events: Vec<crate::images::ImageEvent>, c
 }
 
 struct Session {
+    /// 服务器给的名字（隐藏昵称的人是占位名「成员-XXXX」），按编号；显示用的真名套在 users 里（第 60-6 项）
+    server_names: HashMap<u32, String>,
     /// 演示模式下为 None
     conn: Option<Conn>,
     /// 服务器说它马上要重启（第 53-5 项）：(说明, 收到的时间)。之后断线就显示这句、马上重连
@@ -388,6 +405,19 @@ impl Session {
             Some(p) => &mut self.dm(p).lines,
             None => &mut self.chat,
         }
+    }
+
+    /// 系统消息里服务器写的占位名换成真名（第 60-6 项；显示时换，真名后到的也能换上）
+    pub(crate) fn real_names_in(&self, t: &str) -> String {
+        let mut out = t.to_string();
+        for u in &self.users {
+            if let Some(sn) = self.server_names.get(&u.id) {
+                if sn != &u.name && sn.starts_with("成员-") {
+                    out = out.replace(sn.as_str(), &u.name);
+                }
+            }
+        }
+        out
     }
 
     fn name_of(&self, id: u32) -> String {
@@ -631,6 +661,15 @@ pub struct App {
     share_bw_low_since: Option<std::time::Instant>,
     share_bw_warn: Option<String>,
     share_bw_toasted: bool,
+    view_diag_at: std::time::Instant,
+    /// 测上行带宽（第 71 项）
+    speed: Arc<Mutex<crate::speedtest::State>>,
+    /// 选了 DeepFilterNet3 的「暴力」档：弹「收到！暴力了嗷」
+    show_violent: bool,
+    /// 聊天搜索：关键字、当前第几条、要不要滚过去
+    chat_search: String,
+    chat_search_hit: usize,
+    chat_search_jump: bool,
     /// 毛玻璃（第 59 项）：这次启动窗口是透明的（云母）；云母已经设过；弹框后面的模糊背景；等截图回来
     glass_window: bool,
     mica_done: bool,
@@ -652,6 +691,8 @@ pub struct App {
     test_image_sent: bool,
     /// 测试模式：VOC_TEST_SHARE 已经开始过共享；VOC_TEST_LOG 上次写日志的时间
     test_share_started: bool,
+    test_speed_started: bool,
+    test_speed_logged: bool,
     /// 测试：共享者强制 AV1、本机解不了，没去看（第 61 项）
     test_av1_blocked: bool,
     test_log_at: std::time::Instant,
@@ -718,6 +759,8 @@ pub(crate) struct Viewer {
     gpu: Option<crate::nv12view::Nv12>,
     /// 弹出成独立窗口了（第 53-4 项）、独立窗口置顶
     popped: bool,
+    /// 这一帧嵌在语音房间里画过了（第 59 项）：不再浮观看窗口
+    pub(crate) embedded: bool,
     on_top: bool,
     rates: crate::theme::ViewRates,
     /// 实际换上屏幕的帧（第 56-a 项）：最近 1 秒每一帧的时间；从解码交出到画上屏幕的平均等待（ms）
@@ -739,6 +782,7 @@ impl Viewer {
             rx_prev: None,
             gpu: None,
             popped: false,
+            embedded: false,
             on_top: false,
             rates: Default::default(),
             shown: Default::default(),
@@ -800,6 +844,7 @@ impl App {
         settings.ptt_key.store(cfg.ptt_packed(), Ordering::Relaxed);
         settings.ptt_tail_ms.store(cfg.ptt_tail_ms, Ordering::Relaxed);
         crate::audio::LOW_BANDWIDTH.store(cfg.low_bandwidth, Ordering::Relaxed);
+        crate::audio::VOICE_BITRATE.store(cfg.voice_kbps.clamp(16, 128) * 1000, Ordering::Relaxed);
         settings.input_gain.set(cfg.input_gain);
         settings.output_volume.set(cfg.output_volume);
         // 测试：VOC_TEST_TONE=1 时不用麦克风、自己「一直说话」（见 voice.rs），也不从音箱放声音
@@ -808,6 +853,13 @@ impl App {
         }
         let mixer = Arc::new(Mutex::new(Mixer::default()));
         let voice = Arc::new(VoiceState::default());
+        // 0.6.5：降噪默认换成 RNNoise 新版（老配置里是老版的改一次；选了别的不动）
+        if !cfg.denoise_v2_migrated {
+            if cfg.denoise == DenoiseMode::Rnnoise {
+                cfg.denoise = DenoiseMode::Rnnoise2;
+            }
+            cfg.denoise_v2_migrated = true;
+        }
         // 0.5.1 起观看默认用显卡解码（出错会自动退回软解）；老配置里默认的「软解」改一次
         if !cfg.hw_decode_migrated {
             cfg.hw_decode = true;
@@ -887,6 +939,12 @@ impl App {
             share_bw_low_since: None,
             share_bw_warn: None,
             share_bw_toasted: false,
+            view_diag_at: std::time::Instant::now(),
+            speed: Default::default(),
+            show_violent: false,
+            chat_search: String::new(),
+            chat_search_hit: 0,
+            chat_search_jump: false,
             glass_window: crate::glass::startup_enabled(),
             mica_done: false,
             glass_backdrop: None,
@@ -900,6 +958,8 @@ impl App {
             image_view: None,
             test_image_sent: false,
             test_share_started: false,
+            test_speed_started: false,
+            test_speed_logged: false,
             test_av1_blocked: false,
             test_log_at: std::time::Instant::now(),
             test_ticks: 0,
@@ -955,7 +1015,7 @@ impl App {
     }
 
     fn apply_denoise(&mut self) {
-        let r = denoise::create(self.cfg.denoise, &self.cfg.denoise_plugin, &self.cfg.denoise_model);
+        let r = denoise::create(self.cfg.denoise, &self.cfg.denoise_plugin, &self.cfg.denoise_model, self.cfg.dfn_level);
         let mut slot = self.denoise.lock().unwrap();
         *slot = None; // 先释放旧的（插件 DLL 可能被替换）
         self.denoise_status = match r {
@@ -1000,10 +1060,19 @@ impl App {
     }
 
     /// resume = 断线恢复凭证（第 37-2 项）
+    /// 登录时告诉服务器的名字：隐藏昵称时是按本机身份算的占位名「成员-XXXX」（每次一样，第 60-6 项）
+    pub(crate) fn wire_name(&self) -> String {
+        if self.cfg.hide_name {
+            placeholder_name(&self.identity_seed)
+        } else {
+            self.cfg.name.trim().to_string()
+        }
+    }
+
     fn spawn_connect_with(&self, resume: Option<(u32, String)>) -> Receiver<ConnectResult> {
         let ctx = &self.egui_ctx;
         let addr = self.cfg.server.clone();
-        let name = self.cfg.name.clone();
+        let name = self.wire_name();
         let code = self.code_input.clone();
         let (voice, mixer) = (self.voice.clone(), self.mixer.clone());
         let (tx, rx) = mpsc::channel();
@@ -1086,6 +1155,7 @@ impl App {
             chat,
             dms,
             chat_tab: None,
+            server_names: HashMap::new(),
             chat_input: String::new(),
             restarting: None,
             resume: None,
@@ -1114,6 +1184,32 @@ impl App {
         for (title, body) in notes.into_iter().take(3) {
             let body: String = body.chars().take(80).collect();
             crate::notify::toast(&title, &body);
+        }
+    }
+
+    /// 观看诊断记录（第 69-d 项）：每秒给每个正在看的共享写一行日志
+    fn log_view_diag(&mut self) {
+        if !self.cfg.view_diag_log || self.views.is_empty() || self.view_diag_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.view_diag_at = std::time::Instant::now();
+        for (id, v) in &self.views {
+            let Ok(v) = v.try_lock() else { continue };
+            let vw = &v.view;
+            let (shown, jitter) = v.shown_stats();
+            let rx = self.voice.video.rx_stats(*id);
+            let (loss, fec, nack, gave_up, keys, rtt) = rx
+                .map(|(s, k, r)| ((s.data_lost * 1000 / s.data_total.max(1)) as f32 / 10.0, s.fec_recovered, s.rtx_recovered, s.gaps, k, r))
+                .unwrap_or_default();
+            let info = vw.sharer_info.lock().unwrap().map(|(i, _)| (i.sent_fps, i.kbps, i.rate_pct, i.congested));
+            crate::applog::log(format!(
+                "观看诊断 #{id}：收到 {} 交出 {} 显示 {shown} fps · 间隔抖动 {jitter:.1} ms · 解码 {:.1} ms · 显示等待 {} ms · 丢包 {loss}% 冗余救回 {fec} 补发 {nack} 放弃 {gave_up} 要关键帧 {keys} · 往返 {rtt} ms · 共享者(发出帧, kbps, 码率%, 拥塞) {:?}",
+                vw.rx_fps.load(Ordering::Relaxed),
+                vw.fps.load(Ordering::Relaxed),
+                vw.decode_us.load(Ordering::Relaxed) as f32 / 1000.0,
+                vw.show_ms.load(Ordering::Relaxed),
+                info
+            ));
         }
     }
 
@@ -1166,6 +1262,7 @@ impl App {
     /// 全局快捷键按下了：切换闭麦 / 静音，响一声提示（游戏里看不到窗口也知道切成功了）
     fn handle_hotkeys(&mut self) {
         self.check_share_bandwidth();
+        self.log_view_diag();
         let fired = self.hotkeys.take();
         if fired == 0 {
             return;
@@ -1285,6 +1382,29 @@ impl App {
         let Screen::Main(s) = &mut self.screen else { return };
         if s.me().and_then(|u| u.channel_id).is_none() {
             return;
+        }
+        // VOC_TEST_SPEEDTEST=1：登录后测一次上行带宽，结果写进日志（第 71 项）
+        if std::env::var_os("VOC_TEST_SPEEDTEST").is_some() && !self.test_speed_started && self.voice.current_link().is_some_and(|l| l.server_rtt_ms() > 0) {
+            self.test_speed_started = true;
+            let l = self.voice.current_link().unwrap();
+            let server_ok = s.features.iter().any(|f| f == voc_proto::FEATURE_SPEEDTEST);
+            let server = server_ok.then(|| {
+                let (l1, l2) = (l.clone(), l.clone());
+                let c: Box<dyn Fn(bool) + Send> = Box::new(move |s| l1.speed_control(s));
+                let p: Box<dyn Fn(usize) + Send> = Box::new(move |n| l2.speed_probe(n));
+                (l.server_rtt_ms(), c, p)
+            });
+            crate::speedtest::spawn(self.speed.clone(), self.egui_ctx.clone(), server);
+        }
+        if self.test_speed_started && !self.test_speed_logged {
+            let st = self.speed.lock().unwrap();
+            if !st.running && !st.rows.is_empty() {
+                self.test_speed_logged = true;
+                for r in &st.rows {
+                    crate::applog::log(format!("测速：{} 延迟 {:?} ms 上行 {:?} Mbps {} {}", r.name, r.latency_ms, r.mbps, if r.dropped { "（离谱，去掉）" } else { "" }, r.note));
+                }
+                crate::applog::log(format!("测速：平均 {:?} Mbps", st.chosen));
+            }
         }
         if let (Ok(h), false) = (std::env::var("VOC_TEST_SHARE"), self.test_share_started) {
             self.test_share_started = true;
@@ -1469,8 +1589,13 @@ impl App {
         if self.test_av1_blocked {
             line += "| 看不了：共享者强制 AV1，本机解不了 AV1 ";
         }
+        // 名单（第 60-6 项测试：服务器给的名字 → 显示的名字）
+        line += &format!("| 名单 {:?} ", s.users.iter().map(|u| (s.server_names.get(&u.id).cloned().unwrap_or_default(), u.name.clone())).collect::<Vec<_>>());
         if let Some(sh) = &self.sharer {
             line += &format!("| 编码器 {} ", sh.stats.encoder.lock().unwrap());
+            if let Some(l) = self.voice.current_link() {
+                line += &format!("| 冗余计划 {:?} ", l.fec_plan_debug());
+            }
         }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(f, "{line}");
@@ -2025,7 +2150,7 @@ impl App {
                     // 程序名只端到端发给成员；服务器只知道「在放伴奏」
                     s.send(ClientMsg::SetMusic { name: Some(MUSIC_PLACEHOLDER.into()) });
                     if let Some(e2e) = &s.e2e {
-                        e2e.lock().unwrap().set_profile(voc_proto::e2e::Profile { music: Some(name.clone()) });
+                        e2e.lock().unwrap().set_profile(voc_proto::e2e::Profile { music: Some(name.clone()), ..Default::default() });
                     }
                 }
                 self.music = Some(MusicPlaying { pid, name, prev_volume, monitor: 1.0, gain, _src: src });
@@ -2269,15 +2394,17 @@ impl App {
                         let mut udp_addr = conn.server_addr;
                         udp_addr.set_port(udp_port);
                         let pins = self.cfg.pins.get(&s.server_key).cloned().unwrap_or_default();
-                        let e2e = Arc::new(Mutex::new(E2e::new(
-                            user_id,
-                            self.cfg.name.trim(),
-                            Identity::from_seed(&self.identity_seed),
-                            pins,
-                        )));
+                        // 身份公告会经过服务器：里面的名字用登录时的名字（隐藏昵称时是占位名），真名只放进加密的资料里（第 60-6 项）
+                        let wire = if self.cfg.hide_name {
+                            placeholder_name(&self.identity_seed)
+                        } else {
+                            self.cfg.name.trim().to_string()
+                        };
+                        let e2e = Arc::new(Mutex::new(E2e::new(user_id, &wire, Identity::from_seed(&self.identity_seed), pins)));
+                        e2e.lock().unwrap().set_real_name(self.cfg.name.trim());
                         s.e2e = Some(e2e.clone());
                         if let Some(m) = &self.music {
-                            e2e.lock().unwrap().set_profile(voc_proto::e2e::Profile { music: Some(m.name.clone()) });
+                            e2e.lock().unwrap().set_profile(voc_proto::e2e::Profile { music: Some(m.name.clone()), ..Default::default() });
                         }
                         if let Err(e) = voice::connect(
                             udp_addr,
@@ -2307,6 +2434,12 @@ impl App {
                     ServerMsg::State { channels, users } => {
                         s.channels = channels;
                         s.users = users;
+                        // 服务器给的是占位名：换成端到端收到的真名（第 60-6 项）；授权码标记交给身份核对
+                        s.server_names = s.users.iter().map(|u| (u.id, u.name.clone())).collect();
+                        if let Some(e) = &s.e2e {
+                            e.lock().unwrap().tags = s.users.iter().map(|u| (u.id, u.tag.clone())).collect();
+                        }
+                        apply_real_names(s, self.cfg.name.trim());
                         if let Some(ch) = s.me().and_then(|u| u.channel_id) {
                             if !self.test_mode {
                                 self.cfg.last_channel.insert(s.server_key.clone(), ch);
@@ -2437,6 +2570,8 @@ impl App {
                             l.on_peers(peers);
                         }
                     }
+                    ServerMsg::SpeedTestResult { kbps } => *crate::speedtest::SERVER_RESULT.lock().unwrap() = Some(kbps),
+                    ServerMsg::ListenLoss { pct } => voice::LISTEN_LOSS.store(pct.min(100), Ordering::Relaxed),
                     ServerMsg::PunchAt { peer, in_ms } => {
                         if let Some(l) = self.voice.current_link() {
                             l.punch_at(peer, in_ms);
@@ -2591,6 +2726,7 @@ impl App {
         let ch = |id: u32, name: &str| ChannelInfo { id, name: name.into() };
         let u = |id: u32, name: &str, c: Option<u32>, muted: bool, deafened: bool, sharing: Option<&str>| UserInfo {
             decoders: vec![],
+            tag: String::new(),
             id,
             name: name.into(),
             channel_id: c,
@@ -2608,6 +2744,7 @@ impl App {
         let (_tx, events) = mpsc::channel();
         let mut s = Session {
             conn: None,
+            server_names: HashMap::new(),
             last_members: None,
             events,
             user_id: 1,
@@ -2720,6 +2857,12 @@ impl App {
         }
         if let Some(t) = std::env::var("VOC_PALETTE").ok().and_then(|t| t.parse().ok()) {
             self.cfg.palette = t;
+        }
+        // VOC_SEARCH=关键字：聊天搜索框里先填好（截图用）
+        if let Ok(q) = std::env::var("VOC_SEARCH") {
+            self.chat_search = q;
+            self.chat_search_hit = usize::MAX;
+            self.chat_search_jump = true;
         }
         // VOC_GLASS=1：弹框后面的毛玻璃（截图用）
         self.cfg.glass = std::env::var_os("VOC_GLASS").is_some();
@@ -2840,6 +2983,39 @@ pub fn vk_name(vk: u32) -> String {
         }
     }
     format!("按键 {vk:#04x}")
+}
+
+/// 隐藏昵称时告诉服务器的占位名（第 60-6 项）：按本机身份算，每次一样；6 位十六进制，几个人撞名（服务器会拒绝登录）的机会很小
+pub(crate) fn placeholder_name(seed: &[u8; 32]) -> String {
+    let h = seed.iter().fold(0x811c_9dc5u32, |h, b| (h ^ *b as u32).wrapping_mul(0x0100_0193));
+    format!("成员-{:06X}", h & 0xFF_FFFF)
+}
+
+/// 把服务器给的名字换成显示用的名字（第 60-6 项）：自己用本机的昵称，别人用端到端收到的真名（还没收到就用服务器给的），
+/// 同名的后面加「 #编号」区分。以 server_names 为底，重复调用结果一样
+fn apply_real_names(s: &mut Session, my_real: &str) {
+    let profiles: HashMap<u32, String> = match &s.e2e {
+        Some(e) => {
+            let mut e = e.lock().unwrap();
+            e.profiles_dirty = false;
+            e.profiles.iter().filter_map(|(id, p)| p.name.clone().map(|n| (*id, n))).collect()
+        }
+        None => HashMap::new(),
+    };
+    let me = s.user_id;
+    for u in s.users.iter_mut() {
+        let base = s.server_names.get(&u.id).cloned().unwrap_or_else(|| u.name.clone());
+        u.name = if u.id == me && !my_real.is_empty() { my_real.to_string() } else { profiles.get(&u.id).cloned().unwrap_or(base) };
+    }
+    let mut count: HashMap<String, u32> = HashMap::new();
+    for u in &s.users {
+        *count.entry(u.name.clone()).or_default() += 1;
+    }
+    for u in s.users.iter_mut() {
+        if count.get(&u.name).copied().unwrap_or(0) > 1 {
+            u.name = format!("{} #{}", u.name, u.id);
+        }
+    }
 }
 
 /// 按键页的录键框（第 58 项）：录哪个动作、录到的键、有什么问题

@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/voc-proto", "crates/voc-server", "crates/voc-client", "crates/voc-setup", "crates/voc-denoise-example"]
+# 第三方库（DeepFilterNet 的 libDF）：作为 voc-client 的路径依赖，不当成工作区成员（不跑它的测试 / clippy）
+exclude = ["crates/deep_filter"]
 
 [workspace.package]
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/XYMYSWL/VOC"

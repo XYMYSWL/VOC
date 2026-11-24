@@ -10,6 +10,7 @@ use crate::audio::{CAPTURE_FRAME, CAPTURE_RATE};
 use serde::{Deserialize, Serialize};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 
 pub const PLUGIN_ABI_VERSION: u32 = 1;
@@ -26,17 +27,27 @@ pub type DenoiseSlot = Arc<Mutex<Option<Box<dyn Denoiser>>>>;
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DenoiseMode {
     Off,
-    #[default]
+    /// 老版 RNNoise（nnnoiseless，2017 年的模型）
     Rnnoise,
+    /// RNNoise 0.2（2024 年的新模型，第 68 项；默认）
+    #[default]
+    Rnnoise2,
+    /// DeepFilterNet3（第 67 / 68 项）：效果更好、更费 CPU，强度见 DFN_LEVELS
+    Dfn3,
     /// 外部插件（Krisp 等）
     Plugin,
 }
 
+/// DeepFilterNet3 降噪强度：(名字, 噪音最多压低多少 dB, 后置滤波强度（0 = 不开）)
+pub const DFN_LEVELS: [(&str, f32, f32); 4] = [("标准", 12.0, 0.0), ("高", 24.0, 0.0), ("极高", 100.0, 0.0), ("暴力", 100.0, 0.03)];
 
-pub fn create(mode: DenoiseMode, plugin_path: &str, model_path: &str) -> Result<Option<Box<dyn Denoiser>>, String> {
+
+pub fn create(mode: DenoiseMode, plugin_path: &str, model_path: &str, dfn_level: u8) -> Result<Option<Box<dyn Denoiser>>, String> {
     Ok(match mode {
+        DenoiseMode::Dfn3 => Some(Box::new(Dfn3::new(dfn_level)?)),
         DenoiseMode::Off => None,
         DenoiseMode::Rnnoise => Some(Box::new(Rnnoise::new())),
+        DenoiseMode::Rnnoise2 => Some(Box::new(Rnnoise2::new()?)),
         DenoiseMode::Plugin => {
             if plugin_path.trim().is_empty() {
                 return Err("请先填写降噪插件 DLL 路径".into());
@@ -46,7 +57,185 @@ pub fn create(mode: DenoiseMode, plugin_path: &str, model_path: &str) -> Result<
     })
 }
 
-// ------------------------------------------------------------ RNNoise
+// ------------------------------------------------------------ DeepFilterNet3（crates/deep_filter，v0.5.6）
+
+/// DeepFilterNet3 的模型对象不能跨线程搬：放在自己的线程里加载、处理，每帧通过通道送过去拿回来（只多几微秒）。
+/// 加载要一两秒，加载好之前先用 RNNoise 新版；一帧 8 ms 还没回来就这一帧用 RNNoise 新版，处理平均超过 7 ms（一帧 10 ms）就整个退回
+pub struct Dfn3 {
+    tx: std::sync::mpsc::Sender<Vec<f32>>,
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+    status: std::sync::mpsc::Receiver<Result<(), String>>,
+    ready: bool,
+    fallback: Rnnoise2,
+    level: u8,
+    /// 退回 RNNoise 的原因
+    gave_up: Option<String>,
+    timing: (Duration, u32),
+    late: u32,
+}
+
+impl Dfn3 {
+    pub fn new(level: u8) -> Result<Self, String> {
+        let level = level.min(DFN_LEVELS.len() as u8 - 1);
+        let (_, lim, pf) = DFN_LEVELS[level as usize];
+        let (tx, frames_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (out_tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (st_tx, status) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("dfn3".into())
+            .spawn(move || {
+                use deep_filter::tract::{DfParams, DfTract, RuntimeParams};
+                let mut rp = RuntimeParams::default_with_ch(1).with_atten_lim(lim);
+                if pf > 0.0 {
+                    rp = rp.with_post_filter(pf);
+                }
+                let m = std::panic::catch_unwind(|| DfTract::new(DfParams::default(), &rp).map_err(|e| e.to_string()))
+                    .unwrap_or_else(|_| Err("模型加载出错".into()))
+                    .and_then(|m| if m.hop_size == CAPTURE_FRAME && m.sr == 48_000 { Ok(m) } else { Err(format!("模型帧长 {} / 采样率 {} 不对", m.hop_size, m.sr)) });
+                let mut m = match m {
+                    Ok(m) => {
+                        let _ = st_tx.send(Ok(()));
+                        m
+                    }
+                    Err(e) => {
+                        let _ = st_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut inb = ndarray::Array2::<f32>::zeros((1, CAPTURE_FRAME));
+                let mut outb = ndarray::Array2::<f32>::zeros((1, CAPTURE_FRAME));
+                // 降噪器被换掉（发送端没了）就结束
+                while let Ok(mut f) = frames_rx.recv() {
+                    for (d, s) in inb.iter_mut().zip(f.iter()) {
+                        *d = *s;
+                    }
+                    if m.process(inb.view(), outb.view_mut()).is_err() {
+                        return;
+                    }
+                    for (d, s) in f.iter_mut().zip(outb.iter()) {
+                        *d = s.clamp(-1.0, 1.0);
+                    }
+                    if out_tx.send(f).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self { tx, rx, status, ready: false, fallback: Rnnoise2::new()?, level, gave_up: None, timing: (Duration::ZERO, 0), late: 0 })
+    }
+}
+
+impl Denoiser for Dfn3 {
+    fn process(&mut self, frame: &mut [f32]) {
+        if !self.ready && self.gave_up.is_none() {
+            match self.status.try_recv() {
+                Ok(Ok(())) => self.ready = true,
+                Ok(Err(e)) => self.gave_up = Some(e),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gave_up = Some("模型线程退出了".into()),
+                Err(_) => {}
+            }
+        }
+        if !self.ready || self.gave_up.is_some() {
+            self.fallback.process(frame);
+            return;
+        }
+        let t = Instant::now();
+        if self.tx.send(frame.to_vec()).is_err() {
+            self.gave_up = Some("处理出错".into());
+            self.fallback.process(frame);
+            return;
+        }
+        match self.rx.recv_timeout(Duration::from_millis(8)) {
+            Ok(out) => frame.copy_from_slice(&out[..frame.len()]),
+            Err(_) => {
+                // 这一帧没赶上：用 RNNoise 新版顶上（之后晚到的那一帧丢掉）
+                self.late += 1;
+                self.fallback.process(frame);
+                while self.rx.try_recv().is_ok() {}
+            }
+        }
+        // 太慢（电脑跑不过来，会让声音断断续续）：退回 RNNoise 新版
+        self.timing.0 += t.elapsed();
+        self.timing.1 += 1;
+        if self.timing.1 >= 300 {
+            let avg = self.timing.0 / self.timing.1;
+            if avg > Duration::from_millis(7) || self.late > 15 {
+                self.gave_up = Some(format!("这台电脑跑不过来（每 10 ms 一帧要 {:.1} ms）", avg.as_secs_f32() * 1000.0));
+            }
+            self.timing = (Duration::ZERO, 0);
+            self.late = 0;
+        }
+    }
+    fn name(&self) -> String {
+        let lv = DFN_LEVELS[self.level as usize].0;
+        match (&self.gave_up, self.ready) {
+            (Some(e), _) => format!("RNNoise 新版（DeepFilterNet3 退回了：{e}）"),
+            (None, true) => format!("DeepFilterNet3 · {lv}"),
+            (None, false) => format!("DeepFilterNet3 · {lv}（加载中，先用 RNNoise 新版）"),
+        }
+    }
+}
+
+// ------------------------------------------------------------ RNNoise 0.2（C 库，build.rs 编进来）
+
+#[repr(C)]
+struct DenoiseStateC {
+    _p: [u8; 0],
+}
+
+unsafe extern "C" {
+    fn rnnoise_get_frame_size() -> i32;
+    fn rnnoise_create(model: *mut core::ffi::c_void) -> *mut DenoiseStateC;
+    fn rnnoise_destroy(st: *mut DenoiseStateC);
+    fn rnnoise_process_frame(st: *mut DenoiseStateC, out: *mut f32, input: *const f32) -> f32;
+}
+
+pub struct Rnnoise2 {
+    st: *mut DenoiseStateC,
+    buf: Vec<f32>,
+    out: Vec<f32>,
+}
+
+// 只在降噪那一个线程里用
+unsafe impl Send for Rnnoise2 {}
+
+impl Rnnoise2 {
+    pub fn new() -> Result<Self, String> {
+        let n = unsafe { rnnoise_get_frame_size() } as usize;
+        if n != CAPTURE_FRAME {
+            return Err(format!("RNNoise 新版一帧 {n} 个采样，和 VOC 的 {CAPTURE_FRAME} 不一样"));
+        }
+        let st = unsafe { rnnoise_create(std::ptr::null_mut()) };
+        if st.is_null() {
+            return Err("RNNoise 新版初始化失败".into());
+        }
+        Ok(Self { st, buf: vec![0.0; CAPTURE_FRAME], out: vec![0.0; CAPTURE_FRAME] })
+    }
+}
+
+impl Drop for Rnnoise2 {
+    fn drop(&mut self) {
+        unsafe { rnnoise_destroy(self.st) };
+    }
+}
+
+impl Denoiser for Rnnoise2 {
+    fn process(&mut self, frame: &mut [f32]) {
+        // 和老版一样，期望 i16 量级的浮点数
+        for (b, x) in self.buf.iter_mut().zip(frame.iter()) {
+            *b = x * 32767.0;
+        }
+        unsafe { rnnoise_process_frame(self.st, self.out.as_mut_ptr(), self.buf.as_ptr()) };
+        for (x, o) in frame.iter_mut().zip(&self.out) {
+            *x = (o / 32767.0).clamp(-1.0, 1.0);
+        }
+    }
+    fn name(&self) -> String {
+        "RNNoise 0.2".into()
+    }
+}
+
+// ------------------------------------------------------------ RNNoise（老版，nnnoiseless）
 
 pub struct Rnnoise {
     st: Box<nnnoiseless::DenoiseState<'static>>,
@@ -247,5 +436,78 @@ mod tests {
         let mut f = vec![0.3f32; CAPTURE_FRAME];
         p.process(&mut f);
         assert!(f.iter().all(|x| *x == 0.3)); // 模板未接 SDK，透传
+    }
+}
+
+#[cfg(test)]
+mod rnnoise2_tests {
+    use super::*;
+
+    /// 白噪声：新版、老版都应该压下去很多（新版的 C 库确实编进来、能跑）
+    #[test]
+    fn rnnoise2_suppresses_white_noise() {
+        let mut x = 12345u32;
+        let mut noise = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32 - 0.5) * 0.2
+        };
+        let frames: Vec<Vec<f32>> = (0..300).map(|_| (0..CAPTURE_FRAME).map(|_| noise()).collect()).collect();
+        let energy = |d: &mut dyn Denoiser| {
+            let mut e = 0.0f64;
+            for (i, f) in frames.iter().enumerate() {
+                let mut f = f.clone();
+                d.process(&mut f);
+                if i >= 100 {
+                    e += f.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+                }
+            }
+            e
+        };
+        let input: f64 = frames[100..].iter().flatten().map(|v| (*v as f64).powi(2)).sum();
+        let new = energy(&mut Rnnoise2::new().unwrap());
+        let old = energy(&mut Rnnoise::new());
+        eprintln!("白噪声剩下：新版 {:.1} dB，老版 {:.1} dB", 10.0 * (new / input).log10(), 10.0 * (old / input).log10());
+        assert!(new < input * 0.1, "new RNNoise should cut white noise by >10 dB");
+    }
+
+    /// DeepFilterNet3：加载好之后压白噪声，并量每帧多久（一帧 10 ms，要远小于它）
+    #[test]
+    fn dfn3_loads_and_suppresses() {
+        let mut x = 777u32;
+        let mut noise = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32 - 0.5) * 0.2
+        };
+        for level in [0u8, 3] {
+            let mut d = Dfn3::new(level).unwrap();
+            let t = Instant::now();
+            while !d.name().starts_with("DeepFilterNet3 · ") || d.name().contains("加载中") {
+                let mut f: Vec<f32> = (0..CAPTURE_FRAME).map(|_| noise()).collect();
+                d.process(&mut f);
+                assert!(t.elapsed() < Duration::from_secs(30), "load: {}", d.name());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            eprintln!("DeepFilterNet3 加载用了 {:.1} 秒", t.elapsed().as_secs_f32());
+            let (mut ein, mut eout) = (0f64, 0f64);
+            let t = Instant::now();
+            for i in 0..400 {
+                let mut f: Vec<f32> = (0..CAPTURE_FRAME).map(|_| noise()).collect();
+                if i >= 100 {
+                    ein += f.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+                }
+                d.process(&mut f);
+                if i >= 100 {
+                    eout += f.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+                }
+            }
+            let per = t.elapsed().as_secs_f32() * 1000.0 / 400.0;
+            eprintln!("DeepFilterNet3「{}」：白噪声剩下 {:.1} dB，每帧 {per:.2} ms（{}）", DFN_LEVELS[level as usize].0, 10.0 * (eout / ein).log10(), d.name());
+            assert!(d.name().starts_with("DeepFilterNet3"), "{}", d.name());
+            assert!(eout < ein * 0.5);
+        }
     }
 }

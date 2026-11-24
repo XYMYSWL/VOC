@@ -281,6 +281,10 @@ impl App {
             }
         };
 
+        // 有人的真名刚到（第 60-6 项）：重新套一次名字
+        if s.e2e.as_ref().is_some_and(|e| e.lock().unwrap().profiles_dirty) {
+            crate::app::apply_real_names(s, self.cfg.name.trim());
+        }
         // 进了一个新的语音频道：默认打开语音房间（第 59 项）
         if my_channel != self.room_seen_ch {
             if my_channel.is_some() {
@@ -457,6 +461,8 @@ impl App {
                                     (Some(_), None) => "在语音频道里".into(),
                                     _ => "未进入语音频道".into(),
                                 };
+                                // 自己在服务器里的编号（第 60-6 项：服务器日志里只写编号）
+                                let status = format!("{status} · #{}", s.user_id);
                                 ui.label(RichText::new(status).size(12.0).color(if talking { th::GREEN() } else { th::TEXT_FAINT() }));
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -912,8 +918,29 @@ impl App {
                             ui.label(RichText::new(format!("{} 人", members.len())).color(th::TEXT_FAINT()));
                         });
                         ui.add_space(8.0);
-                        // 屏幕共享卡片
+                        // 屏幕共享卡片；正在看、没弹出、没全屏的直接把画面嵌在这里（第 59 项效果图），不再浮一个窗口
                         for u in members.iter().filter(|u| u.sharing.is_some()) {
+                            if let Some(va) = self.views.get(&u.id).cloned() {
+                                let mut v = va.lock().unwrap();
+                                if !v.popped && self.fullscreen != Some(u.id) {
+                                    *v.view.repaint_target.lock().unwrap() = None;
+                                    refresh_viewer(ui.ctx(), u.id, &mut v);
+                                    let h = (ui.available_height() * 0.62).clamp(260.0, 760.0);
+                                    egui::Frame::new()
+                                        .fill(Color32::BLACK)
+                                        .stroke(Stroke::new(2.0, th::ACCENT()))
+                                        .corner_radius(CornerRadius::same(14))
+                                        .inner_margin(Margin::same(8))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.set_height(h);
+                                            viewer_body(ui, u.id, &mut v, &self.voice, &self.mixer);
+                                        });
+                                    v.embedded = true;
+                                    ui.add_space(10.0);
+                                    continue;
+                                }
+                            }
                             let desc = u.sharing.clone().unwrap_or_default();
                             let is_me = u.id == s.user_id;
                             egui::Frame::new()
@@ -1030,6 +1057,63 @@ impl App {
                     });
                     return;
                 }
+                // 聊天搜索（第 59 项效果图里的搜索框）：只在本机已有的记录里搜（聊天端到端加密、关掉 VOC 就清，不上传、不存盘）
+                let search_q = self.chat_search.trim().to_lowercase();
+                let search_hits: Vec<usize> = if search_q.is_empty() {
+                    Vec::new()
+                } else {
+                    let lines = match &s.chat_tab {
+                        Some(p) => s.dms.iter().find(|t| &t.peer == p).map(|t| &t.lines).unwrap_or(&s.chat),
+                        None => &s.chat,
+                    };
+                    lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| match l {
+                            ChatLine::User { from, text, .. } => text.to_lowercase().contains(&search_q) || from.to_lowercase().contains(&search_q),
+                            ChatLine::System(t) => t.to_lowercase().contains(&search_q),
+                            _ => false,
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                };
+                if self.chat_search_hit >= search_hits.len() {
+                    self.chat_search_hit = search_hits.len().saturating_sub(1);
+                }
+                egui::Panel::top("chat_search").frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 4))).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        crate::icons::show(ui, Icon::Search, 16.0, th::TEXT_FAINT());
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.chat_search).hint_text("搜索聊天（只在本机的记录里搜）").desired_width(220.0));
+                        if r.changed() {
+                            self.chat_search_hit = usize::MAX; // 新的搜索：跳到最近的一条
+                            self.chat_search_jump = true;
+                        }
+                        if !search_q.is_empty() {
+                            let n = search_hits.len();
+                            if n == 0 {
+                                ui.label(RichText::new("没找到").size(12.0).color(th::TEXT_FAINT()));
+                            } else {
+                                if self.chat_search_hit == usize::MAX {
+                                    self.chat_search_hit = n - 1;
+                                }
+                                ui.label(RichText::new(format!("{} / {n}", self.chat_search_hit + 1)).size(12.0).color(th::TEXT_DIM()));
+                                if ui.small_button("▲").on_hover_text("上一条").clicked() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))) {
+                                    self.chat_search_hit = self.chat_search_hit.saturating_sub(1);
+                                    self.chat_search_jump = true;
+                                }
+                                if ui.small_button("▼").on_hover_text("下一条").clicked() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))) {
+                                    self.chat_search_hit = (self.chat_search_hit + 1).min(n - 1);
+                                    self.chat_search_jump = true;
+                                }
+                            }
+                            if ui.small_button("✕").on_hover_text("清除搜索").clicked() {
+                                self.chat_search.clear();
+                            }
+                        }
+                    });
+                });
+                let search_cur = search_hits.get(self.chat_search_hit).copied();
+                let mut jump = std::mem::take(&mut self.chat_search_jump);
                 egui::Panel::bottom("chat_input").frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 8))).show(ui, |ui| {
                     if mic_silent {
                         ui.label(
@@ -1132,7 +1216,7 @@ impl App {
                           });
                         });
                 });
-                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                egui::ScrollArea::vertical().stick_to_bottom(search_q.is_empty()).auto_shrink([false, false]).show(ui, |ui| {
                     let lines = match &s.chat_tab {
                         Some(p) => s.dms.iter().find(|t| &t.peer == p).map(|t| &t.lines).unwrap_or(&s.chat),
                         None => &s.chat,
@@ -1156,19 +1240,29 @@ impl App {
                         });
                     }
                     let mut prev: Option<(&str, u64)> = None;
-                    for line in lines {
+                    for (li, line) in lines.iter().enumerate() {
+                        let hit = search_hits.contains(&li);
+                        let is_cur = search_cur == Some(li);
                         match line {
                             ChatLine::User { from, text, ts, mine, id, reactions } => {
                                 // 同一人 5 分钟内的连续消息合并显示
                                 let grouped = prev.is_some_and(|(p, t)| p == from && ts.saturating_sub(t) < 300_000);
                                 let at_me = !*mine && crate::app::mentions(text, &my_name);
                                 // 消息正文：@我 的高亮；能回应的右键出表情
-                                let body = |ui: &mut egui::Ui, react: &mut Option<((u32, u64), String)>| {
+                                let mut body = |ui: &mut egui::Ui, react: &mut Option<((u32, u64), String)>| {
                                     let mut rt = RichText::new(text);
                                     if at_me {
                                         rt = rt.color(th::YELLOW());
                                     }
+                                    // 搜到的高亮，当前这条更显眼
+                                    if hit {
+                                        rt = rt.background_color(if is_cur { th::ACCENT_SOFT() } else { th::YELLOW_SOFT() });
+                                    }
                                     let r = ui.add(egui::Label::new(rt).wrap().sense(Sense::click()));
+                                    if is_cur && jump {
+                                        r.scroll_to_me(Some(Align::Center));
+                                        jump = false;
+                                    }
                                     if let Some(mid) = id {
                                         let r = r.on_hover_text("右键：表情回应");
                                         r.context_menu(|ui| {
@@ -1268,7 +1362,7 @@ impl App {
                                         .corner_radius(CornerRadius::same(10))
                                         .inner_margin(Margin::symmetric(10, 3))
                                         .show(ui, |ui| {
-                                            ui.add(egui::Label::new(RichText::new(t).size(12.0).color(th::TEXT_DIM())).wrap());
+                                            ui.add(egui::Label::new(RichText::new(s.real_names_in(t)).size(12.0).color(th::TEXT_DIM())).wrap());
                                         });
                                 });
                                 prev = None;
@@ -1487,6 +1581,22 @@ impl App {
                         }
                         ui.label(RichText::new("说话时电平条要超过白线、不说话时低于白线；背景噪音大就把阈值调高。").size(11.5).color(th::TEXT_FAINT()));
                     }
+                    // 语音音质（第 68 项）：码率越高越清楚、越费流量（每个人说话时每路都按这个发）
+                    ui.horizontal(|ui| {
+                        ui.label("语音音质");
+                        if th::segmented(ui, &mut self.cfg.voice_kbps, &[(32u32, "32 kbps"), (64, "64 kbps"), (96, "96 kbps"), (128, "128 kbps")]) {
+                            crate::audio::VOICE_BITRATE.store(self.cfg.voice_kbps * 1000, Ordering::Relaxed);
+                        }
+                    });
+                    ui.label(
+                        RichText::new(if self.cfg.low_bandwidth {
+                            "现在开着「低带宽模式」：语音固定 12 kbps，这里的选择不生效。"
+                        } else {
+                            "码率越高人声越清楚、细节越多，流量也越大（96 kbps 说话时每分钟约 0.7 MB）。网差时可以调低。"
+                        })
+                        .size(11.5)
+                        .color(th::TEXT_FAINT()),
+                    );
                     if ui
                         .checkbox(&mut self.cfg.aec, "回声消除（不戴耳机、用扬声器外放时开）")
                         .on_hover_text("外放时，扬声器里队友的声音会被麦克风收进去，队友会听到自己的回声。开着它可以消掉。戴耳机时开着也没关系。")
@@ -1551,8 +1661,32 @@ impl App {
                     apply_dn |= th::segmented(
                         ui,
                         &mut self.cfg.denoise,
-                        &[(DenoiseMode::Off, "关闭"), (DenoiseMode::Rnnoise, "RNNoise"), (DenoiseMode::Plugin, "Krisp / 插件")],
+                        &[
+                            (DenoiseMode::Off, "关闭"),
+                            (DenoiseMode::Rnnoise2, "RNNoise 新版"),
+                            (DenoiseMode::Dfn3, "DeepFilterNet3"),
+                            (DenoiseMode::Rnnoise, "RNNoise 旧版"),
+                            (DenoiseMode::Plugin, "Krisp / 插件"),
+                        ],
                     );
+                    // DeepFilterNet3 的降噪强度（第 67 项）；选「暴力」弹个提示
+                    if self.cfg.denoise == DenoiseMode::Dfn3 {
+                        ui.horizontal(|ui| {
+                            ui.label("降噪强度");
+                            let opts: Vec<(u8, &str)> = crate::denoise::DFN_LEVELS.iter().enumerate().map(|(i, l)| (i as u8, l.0)).collect();
+                            if th::segmented(ui, &mut self.cfg.dfn_level, &opts) {
+                                apply_dn = true;
+                                if self.cfg.dfn_level as usize == crate::denoise::DFN_LEVELS.len() - 1 {
+                                    self.show_violent = true;
+                                }
+                            }
+                        });
+                        ui.label(
+                            RichText::new("标准：噪音最多压低 12 dB（保留一点环境声，人声最自然）；高：24 dB；极高：不设上限；暴力：不设上限再加后置滤波，残留噪音压得最狠，人声可能发闷一点。比 RNNoise 多占一些 CPU、多约 20 ms 延迟；电脑跑不过来时自动退回 RNNoise 新版。")
+                                .size(11.5)
+                                .color(th::TEXT_FAINT()),
+                        );
+                    }
                     if self.cfg.denoise == DenoiseMode::Plugin {
                         egui::Grid::new("plugin").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                             ui.label("插件 DLL");
@@ -1576,6 +1710,7 @@ impl App {
                     );
                     }
                     if self.settings_tab == 2 {
+                    self.ui_speedtest(ui);
                     th::section(ui, "网络");
                     if ui
                         .checkbox(&mut self.cfg.low_bandwidth, "低带宽模式（手机热点、流量少或很卡的网络）")
@@ -1829,6 +1964,12 @@ impl App {
                     );
                     }
                     if self.settings_tab == 4 {
+                    th::section(ui, "观看");
+                    ui.checkbox(&mut self.cfg.view_diag_log, "记录观看诊断（看共享时每秒写一行进日志）").on_hover_text(
+                        "看共享卡顿、掉帧时打开：每秒把收到 / 解码 / 显示的帧数、丢包、冗余和补发救回多少、往返时间写进日志（设置 → 关于 → 打开日志文件夹）。
+                         只记数字，不记画面内容；排查完可以关掉。",
+                    );
+                    ui.add_space(6.0);
                     th::section(ui, "屏幕共享编码器");
                     let choices = video::encoder_choices();
                     let cur = choices.iter().find(|c| c.0 == self.cfg.share.encoder).map(|c| c.1.clone()).unwrap_or_else(|| choices[0].1.clone());
@@ -1856,6 +1997,15 @@ impl App {
                     );
                     }
                     if self.settings_tab == 3 {
+                    th::section(ui, "隐私");
+                    ui.checkbox(&mut self.cfg.hide_name, "对服务器隐藏昵称（重新连接后生效）").on_hover_text(
+                        "打开：服务器只知道你是「成员-XXXX」（日志、状态里也只写编号），真名只经端到端加密发给服务器上的其他人。
+                         旧版本 VOC 的人看你只能看到「成员-XXXX」。关掉：和以前一样，服务器能看到昵称。",
+                    );
+                    if let Screen::Main(s) = &self.screen {
+                        ui.label(RichText::new(format!("你在这台服务器上是 #{}（服务器日志里只写编号）", s.user_id)).size(11.5).color(th::TEXT_FAINT()));
+                    }
+                    ui.add_space(6.0);
                     th::section(ui, "端到端加密");
                     ui.label(RichText::new("我的安全码").size(12.0).color(th::TEXT_DIM()));
                     let code = voc_proto::e2e::safety_code(&Identity::from_seed(&self.identity_seed).public);
@@ -1885,11 +2035,101 @@ impl App {
             self.show_settings = false;
             self.settings.loopback.store(false, Ordering::Relaxed);
         }
+        // 选了「暴力」档（第 67 项）
+        if self.show_violent {
+            egui::Window::new(RichText::new("降噪强度").strong())
+                .id(egui::Id::unique("violent"))
+                .collapsible(false)
+                .resizable(false)
+                .order(egui::Order::Foreground)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(240.0);
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("收到！暴力了嗷").size(20.0).strong());
+                        ui.add_space(10.0);
+                        if th::primary_button(ui, "好", 120.0, true).clicked() {
+                            self.show_violent = false;
+                        }
+                    });
+                });
+        }
         if self.show_settings {
             self.ui_key_edit(ctx);
         } else if self.key_edit.is_some() {
             self.end_key_edit(None);
         }
+    }
+
+    // ============================================================ 测上行带宽（第 71 项）
+
+    fn ui_speedtest(&mut self, ui: &mut egui::Ui) {
+        th::section(ui, "上行带宽");
+        let running = self.speed.lock().unwrap().running;
+        let link = self.voice.current_link();
+        let server_ok = matches!(&self.screen, Screen::Main(s) if s.features.iter().any(|f| f == voc_proto::FEATURE_SPEEDTEST));
+        ui.horizontal(|ui| {
+            let b = ui.add_enabled(!running, egui::Button::new(if running { "正在测…（约 20 秒）" } else { "测上行带宽" }));
+            if b.on_hover_text("依次测：你的 VOC 服务器、Cloudflare、Leaseweb 香港（iperf3）。测速网站会看到你的 IP；测的时候语音可能卡一下").clicked() {
+                let server = match (&link, server_ok) {
+                    (Some(l), true) => {
+                        let (l1, l2) = (l.clone(), l.clone());
+                        let c: Box<dyn Fn(bool) + Send> = Box::new(move |s| l1.speed_control(s));
+                        let p: Box<dyn Fn(usize) + Send> = Box::new(move |n| l2.speed_probe(n));
+                        Some((l.server_rtt_ms(), c, p))
+                    }
+                    _ => None,
+                };
+                crate::speedtest::spawn(self.speed.clone(), ui.ctx().clone(), server);
+            }
+            if running {
+                ui.spinner();
+            }
+        });
+        ui.label(RichText::new("只在你点按钮时测。会连：你的 VOC 服务器、speed.cloudflare.com、Leaseweb 香港测速节点（它们会看到你的 IP）。").size(11.5).color(th::TEXT_FAINT()));
+        let (rows, chosen, fresh) = {
+            let s = self.speed.lock().unwrap();
+            (s.rows.clone(), s.chosen, s.fresh)
+        };
+        if !rows.is_empty() {
+            egui::Grid::new("speed").num_columns(4).spacing([14.0, 4.0]).striped(true).show(ui, |ui| {
+                for h in ["测速服务器", "延迟", "上行", ""] {
+                    ui.label(RichText::new(h).size(11.5).color(th::TEXT_FAINT()));
+                }
+                ui.end_row();
+                for r in &rows {
+                    ui.label(&r.name);
+                    ui.label(r.latency_ms.map(|l| format!("{l} ms")).unwrap_or_else(|| "—".into()));
+                    let m = r.mbps.map(|m| format!("{m:.1} Mbps")).unwrap_or_else(|| "—".into());
+                    ui.label(if r.dropped { RichText::new(m).strikethrough().color(th::TEXT_FAINT()) } else { RichText::new(m).strong() });
+                    let note = if r.dropped { "比其他的低太多，没算进平均".to_string() } else { r.note.clone() };
+                    ui.label(RichText::new(note).size(11.5).color(th::TEXT_FAINT()));
+                    ui.end_row();
+                }
+            });
+        }
+        if let Some(avg) = chosen {
+            // 自动选择：直连上行预算设成平均值的八成（留点余量给语音和别的程序）
+            let budget = ((avg * 0.8).round() as u32).clamp(1, 100);
+            if fresh {
+                self.speed.lock().unwrap().fresh = false;
+                self.cfg.p2p_budget_mbps = budget;
+                if let Some(l) = &link {
+                    l.set_budget(budget * 1_000_000);
+                }
+            }
+            let tip = match avg {
+                a if a < 5.0 => "共享建议 720P 30 帧「标准」",
+                a if a < 10.0 => "共享建议 1080P 60 帧「标准」",
+                a if a < 20.0 => "共享建议 1080P 60 帧「高」",
+                _ => "共享用 1080P 60 帧「极高」也够",
+            };
+            ui.label(RichText::new(format!("上行约 {avg:.1} Mbps（去掉离谱的低值后平均）：已把「直连上行预算」设成 {budget} Mbps；{tip}")).color(th::GREEN()));
+        } else if !running && !rows.is_empty() {
+            ui.label(RichText::new("都没测出来，上行预算没改").color(th::YELLOW()));
+        }
+        ui.add_space(8.0);
     }
 
     // ============================================================ 外观页（第 59 项）
@@ -2625,6 +2865,8 @@ impl App {
                     },
                 );
                 v = va.lock().unwrap();
+            } else if std::mem::take(&mut v.embedded) {
+                // 这一帧已经嵌在语音房间里画过了（第 59 项），不再浮窗口；点了什么照常在下面处理
             } else {
                 *v.view.repaint_target.lock().unwrap() = None;
                 refresh_viewer(ctx, *id, &mut v);

@@ -96,6 +96,8 @@ impl AtomicF32 {
 /// UI 与音频线程共享的设置/状态
 /// 低带宽模式：语音 / 伴奏降码率，屏幕共享最高 480P 30 帧，观看时默认低画质
 pub static LOW_BANDWIDTH: AtomicBool = AtomicBool::new(false);
+/// 语音码率（bps，设置 → 音频「语音音质」，第 68 项）
+pub static VOICE_BITRATE: AtomicU32 = AtomicU32::new(96_000);
 
 pub struct Settings {
     pub muted: AtomicBool,

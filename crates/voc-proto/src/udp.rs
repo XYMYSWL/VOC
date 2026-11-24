@@ -25,6 +25,8 @@ pub const SHARE_AUDIO: u8 = 6;
 pub const NACK: u8 = 7;
 /// 屏幕共享的鼠标位置和形状（发给观看者）。格式同 VOICE，内容见 [`cursor_payload`]
 pub const CURSOR: u8 = 8;
+/// 测上行带宽（第 71 项）：客户端在几秒内逐步加速发这种包，服务器只数收到多少字节
+pub const SPEED: u8 = 9;
 
 /// 鼠标：x、y 是在共享画面里的位置（0–65535 对应左到右 / 上到下），shape 见 CURSOR_*，visible = 显示着
 pub fn cursor_payload(x: u16, y: u16, shape: u8, visible: bool) -> [u8; 6] {
@@ -321,6 +323,59 @@ pub fn rs_small_group_ratio(k: usize, ratio: f32) -> f32 {
     }
 }
 const RS_HDR: usize = 11;
+
+/// Reed-Solomon 冗余比例（校验片 / 数据片），按观看者回报的原始丢包率（千分之几）：不到 0.5% 不加；30% 丢包时 1.2 倍
+pub fn fec_ratio(loss_permille: u16) -> f32 {
+    match loss_permille {
+        0..5 => 0.0,
+        5..30 => 0.15,
+        30..80 => 0.35,
+        80..150 => 0.6,
+        150..250 => 0.9,
+        250..350 => 1.2,
+        350..450 => 1.5,
+        _ => 2.0,
+    }
+}
+
+/// 冗余按往返时间调（第 69-c 项）：往返 ≥ 80 ms 多加 25%，≥ 150 ms 多加 50%；往返 < 30 ms、丢包不高时少 20%（靠补发）。最多 2 倍
+pub fn rtt_fec(r: f32, rtt_ms: u32, loss_permille: u16) -> f32 {
+    if r <= 0.0 {
+        return r;
+    }
+    let k = match rtt_ms {
+        150.. => 1.5,
+        80..150 => 1.25,
+        1..30 if loss_permille < 150 => 0.8,
+        _ => 1.0,
+    };
+    (r * k).min(2.0)
+}
+
+/// 关键帧的冗余更高（丢了要等下一张关键帧，代价大）：至少 10%，最多 RS_MAX_RATIO
+pub fn key_fec_ratio(r: f32) -> f32 {
+    (r * 1.5).clamp(0.1, RS_MAX_RATIO)
+}
+
+/// 某个观看者该用的冗余比例（共享者给直连的人、服务器给经服务器的人都按这个算）
+pub fn viewer_fec_ratio(loss_permille: u16, rtt_ms: u32) -> f32 {
+    rtt_fec(fec_ratio(loss_permille), rtt_ms, loss_permille)
+}
+
+/// 发给某个人时这个分片要不要带上（第 65-2 项）：Reed-Solomon 校验包的第 j 片，前 m 片和「只编 m 片」时完全一样，
+/// 所以按最高的冗余编一次，每个人只发他那一份（前 rs_parity_count(k, 他的比例) 片）。不是 RS 校验包的都带
+pub fn rs_keep_for(frag: &[u8], ratio: f32) -> bool {
+    let Some((f, d)) = read_video_frag(frag) else { return true };
+    if !f.is_rs_parity() {
+        return true;
+    }
+    let Some((p, _)) = read_rs_parity(&f, d) else { return true };
+    if ratio <= 0.0 {
+        return false;
+    }
+    let r = if f.flags & VIDEO_KEY != 0 { key_fec_ratio(ratio) } else { ratio };
+    p.j < rs_parity_count(p.k, r)
+}
 
 /// 一帧的数据分片怎么分组：[(第一片, 片数)]，尽量平均
 pub fn rs_groups(count: usize) -> Vec<(usize, usize)> {
@@ -857,4 +912,41 @@ mod tests {
         assert!(!seq_newer(65535, 1));
         assert!(seq_newer(10, 9));
     }
+    #[test]
+    fn rs_parity_rows_are_a_prefix() {
+        // 第 65-2 项靠这个：同一组数据，校验片多编几片时前面的那几片和少编时完全一样（不同来源的校验片可以混着用）
+        let data: Vec<u8> = (0..VIDEO_FRAG * 7 + 100).map(|i| (i * 31 % 251) as u8).collect();
+        let few = rs_parities(3, 0, &data, 0.35);
+        let many = rs_parities(3, 0, &data, 1.5);
+        let row = |v: &[u8]| {
+            let (f, d) = read_video_frag(v).unwrap();
+            let (p, sh) = read_rs_parity(&f, d).unwrap();
+            (p.first, p.j, sh.to_vec())
+        };
+        for a in &few {
+            let (first, j, sh) = row(a);
+            assert!(many.iter().map(|b| row(b)).any(|(f2, j2, s2)| f2 == first && j2 == j && s2 == sh), "row {j} of group {first} differs");
+        }
+        assert_eq!(many.iter().filter(|f| rs_keep_for(f, 0.35)).count(), few.len());
+        assert_eq!(many.iter().filter(|f| rs_keep_for(f, 0.0)).count(), 0);
+        // 用少编的 m 片里的几片 + 多编的后面几片一起还原
+        let (f0, _) = read_video_frag(&many[0]).unwrap();
+        let (p_many, _) = read_rs_parity(&f0, read_video_frag(&many[0]).unwrap().1).unwrap();
+        let k = p_many.k;
+        let chunks = frame_chunks(&data);
+        let mut dat: Vec<Option<&[u8]>> = chunks[..k].iter().map(|c| Some(&c[..])).collect();
+        for d in dat.iter_mut().take(3) {
+            *d = None; // 丢 3 片数据
+        }
+        let shards: Vec<(usize, Vec<u8>)> = many.iter().map(|b| row(b)).filter(|(f, _, _)| *f == 0).map(|(_, j, s)| (j, s)).collect();
+        let mut par: Vec<Option<&[u8]>> = vec![None; p_many.m];
+        for (j, s) in &shards {
+            if *j == 0 || *j >= 2 {
+                par[*j] = Some(&s[..]);
+            }
+        }
+        let got = rs_recover(chunks.len(), &p_many, &dat, &par).expect("recover");
+        assert_eq!(got[0][..], chunks[0][..]);
+    }
+
 }

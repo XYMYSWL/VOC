@@ -1259,32 +1259,19 @@ impl Drop for Sharer {
     }
 }
 
-/// Reed-Solomon 冗余比例（校验片 / 数据片），按观看者回报的原始丢包率（千分之几，最近 5 秒最大值）：
-/// 不到 0.5% 不加；30% 丢包时 1.2 倍（一组 k 片数据配 1.2k 片校验，收到任意 k 片就能还原）
 /// 第 34-5 项：观看者回报的原画层丢包（千分之几）到这么多就跨帧交错
 const INTERLEAVE_LOSS: u16 = 150;
 
 /// 第 38-8 项：不稳的长距离线路上至少留这么多冗余
 const LONG_HAUL_FEC: f32 = 0.15;
 
-pub fn fec_ratio(loss_permille: u16) -> f32 {
-    match loss_permille {
-        0..5 => 0.0,
-        5..30 => 0.15,
-        30..80 => 0.35,
-        80..150 => 0.6,
-        150..250 => 0.9,
-        // 0.6：丢包更高时冗余继续往上加（以前最多 120%，丢一半时整组常常救不回）。拥塞时不加（见 congestion_cap）
-        250..350 => 1.2,
-        350..450 => 1.5,
-        _ => 2.0,
-    }
-}
+pub use voc_proto::udp::key_fec_ratio;
+#[cfg(test)]
+use voc_proto::udp::fec_ratio;
 
-/// 关键帧的冗余更高（丢了要等下一张关键帧，代价大）：至少 10%，最多 1.5 倍
-pub fn key_fec_ratio(r: f32) -> f32 {
-    (r * 1.5).clamp(0.1, voc_proto::udp::RS_MAX_RATIO)
-}
+/// 丢了帧先要几次恢复帧（只参考确认过的长期参考帧，比关键帧小得多），都没接上再要整张关键帧（第 69-c 项：恢复帧要得快了，次数也放宽，
+/// 不然重丢包时很快就退到大关键帧，关键帧本身又容易丢，画面会停一阵）
+const RECOVER_TRIES: u32 = 6;
 
 /// 长期参考帧（只用于原画层）：两个槽轮流存，观看者解码成功后确认。
 /// 有人丢了帧就发一帧只参考「所有观看者都确认过的那个槽」的恢复帧，代替整张关键帧
@@ -1468,12 +1455,14 @@ fn encode_loop(
                 ltr.ack(by, f);
             }
             let cap = ltr.capable(&main_ids);
+            // 两张恢复帧至少隔多久（第 69-c 项）：按观看者里最长的往返时间，短线路上丢了能更快接上；60～250 ms
+            let recover_gap = Duration::from_millis((link.layer_rtt(false) as f32 * 1.2).clamp(60.0, LTR_RECOVER_GAP.as_millis() as f32) as u64);
             let mut tag = LtrTag::default();
             if key {
                 tag.mark = Some(0);
             } else if link.take_ltr_recover() {
                 match ltr.common_slot(&cap) {
-                    Some(s) if ltr.last_recover.elapsed() >= LTR_RECOVER_GAP => {
+                    Some(s) if ltr.last_recover.elapsed() >= recover_gap => {
                         tag.use_slot = Some(s);
                         ltr.last_recover = Instant::now();
                         ltr.recovers += 1;
@@ -1700,7 +1689,10 @@ fn encode_loop(
             want_cursor_in_video.store(!link.all_watchers_draw_cursor(), Ordering::Relaxed);
             // 冗余比例按各层观看者回报的丢包率；丢包很高的直连观看者两条路同时发
             let (loss_main, loss_low) = (link.layer_loss(false), link.layer_loss(true));
-            (fec_main, fec_low) = (fec_ratio(loss_main), fec_ratio(loss_low));
+            // 每个观看者按自己的丢包和往返算冗余（第 65-2 / 69-c 项）：直连的人各发各的；经服务器的那份按多数人（中位数）算，
+            // 网差的人由服务器另外给他补校验片——一个人网差不再让所有人、共享者的上行都多背冗余。编码按最高的那个编一次
+            let (plan_main, plan_low) = (link.layer_fec_plan(false), link.layer_fec_plan(true));
+            (fec_main, fec_low) = (plan_main.max(), plan_low.max());
             // 长距离、最近有过突发丢包：先留 15% 冗余，不等丢了再加（第 38-8 项；拥塞时下面会压回去）
             if loss_main.max(loss_low) >= 30 {
                 link.note_loss_burst();
@@ -1732,6 +1724,18 @@ fn encode_loop(
             if congested {
                 (fec_main, fec_low) = (fec_main.min(CONGESTED_FEC_CAP), fec_low.min(CONGESTED_FEC_CAP));
             }
+            // 发给各人的那一份也做同样的上下限调整
+            let long_haul = link.long_haul() && !congested;
+            let adj = |r: f32| {
+                let r = if long_haul { r.max(LONG_HAUL_FEC) } else { r };
+                if congested {
+                    r.min(CONGESTED_FEC_CAP)
+                } else {
+                    r
+                }
+            };
+            link.set_fec_plan(false, plan_main.adjusted(adj));
+            link.set_fec_plan(true, plan_low.adjusted(adj));
             // 测试：VOC_TEST_FEC=百分比 固定冗余比例
             if let Some(f) = std::env::var("VOC_TEST_FEC").ok().and_then(|v| v.parse::<f32>().ok()) {
                 (fec_main, fec_low) = (f / 100.0, f / 100.0);
@@ -1830,6 +1834,8 @@ struct Stream {
     /// 确认过共享者的长期参考帧（之后丢了帧可以要恢复帧，不用等关键帧）；这一轮已经要过几次恢复帧
     ltr_ok: bool,
     recover_reqs: u32,
+    /// 已经为哪一帧卡住提前要过恢复帧（每帧只要一次）
+    early_recover_for: Option<u32>,
     /// 统计：靠恢复帧接上的次数
     recovered: u32,
     /// 上次回报丢包率的时间
@@ -1897,6 +1903,7 @@ impl VideoRx {
                 key_requests: 0,
                 ltr_ok: false,
                 recover_reqs: 0,
+                early_recover_for: None,
                 recovered: 0,
                 last_report: Instant::now(),
                 dec_tx: tx,
@@ -1985,6 +1992,14 @@ impl Stream {
         if out.gap {
             self.need_key = true; // 中间丢了帧，之后的非关键帧解不对
         }
+        // 队头的帧卡了一个多来回：先要一张恢复帧，和补发并行（第 69-c 项）。等到放弃再要，画面要多停一个来回
+        if let (Some(f), true, false) = (out.stalled, self.ltr_ok, self.need_key) {
+            if self.early_recover_for != Some(f) {
+                self.early_recover_for = Some(f);
+                self.last_req = Some(now);
+                acts.recovers.push(from);
+            }
+        }
         if self.asm.layer() != before_layer {
             self.ltr_ok = false; // 换了画质层：长期参考帧是另一层的
         }
@@ -2021,11 +2036,17 @@ impl Stream {
         let layer = self.asm.layer();
         acts.nacks.extend(out.nacks.into_iter().map(|(frame, idxs)| (from, layer, frame, idxs)));
         // 需要关键帧时按往返时间限速请求（至少 300 ms 一次；高延迟时更慢，免得共享者连发大关键帧把线路挤满）
-        let gap = Duration::from_millis((self.asm.rtt() * 2.0 + 100.0).max(300.0) as u64);
+        // 恢复帧很小：按实际往返时间要（第 69-c 项，往返短就早点再要，最少隔 60 ms）；整张关键帧大，照旧慢一点
+        let rtt = self.asm.rtt();
+        let gap = if self.ltr_ok && self.recover_reqs < RECOVER_TRIES {
+            Duration::from_millis((rtt * 1.3 + 30.0).clamp(60.0, 300.0) as u64)
+        } else {
+            Duration::from_millis((rtt * 2.0 + 100.0).max(300.0) as u64)
+        };
         if self.need_key && self.last_req.is_none_or(|t| now.duration_since(t) > gap) {
             self.last_req = Some(now);
             // 确认过长期参考帧：先要恢复帧（只有关键帧的零头大小）；要了 3 次还没接上再要关键帧
-            if self.ltr_ok && self.recover_reqs < 3 {
+            if self.ltr_ok && self.recover_reqs < RECOVER_TRIES {
                 self.recover_reqs += 1;
                 acts.recovers.push(from);
             } else {
@@ -2100,14 +2121,24 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
         last_arrival = Some(now);
         sec_rx += batch.len() as u32;
         let smooth = view.smooth.load(Ordering::Relaxed);
+        // 帧间隔（第 69-a 项）：优先按共享者每秒报的「发出几帧」算——丢帧、等恢复帧时扔掉的帧都不会把间隔估长
+        let sent_fps = view.sharer_info.lock().unwrap().filter(|(_, t)| t.elapsed() < Duration::from_secs(3)).map(|(i, _)| i.sent_fps as f32).filter(|f| *f >= 5.0);
+        if let Some(f) = sent_fps {
+            let est = interval.as_secs_f32() * 0.7 + (1.0 / f) * 0.3;
+            interval = Duration::from_secs_f32(est.clamp(0.004, 0.1));
+        }
         for (i, (cid, bits, cap)) in batch.iter().enumerate() {
             let cap = *cap;
-            // 帧里有截屏时间时，帧间隔按相邻两帧的截屏时间估（第 56-c 项：网络一串一串到时，按到达时间估会被带偏）。
-            // 要按收到的每一帧算，不能按显示出来的帧算：跳过一帧间隔就估成两倍、放得更慢、跳得更多，120 帧时会一路掉到一半（第 64 项）
-            if let (Some(c), Some(pc)) = (cap, prev_cap) {
-                let dt = (c.wrapping_sub(pc) as f32).clamp(4.0, 100.0) / 1000.0;
-                let est = interval.as_secs_f32() * 0.9 + dt * 0.1;
-                interval = Duration::from_secs_f32(est.clamp(0.004, 0.1));
+            // 没有共享者的帧数时：按相邻两帧的截屏时间估（第 56-c 项：网络一串一串到时，按到达时间估会被带偏）。
+            // 按收到的每一帧算（不按显示出来的帧，第 64 项）；中间缺了帧（间隔比现在估的长 1.7 倍以上）只慢慢往上调，免得丢帧把间隔估长
+            if let (None, Some(c), Some(pc)) = (sent_fps, cap, prev_cap) {
+                let d = c.wrapping_sub(pc);
+                if d > 0 && d < 1000 {
+                    let dt = (d as f32).clamp(4.0, 100.0) / 1000.0;
+                    let w = if dt > interval.as_secs_f32() * 1.7 { 0.02 } else { 0.1 };
+                    let est = interval.as_secs_f32() * (1.0 - w) + dt * w;
+                    interval = Duration::from_secs_f32(est.clamp(0.004, 0.1));
+                }
             }
             if cap.is_some() {
                 prev_cap = cap;

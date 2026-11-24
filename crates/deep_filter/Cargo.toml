@@ -1,0 +1,55 @@
+# DeepFilterNet 的 libDF（https://github.com/Rikorose/DeepFilterNet ，v0.5.6，MIT OR Apache-2.0，作者 Hendrik Schröter）。
+# VOC 第 67 / 68 项：只拿实时推理（tract）要用的部分，训练 / 数据集相关的依赖（hdf5 等）去掉了；
+# 改动：模型文件路径改成本目录下的 models/（原来是仓库根目录的 models/）。
+[package]
+name = "deep_filter"
+version = "0.5.6"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["tract", "default-model"]
+transforms = ["dep:thiserror", "dep:ndarray", "dep:rubato"]
+logging = ["dep:log"]
+tract = [
+  "transforms",
+  "logging",
+  "dep:tract-core",
+  "dep:tract-onnx",
+  "dep:tract-pulse",
+  "dep:tract-hir",
+  "dep:rust-ini",
+  "dep:ndarray",
+  "dep:anyhow",
+  "dep:flate2",
+  "dep:tar",
+]
+default-model = []
+# 下面这些在原库里有、VOC 不用（对应的代码不会编译）
+default-model-ll = []
+dataset = []
+capi = []
+wav-utils = []
+timings = []
+
+[dependencies]
+rustfft = "^6.1.0"
+realfft = "^3.1.0"
+itertools = "0.10"
+num-complex = "^0.4"
+log = { version = "0.4", features = ["std"], optional = true }
+thiserror = { version = "1.0", optional = true }
+anyhow = { version = "1.0", optional = true }
+ndarray = { version = "^0.15", optional = true }
+rubato = { version = "0.14", optional = true }
+rust-ini = { version = "^0.19", optional = true }
+tract-core = { version = "^0.19.4", optional = true }
+tract-onnx = { version = "^0.19.4", optional = true }
+tract-pulse = { version = "^0.19.4", optional = true }
+tract-hir = { version = "^0.19.4", optional = true }
+flate2 = { version = "1.0.24", optional = true }
+tar = { version = "0.4.38", optional = true }

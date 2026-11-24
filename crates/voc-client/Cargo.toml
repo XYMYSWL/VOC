@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# DeepFilterNet3 降噪（第 67 / 68 项）：libDF v0.5.6 放在 crates/deep_filter
+deep_filter = { path = "../deep_filter", default-features = false, features = ["tract", "default-model"] }
+ndarray = "0.15"
 voc-proto = { path = "../voc-proto" }
 serde.workspace = true
 serde_json.workspace = true
@@ -35,3 +38,6 @@ ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 [dev-dependencies]
 pollster = "1"
+
+[build-dependencies]
+cc = "1"

@@ -66,6 +66,10 @@ pub enum ClientMsg {
     },
     /// 主动退出（关闭 / 退出登录）：服务器马上把我移除，不保留 20 秒
     Bye,
+    /// 测上行带宽（第 71 项，服务器有 FEATURE_SPEEDTEST 才发）：start = 开始数 SPEED 包；再发一次 start = false 结束、要结果
+    SpeedTest {
+        start: bool,
+    },
     /// 和某人第一次打洞的结果（第 62-1 项，服务器有 FEATURE_PUNCH 才发）：ok = 打通了，ms = 用了多久（没通时是放弃前打了多久）。
     /// 服务器按双方的 NAT 类型汇总打通率，不记 IP
     PunchResult {
@@ -181,6 +185,9 @@ pub enum ClientMsg {
         loss: u16,
         #[serde(default)]
         rtt: u32,
+        /// 能把服务器另外补的校验片（同一组、校验片数更多）合进来用（0.6.5，第 65-2 项）；旧客户端没有这个字段 = false
+        #[serde(default)]
+        rs_ext: bool,
     },
     /// 本机能解码的视频格式（"av1" / "hevc" / "h264"），共享者据此选择编码格式
     Caps {
@@ -287,6 +294,15 @@ pub enum ServerMsg {
     Pong,
     /// 和 peer 同时开始打洞（第 62-2 项）：服务器把这条同一时刻发给双方，收到后过 in_ms 毫秒、减去自己到服务器的单程延迟再开打，
     /// 两边差不多同一刻开始（严格型 NAT、按顺序分配端口的 NAT 吃这个时机）。旧客户端不认识这条，照旧收到名单就打
+    /// 同频道其他人里收我语音丢得最多的那个丢了多少（%，第 70 项）：发的人据此加冗余（以前只看自己这一头的丢包，
+    /// 丢在服务器到听的人那一段时发的人不知道）。旧服务器不发
+    /// 测上行带宽的结果：从收到第一个 SPEED 包起，每 250 ms 收到多少千比特每秒（第 71 项）
+    SpeedTestResult {
+        kbps: Vec<u32>,
+    },
+    ListenLoss {
+        pct: u8,
+    },
     PunchAt {
         peer: u32,
         in_ms: u32,
@@ -418,6 +434,9 @@ pub struct ChannelInfo {
 pub struct UserInfo {
     pub id: u32,
     pub name: String,
+    /// 授权码的标记（第 60-6 项）：同一个授权码每次都一样、看不出授权码本身。身份核对按它记，不按昵称（昵称可以改、可以隐藏）
+    #[serde(default)]
+    pub tag: String,
     pub channel_id: Option<u32>,
     pub muted: bool,
     pub deafened: bool,
@@ -470,6 +489,8 @@ pub const FEATURE_VIDEO_RTX: &str = "video_rtx";
 pub const FEATURE_SHARE_AUDIO_ROUTE: &str = "share_audio_route";
 /// 服务器收打洞结果（PunchResult）、统一通知同时开打（PunchAt）（第 62 项）
 pub const FEATURE_PUNCH: &str = "punch";
+/// 服务器能配合测上行带宽（第 71 项）
+pub const FEATURE_SPEEDTEST: &str = "speedtest";
 
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
     let mut s = serde_json::to_string(msg).expect("serialize");

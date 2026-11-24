@@ -56,6 +56,9 @@ pub struct Profile {
     /// 正在放伴奏的程序名（服务器那边只知道「在放伴奏」）
     #[serde(default)]
     pub music: Option<String>,
+    /// 真实昵称（第 60-6 项）：对服务器隐藏昵称时，服务器只知道占位名「成员-XXXX」，真名只经端到端加密发给成员
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// 能力：认识 BLOB_CHAT2 / BLOB_REACT

@@ -53,6 +53,12 @@ pub struct E2e {
     /// 我的个人资料（端到端发给成员）、成员发来的
     my_profile: e2e::Profile,
     pub profiles: HashMap<u32, e2e::Profile>,
+    /// 有人的资料（真名）变了：界面重新套一次名字（第 60-6 项）
+    pub profiles_dirty: bool,
+    /// 我的真名（隐藏昵称时只经端到端发）
+    real_name: Option<String>,
+    /// 各人的授权码标记（服务器给的），身份核对按它记（第 60-6 项）
+    pub tags: HashMap<u32, String>,
 }
 
 pub struct ChatIn {
@@ -95,6 +101,9 @@ impl E2e {
             next_msg: voc_proto::now_millis() << 10,
             my_profile: Default::default(),
             profiles: HashMap::new(),
+            profiles_dirty: false,
+            real_name: None,
+            tags: HashMap::new(),
         };
         let sig = s.identity.sign_ek(&s.my_name, &s.kem.ek);
         s.out.push(ClientMsg::E2eAnnounce {
@@ -157,8 +166,25 @@ impl E2e {
         self.send_profile_to(&ids);
     }
 
+    /// 我的真名（第 60-6 项）：放进资料里发给成员
+    pub fn set_real_name(&mut self, name: &str) {
+        self.real_name = Some(name.to_string());
+        let ids: Vec<u32> = self.members.keys().copied().collect();
+        self.send_profile_to(&ids);
+    }
+
+    /// 身份核对用的键：有授权码标记按标记，没有（旧服务器）按昵称
+    fn pin_key(&self, id: u32, name: &str) -> String {
+        match self.tags.get(&id).filter(|t| !t.is_empty()) {
+            Some(t) => format!("tag:{t}"),
+            None => name.to_string(),
+        }
+    }
+
     fn send_profile_to(&mut self, to: &[u32]) {
-        let json = serde_json::to_vec(&self.my_profile).expect("profile json");
+        let mut p = self.my_profile.clone();
+        p.name = self.real_name.clone();
+        let json = serde_json::to_vec(&p).expect("profile json");
         for &id in to {
             if !(self.supports_chat2(id) && self.trusted(id)) {
                 continue;
@@ -209,9 +235,10 @@ impl E2e {
             return Err(format!("{} 的加密身份签名无效（可能被篡改），已忽略", e.name));
         }
         let fp = e2e::fingerprint(&idk);
-        let trust = match self.pins.get(&e.name) {
+        let key = self.pin_key(e.id, &e.name);
+        let trust = match self.pins.get(&key) {
             None => {
-                self.pins.insert(e.name.clone(), fp);
+                self.pins.insert(key, fp);
                 self.pins_dirty = true;
                 Trust::New
             }
@@ -281,8 +308,10 @@ impl E2e {
 
     /// 用户核对安全码后，接受某人的新身份
     pub fn trust(&mut self, id: u32) {
+        let Some(name) = self.members.get(&id).map(|m| m.name.clone()) else { return };
+        let key = self.pin_key(id, &name);
         let Some(m) = self.members.get_mut(&id) else { return };
-        self.pins.insert(m.name.clone(), e2e::fingerprint(&m.idk));
+        self.pins.insert(key, e2e::fingerprint(&m.idk));
         self.pins_dirty = true;
         m.trust = Trust::Known;
         self.start_pair(id);
@@ -350,8 +379,8 @@ impl E2e {
                 if let Some(m) = self.members.get_mut(&from) {
                     m.features = h.features.into_iter().take(16).map(|f| f.chars().take(32).collect()).collect();
                 }
-                // 新认识的新版本成员：把我的资料也给他
-                if self.my_profile != e2e::Profile::default() {
+                // 新认识的新版本成员：把我的资料（伴奏程序名、真名）也给他
+                if self.my_profile != e2e::Profile::default() || self.real_name.is_some() {
                     self.send_profile_to(&[from]);
                 }
                 None
@@ -359,7 +388,13 @@ impl E2e {
             e2e::BLOB_PROFILE => {
                 let mut p: e2e::Profile = serde_json::from_slice(&data).ok()?;
                 p.music = p.music.map(|m| m.chars().take(64).collect());
+                // 真名（第 60-6 项）：去掉控制字符、最多 32 个字；聊天里显示的发送者名字也换成真名
+                p.name = p.name.map(|n| n.chars().filter(|c| !c.is_control()).take(32).collect::<String>().trim().to_string()).filter(|n| !n.is_empty());
+                if let (Some(n), Some(m)) = (&p.name, self.members.get_mut(&from)) {
+                    m.name = n.clone();
+                }
                 self.profiles.insert(from, p);
+                self.profiles_dirty = true;
                 None
             }
             e2e::BLOB_REACT => {
@@ -600,7 +635,7 @@ pub mod tests {
     fn profile_reaches_members_end_to_end() {
         let mut a = E2e::new(1, "alice", Identity::generate(), HashMap::new());
         let mut b = E2e::new(2, "bob", Identity::generate(), HashMap::new());
-        a.set_profile(voc_proto::e2e::Profile { music: Some("网易云音乐".into()) });
+        a.set_profile(voc_proto::e2e::Profile { music: Some("网易云音乐".into()), ..Default::default() });
         assert!(a.out.iter().all(|m| !matches!(m, ClientMsg::E2eBlob { .. })), "nobody to send to yet");
         pair_up(&mut a, &mut b);
         relay(&mut b, &mut a); // bob 的能力公告
