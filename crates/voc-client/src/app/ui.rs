@@ -1899,6 +1899,10 @@ impl App {
         th::segmented(ui, &mut self.cfg.theme, &[(0u8, "跟随系统"), (1, "浅色"), (2, "深色")]);
         ui.label(RichText::new("「跟随系统」按 Windows 设置 → 个性化 → 颜色里的「应用模式」。").size(11.5).color(th::TEXT_FAINT()));
         ui.add_space(10.0);
+        th::section(ui, "配色");
+        let opts: Vec<(u8, &str)> = th::STYLES.iter().enumerate().map(|(i, s)| (i as u8, s.0)).collect();
+        th::segmented(ui, &mut self.cfg.palette, &opts);
+        ui.add_space(10.0);
         th::section(ui, "毛玻璃效果");
         let mica = crate::glass::mica_supported();
         let r = ui.checkbox(&mut self.cfg.glass, "毛玻璃效果").on_hover_text(
@@ -2320,6 +2324,11 @@ impl App {
                             ui.end_row();
                         });
                     }
+                    if let Some(w) = &self.share_bw_warn {
+                        egui::Frame::new().fill(th::YELLOW_SOFT()).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+                            ui.label(RichText::new(format!("⚠ {w}")).color(th::YELLOW()));
+                        });
+                    }
                     if sh.cfg.force_av1 {
                         let names = cannot_av1(s);
                         if !names.is_empty() {
@@ -2384,7 +2393,28 @@ impl App {
                 th::segmented(ui, &mut self.cfg.share.height, &[(480, "480P"), (720, "720P"), (1080, "1080P")]);
                 ui.add_space(6.0);
                 th::section(ui, "帧率");
-                th::segmented(ui, &mut self.cfg.share.fps, &[(30, "30 帧"), (60, "60 帧")]);
+                // 120 帧（试验，第 64 项）：只能 AV1；要有 AV1 硬件编码器、共享的屏幕刷新率要到 120 Hz
+                let refresh = match &self.cfg.share.window {
+                    Some(w) => video::window_refresh(w.hwnd),
+                    None => video::monitor_refresh(self.cfg.share.monitor),
+                };
+                let av1 = video::can_encode_av1();
+                let can120 = av1 && refresh >= 119;
+                let opts: Vec<(u32, &str)> = if can120 { vec![(30, "30 帧"), (60, "60 帧"), (120, "120 帧（试验）")] } else { vec![(30, "30 帧"), (60, "60 帧")] };
+                th::segmented(ui, &mut self.cfg.share.fps, &opts);
+                if !can120 {
+                    if self.cfg.share.fps > 60 {
+                        self.cfg.share.fps = 60;
+                    }
+                    let why = if !av1 { "显卡没有 AV1 硬件编码".to_string() } else { format!("共享的屏幕刷新率只有 {refresh} Hz（要 120 Hz 以上）") };
+                    ui.label(RichText::new(format!("120 帧（试验）用不了：{why}")).size(11.5).color(th::TEXT_FAINT()));
+                } else if self.cfg.share.fps > 60 {
+                    ui.label(
+                        RichText::new("试验功能：只用 AV1（解不了 AV1 的人看不了），码率约为 60 帧的 1.6 倍；上行不够时会提醒你。观看的人屏幕也要 120 Hz 才看得出差别。")
+                            .size(11.5)
+                            .color(th::YELLOW()),
+                    );
+                }
                 ui.add_space(6.0);
                 th::section(ui, "画质");
                 let q: Vec<(u8, &str)> = video::QUALITIES.iter().enumerate().map(|(i, q)| (i as u8, q.0)).collect();
@@ -2440,7 +2470,10 @@ impl App {
                 );
                 // 强制 AV1（第 61 项）：本机没有 AV1 硬件编码器就变灰
                 let av1 = video::can_encode_av1();
-                ui.add_enabled(av1, egui::Checkbox::new(&mut self.cfg.share.force_av1, "强制用 AV1 编码"))
+                if self.cfg.share.fps > 60 {
+                    self.cfg.share.force_av1 = true;
+                }
+                ui.add_enabled(av1 && self.cfg.share.fps <= 60, egui::Checkbox::new(&mut self.cfg.share.force_av1, "强制用 AV1 编码"))
                     .on_hover_text("不管观看者能不能解，都用 AV1（同样码率更清楚）。解不了 AV1 的人看不了，他那边会写原因")
                     .on_disabled_hover_text("这台电脑的显卡没有 AV1 硬件编码（要 NVIDIA RTX 40 系、AMD RX 7000、Intel Arc 及以后），用不了");
                 if !av1 {
@@ -2833,7 +2866,7 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        th::sync(ui.ctx(), self.cfg.theme, self.glass_window);
+        th::sync(ui.ctx(), self.cfg.theme, self.cfg.palette, self.glass_window);
         if self.glass_window && !self.mica_done {
             self.mica_done = true;
             let ok = crate::glass::hwnd_of(frame).is_some_and(crate::glass::apply_mica);
@@ -3115,6 +3148,13 @@ fn viewer_body(ui: &mut egui::Ui, id: u32, v: &mut crate::app::Viewer, voice: &A
             if info.p2p_only {
                 th::pill(ui, "共享者只走 P2P", th::TEXT_DIM(), th::BG_ELEVATED())
                     .on_hover_text("共享者设置了画面不经服务器：和他打不通直连、也没有别的观看者能转给你时看不了");
+            }
+        }
+        // 共享者开了 120 帧、这台电脑的屏幕显示不了那么多（第 64 项）
+        if let Some(t) = sinfo.map(|i| i.target_fps as u32).filter(|t| *t > 60) {
+            let r = video::max_refresh();
+            if r + 1 < t {
+                ui.label(RichText::new(format!("对方在用 {t} 帧共享（试验），你的屏幕最多显示 {r} 帧")).size(12.0).color(th::TEXT_FAINT()));
             }
         }
         // 共享的是窗口：最小化 / 关掉了（第 60-1 项）

@@ -27,6 +27,8 @@ pub struct Palette {
     pub yellow_soft: Color32,
     pub red: Color32,
     pub red_soft: Color32,
+    /// 选中的底色（选中按钮、选中文字）：字是正文颜色，要看得清
+    pub selection: Color32,
 }
 
 const fn c(hex: u32) -> Color32 {
@@ -54,6 +56,7 @@ pub const DARK: Palette = Palette {
     yellow_soft: c(0x3A2A10),
     red: c(0xF87171),
     red_soft: c(0x3A1717),
+    selection: c(0x6D72F0),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -77,7 +80,156 @@ pub const LIGHT: Palette = Palette {
     yellow_soft: c(0xFEF3E2),
     red: c(0xDC2626),
     red_soft: c(0xFDECEC),
+    selection: c(0xC7CBFF),
 };
+
+pub const GRAPHITE_LIGHT: Palette = Palette {
+    bg_base: c(0xF6F6F7),
+    rail: c(0xEDEDEF),
+    bg_sidebar: c(0xFAFAFA),
+    bg_panel: c(0xFFFFFF),
+    bg_elevated: c(0xF2F2F4),
+    bg_hover: c(0xEBEBEE),
+    bg_active: c(0xE2E2E7),
+    border: c(0xE6E6E9),
+    text: c(0x18181B),
+    text_dim: c(0x52525B),
+    text_faint: c(0x71717A),
+    accent: c(0x5B5BD6),
+    accent_hover: c(0x4646B4),
+    accent_soft: c(0xEFEFFC),
+    green: c(0x1F8F55),
+    green_soft: c(0xE9F6EF),
+    yellow: c(0xA16207),
+    yellow_soft: c(0xFBF4E3),
+    red: c(0xC93B3B),
+    red_soft: c(0xFBEDED),
+    selection: c(0xD9D9F7),
+};
+pub const GRAPHITE_DARK: Palette = Palette {
+    bg_base: c(0x111113),
+    rail: c(0x0C0C0E),
+    bg_sidebar: c(0x161618),
+    bg_panel: c(0x1B1B1E),
+    bg_elevated: c(0x232326),
+    bg_hover: c(0x2B2B2F),
+    bg_active: c(0x333338),
+    border: c(0x2A2A2E),
+    text: c(0xECECEE),
+    text_dim: c(0xB0B0B8),
+    text_faint: c(0x85858F),
+    accent: c(0x7171E6),
+    accent_hover: c(0xAEAEF8),
+    accent_soft: c(0x26263F),
+    green: c(0x46C987),
+    green_soft: c(0x15291F),
+    yellow: c(0xE5B454),
+    yellow_soft: c(0x2E2614),
+    red: c(0xEE7272),
+    red_soft: c(0x351A1C),
+    selection: c(0x3A3A6E),
+};
+pub const STONE_LIGHT: Palette = Palette {
+    bg_base: c(0xF5F4F2),
+    rail: c(0xECEAE6),
+    bg_sidebar: c(0xFAF9F7),
+    bg_panel: c(0xFFFFFF),
+    bg_elevated: c(0xF1EFEC),
+    bg_hover: c(0xE9E6E1),
+    bg_active: c(0xDFDBD5),
+    border: c(0xE5E2DD),
+    text: c(0x1C1917),
+    text_dim: c(0x57534E),
+    text_faint: c(0x78716C),
+    accent: c(0x0F766E),
+    accent_hover: c(0x115E59),
+    accent_soft: c(0xE6F2F0),
+    green: c(0x2F855A),
+    green_soft: c(0xEAF4EC),
+    yellow: c(0xA16207),
+    yellow_soft: c(0xF8F1E0),
+    red: c(0xB83A3A),
+    red_soft: c(0xF8EBEA),
+    selection: c(0xCBE6E1),
+};
+pub const STONE_DARK: Palette = Palette {
+    bg_base: c(0x141312),
+    rail: c(0x0E0D0C),
+    bg_sidebar: c(0x191817),
+    bg_panel: c(0x1E1C1B),
+    bg_elevated: c(0x272523),
+    bg_hover: c(0x302D2B),
+    bg_active: c(0x3A3633),
+    border: c(0x2E2B28),
+    text: c(0xEEEBE7),
+    text_dim: c(0xB9B3AC),
+    text_faint: c(0x8E8780),
+    accent: c(0x1E9C8E),
+    accent_hover: c(0x7FD8CC),
+    accent_soft: c(0x16302D),
+    green: c(0x5CC98A),
+    green_soft: c(0x17291E),
+    yellow: c(0xE2B45A),
+    yellow_soft: c(0x2F2716),
+    red: c(0xE77B73),
+    red_soft: c(0x361D1B),
+    selection: c(0x1E4A45),
+};
+pub const SEA_LIGHT: Palette = Palette {
+    bg_base: c(0xF4F6F9),
+    rail: c(0xE8ECF2),
+    bg_sidebar: c(0xF9FAFC),
+    bg_panel: c(0xFFFFFF),
+    bg_elevated: c(0xEFF2F6),
+    bg_hover: c(0xE6EBF1),
+    bg_active: c(0xDCE3EC),
+    border: c(0xE1E6ED),
+    text: c(0x0F172A),
+    text_dim: c(0x475569),
+    text_faint: c(0x64748B),
+    accent: c(0x2563EB),
+    accent_hover: c(0x1D4ED8),
+    accent_soft: c(0xEAF1FE),
+    green: c(0x15803D),
+    green_soft: c(0xE8F5EC),
+    yellow: c(0xA16207),
+    yellow_soft: c(0xFBF3E1),
+    red: c(0xC53030),
+    red_soft: c(0xFBECEC),
+    selection: c(0xCFDEFC),
+};
+pub const SEA_DARK: Palette = Palette {
+    bg_base: c(0x0B0F17),
+    rail: c(0x070A10),
+    bg_sidebar: c(0x0F1420),
+    bg_panel: c(0x131A27),
+    bg_elevated: c(0x1A2231),
+    bg_hover: c(0x222B3C),
+    bg_active: c(0x2A3447),
+    border: c(0x1F293A),
+    text: c(0xE2E8F0),
+    text_dim: c(0xA9B4C4),
+    text_faint: c(0x7C889A),
+    accent: c(0x3B7BEF),
+    accent_hover: c(0x93B8FB),
+    accent_soft: c(0x172A4A),
+    green: c(0x4ACB8A),
+    green_soft: c(0x112A1F),
+    yellow: c(0xE6B450),
+    yellow_soft: c(0x2B2412),
+    red: c(0xEF7373),
+    red_soft: c(0x341A1E),
+    selection: c(0x1F3E73),
+};
+
+/// 配色风格（第 63 项，设置 → 外观）：(名字, 浅色, 深色)
+pub const STYLES: [(&str, &Palette, &Palette); 4] = [
+    ("石墨", &GRAPHITE_LIGHT, &GRAPHITE_DARK),
+    ("暖石", &STONE_LIGHT, &STONE_DARK),
+    ("深海", &SEA_LIGHT, &SEA_DARK),
+    ("靛蓝（0.6.3）", &LIGHT, &DARK),
+];
+static STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 static LIGHT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 窗口背景是云母（第 59 项）：大块底色改半透明，透出系统背景
@@ -97,10 +249,11 @@ pub fn is_light() -> bool {
 }
 
 pub fn p() -> &'static Palette {
+    let (_, l, d) = STYLES[(STYLE.load(std::sync::atomic::Ordering::Relaxed) as usize).min(STYLES.len() - 1)];
     if is_light() {
-        &LIGHT
+        l
     } else {
-        &DARK
+        d
     }
 }
 
@@ -139,9 +292,11 @@ pub fn BG_PANEL() -> Color32 {
     tr(p().bg_panel)
 }
 
-/// 外观：0 跟随系统，1 浅色，2 深色。每帧调一次，变了才重设样式（第 59 项）。translucent = 云母窗口
-pub fn sync(ctx: &egui::Context, mode: u8, translucent: bool) {
+/// 外观：0 跟随系统，1 浅色，2 深色；style = 配色风格（STYLES 的下标）。每帧调一次，变了才重设样式（第 59 / 63 项）。translucent = 云母窗口
+pub fn sync(ctx: &egui::Context, mode: u8, style: u8, translucent: bool) {
     TRANSLUCENT.store(translucent, std::sync::atomic::Ordering::Relaxed);
+    let style = style.min(STYLES.len() as u8 - 1);
+    let style_changed = STYLE.swap(style, std::sync::atomic::Ordering::Relaxed) != style;
     let light = match mode {
         1 => true,
         2 => false,
@@ -149,7 +304,7 @@ pub fn sync(ctx: &egui::Context, mode: u8, translucent: bool) {
     };
     static APPLIED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     let want = if light { 1 } else { 2 };
-    if APPLIED.swap(want, std::sync::atomic::Ordering::Relaxed) != want {
+    if APPLIED.swap(want, std::sync::atomic::Ordering::Relaxed) != want || style_changed {
         LIGHT_ON.store(light, std::sync::atomic::Ordering::Relaxed);
         apply(ctx);
         // 系统标题栏也跟着换颜色
@@ -196,9 +351,9 @@ fn visuals() -> egui::Visuals {
     v.window_shadow = egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(sh) };
     v.popup_shadow = egui::epaint::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(sh * 6 / 7) };
     // 浅色：选中的底色用浅靛蓝（字是深色的，深靛蓝底上看不清）
-    v.selection.bg_fill = if is_light() { c(0xC7CBFF) } else { ACCENT() };
+    v.selection.bg_fill = p().selection;
     v.slider_trailing_fill = true; // 滑条左侧用强调色填充，更容易看清
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    v.selection.stroke = Stroke::new(1.0, TEXT());
 
     let r = CornerRadius::same(8);
     let w = &mut v.widgets;
@@ -240,7 +395,8 @@ fn visuals() -> egui::Visuals {
 pub fn pill(ui: &mut egui::Ui, text: impl Into<String>, fg: Color32, bg: Color32) -> egui::Response {
     egui::Frame::new()
         .fill(bg)
-        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 38)))
+        .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::symmetric(8, 2))
         .show(ui, |ui| ui.label(RichText::new(text.into()).size(12.0).color(fg)))
         .response
@@ -363,15 +519,16 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str, width: f32, enabled: bool) 
 /// 名字 → 稳定的头像颜色
 pub fn name_color(name: &str) -> Color32 {
     let h = name.bytes().fold(5381u32, |h, b| h.wrapping_mul(33) ^ b as u32);
+    // 降饱和、明度统一的一组颜色（第 63 项：比纯色更沉稳）
     const P: [Color32; 8] = [
-        Color32::from_rgb(0xe8, 0x6a, 0x92),
-        Color32::from_rgb(0x4e, 0xc9, 0x9b),
-        Color32::from_rgb(0xe9, 0xb7, 0x4a),
-        Color32::from_rgb(0xef, 0x76, 0x5a),
-        Color32::from_rgb(0x4e, 0xa1, 0xff),
-        Color32::from_rgb(0x9b, 0x7b, 0xf7),
-        Color32::from_rgb(0x3f, 0xc1, 0xc9),
-        Color32::from_rgb(0xc7, 0x8b, 0xe8),
+        c(0xC0727F),
+        c(0x5A9A84),
+        c(0xC09A55),
+        c(0xC27660),
+        c(0x5F86BF),
+        c(0x8A7CC0),
+        c(0x4C9AA0),
+        c(0xA67AAE),
     ];
     P[h as usize % P.len()]
 }

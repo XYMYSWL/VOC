@@ -623,6 +623,14 @@ struct Peer {
     quality: PeerQuality,
     /// 对方自测的 NAT 类型
     nat: Option<NatInfo>,
+    /// 什么时候拿到对方现在这个 NAT 信息（端口预测按时间放宽范围，第 62-3 项）
+    nat_at: Option<Instant>,
+    /// 等服务器「同时开打」的时间点（第 62-2 项）：到这之前先不打
+    hold_until: Option<Instant>,
+    /// 第一次打洞的结果已经上报过（第 62-1 项）
+    reported: bool,
+    /// 等「同时开打」时已经低 TTL 先开过口子
+    pre_opened: bool,
     /// 对方的身份指纹（记住上次打通的地址用）
     fp: String,
     /// 以前和他打通过的地址（加密存在本机，先试这些）
@@ -777,6 +785,10 @@ impl Peer {
             last_punch: past,
             last_ping: past,
             punch_started: None,
+            nat_at: None,
+            hold_until: None,
+            reported: false,
+            pre_opened: false,
             low_ttl_for: None,
             punch_round: 0,
             rtt_ms: 0,
@@ -843,11 +855,23 @@ pub fn hopeless_pair(me: Option<NatInfo>, peer: Option<NatInfo>) -> bool {
 }
 
 /// 对方是可预测的对称型：按它的步长猜接下来几个端口
+#[cfg(test)]
 pub fn predicted_ports(n: NatInfo) -> Vec<u16> {
+    predicted_ports_n(n, 16)
+}
+
+/// 往后猜 depth 个端口
+pub fn predicted_ports_n(n: NatInfo, depth: usize) -> Vec<u16> {
     if n.kind != voc_proto::NAT_SYM_PREDICTABLE || n.step == 0 {
         return Vec::new();
     }
-    (1..=16i32).map(|i| n.port as i32 + n.step as i32 * i).filter(|p| (1024..=65535).contains(p)).map(|p| p as u16).collect()
+    (1..=depth as i32).map(|i| n.port as i32 + n.step as i32 * i).filter(|p| (1024..=65535).contains(p)).map(|p| p as u16).collect()
+}
+
+/// 猜多少个端口（第 62-3 项）：服务器上每个人对方都要打洞（每个候选地址占一个端口，按 4 个算），
+/// 拿到对方 NAT 信息每过一分钟再多猜 16 个（运营商大 NAT 上别人也在用端口）；最多 256 个
+pub fn prediction_depth(peer_count: usize, age_min: usize) -> usize {
+    (16 + peer_count * 4 + age_min * 16).min(256)
 }
 
 impl Peer {
@@ -939,6 +963,12 @@ pub const SHARE_AUDIO_SERVER: u8 = 1;
 pub const SHARE_AUDIO_DIRECT: u8 = 2;
 /// 服务器支持共享声音单独的直连名单（FEATURE_SHARE_AUDIO_ROUTE）；旧服务器上共享声音只能跟画面的直连名单走
 pub static SERVER_SHARE_AUDIO_ROUTE: AtomicBool = AtomicBool::new(false);
+/// 服务器收打洞结果、会统一通知同时开打（FEATURE_PUNCH，第 62 项）
+pub static SERVER_PUNCH: AtomicBool = AtomicBool::new(false);
+/// 新出现的人：等服务器「同时开打」的通知最多这么久，等不到就自己开打
+const PUNCH_HOLD_MAX: Duration = Duration::from_millis(1500);
+/// 打洞这么久还没通：上报「没打通」（之后照样每 2 秒重试）
+const PUNCH_GIVE_UP_REPORT: Duration = Duration::from_secs(30);
 /// UDP 发送失败的次数（诊断 / 测试日志）
 pub static SEND_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// 收包线程：处理过的包数、处理一个包最久用了多少微秒（测试日志读一次清零）
@@ -2085,7 +2115,20 @@ impl Link {
     /// 测试日志：每个人的候选地址
     pub fn peer_cands_debug(&self) -> Vec<(u32, Vec<SocketAddr>)> {
         let peers = self.peers.lock().unwrap();
-        let mut v: Vec<_> = peers.map.iter().map(|(id, p)| (*id, p.cands.clone())).collect();
+        let now = Instant::now();
+        // 地址后面附上：等「同时开打」还剩多少毫秒（-1 = 没在等）、打了多久、有没有成对密钥（调试用）
+        let mut v: Vec<_> = peers
+            .map
+            .iter()
+            .map(|(id, p)| {
+                let mut c = p.cands.clone();
+                let hold = p.hold_until.map(|t| t.saturating_duration_since(now).as_millis() as u16).unwrap_or(u16::MAX);
+                let punched = p.punch_started.map(|t| now.duration_since(t).as_millis().min(65000) as u16).unwrap_or(u16::MAX);
+                c.push(SocketAddr::new(std::net::Ipv4Addr::new(0, 0, 0, p.sealer.is_some() as u8).into(), hold));
+                c.push(SocketAddr::new(std::net::Ipv4Addr::new(0, 0, 0, 2).into(), punched));
+                (*id, c)
+            })
+            .collect();
         v.sort();
         v
     }
@@ -2305,16 +2348,47 @@ impl Link {
         let list: Vec<PeerInfo> = list.into_iter().filter(|p| !prefs.get(&p.id).is_some_and(|r| r.hide_ip)).collect();
         let mut peers = self.peers.lock().unwrap();
         peers.map.retain(|id, _| list.iter().any(|p| p.id == *id));
+        let now = Instant::now();
+        let sync = SERVER_PUNCH.load(Ordering::Relaxed);
         for info in list {
             let cands: Vec<SocketAddr> = info.addrs.iter().filter_map(|a| a.parse().ok()).map(norm).collect();
             let p = peers.map.entry(info.id).or_insert_with(|| Peer::new(Vec::new()));
+            if p.nat != info.nat || p.nat_at.is_none() {
+                p.nat_at = Some(now);
+            }
             p.nat = info.nat;
             if p.cands != cands {
                 p.cands = cands;
                 p.punch_started = None; // 有新地址：重新快速打洞
                 p.bday_tried = false;
+                // 服务器会马上通知「同时开打」：先等着，最多等 1.5 秒（第 62-2 项）
+                if sync && !p.confirmed {
+                    p.hold_until = Some(now + PUNCH_HOLD_MAX);
+                }
             }
         }
+    }
+
+    /// 服务器通知和 peer 同时开打（第 62-2 项）：过 in_ms 毫秒、减去自己到服务器的单程延迟后开打
+    pub fn punch_at(&self, peer: u32, in_ms: u32) {
+        let one_way = self.server_rtt.load(Ordering::Relaxed) / 2;
+        let wait = Duration::from_millis(in_ms.saturating_sub(one_way).min(2000) as u64);
+        if let Some(p) = self.peers.lock().unwrap().map.get_mut(&peer) {
+            if !p.confirmed {
+                p.hold_until = Some(Instant::now() + wait);
+                p.punch_started = None;
+                p.pre_opened = false;
+            }
+        }
+    }
+
+    /// 第一次打洞的结果报给服务器（第 62-1 项，每人只报一次）
+    fn report_punch(&self, peer: u32, reported: &mut bool, ok: bool, ms: u128) {
+        if *reported || !SERVER_PUNCH.load(Ordering::Relaxed) {
+            return;
+        }
+        *reported = true;
+        self.tcp_send(Outgoing::Msg(ClientMsg::PunchResult { peer, ok, ms: ms.min(u32::MAX as u128) as u32 }));
     }
 
     /// 生日攻击的一步（每 100 ms，对还没打通的一个人）：该开始就开始、开端口 / 发探测、收备用端口上的包、到时间就收摊。
@@ -2464,6 +2538,7 @@ impl Link {
                 }
             }
         }
+        let peer_count = peers.map.len();
         for (id, p) in peers.map.iter_mut() {
             // 生日攻击：打通了就收摊（留下撞上的端口）；没打通、该做就做一步
             if p.confirmed && p.bday.is_some() {
@@ -2493,9 +2568,31 @@ impl Link {
                 p.good_since = None;
                 p.pings.clear();
             }
+            // 等服务器说的「同时开打」那一刻（第 62-2 项）。等的时候先低 TTL 发一遍：包到不了对方，只在自己的 NAT 上开好口子，
+            // 这样对方的第一个包到时一定进得来（严格型 NAT 收到「不请自来」的包会拉黑对方）
+            if !p.confirmed && p.hold_until.is_some_and(|t| t > now) {
+                if !p.pre_opened {
+                    p.pre_opened = true;
+                    let targets = punch_targets(&p.cands, p.path, p.prev_path, &spare);
+                    let pkts: Vec<(Vec<u8>, SocketAddr)> = targets
+                        .iter()
+                        .filter(|t| matches!(t, SocketAddr::V4(v4) if self.nat_emu.is_some() || !crate::portmap::is_carrier_or_private(*v4.ip())))
+                        .map(|t| {
+                            s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
+                            (buf.clone(), *t)
+                        })
+                        .collect();
+                    self.low_ttl_burst(&pkts);
+                }
+                continue;
+            }
+            p.hold_until = None;
             if !p.confirmed {
                 // 头 15 秒每 200 ms 打一次洞，之后每 2 秒试一次（对方换了网络等情况）
                 let started = *p.punch_started.get_or_insert(now);
+                if now.duration_since(started) > PUNCH_GIVE_UP_REPORT {
+                    self.report_punch(*id, &mut p.reported, false, now.duration_since(started).as_millis());
+                }
                 let hopeless = hopeless_pair(my_nat, p.nat);
                 let interval = if !hopeless && now.duration_since(started) < Duration::from_secs(PUNCH_FAST_SECS as u64) {
                     Duration::from_millis(200)
@@ -2526,11 +2623,17 @@ impl Link {
                     let elapsed = now.duration_since(started);
                     let spray = elapsed > Duration::from_secs(2) && elapsed < Duration::from_secs(30) && p.punch_round % 5 == 0;
                     p.punch_round = p.punch_round.wrapping_add(1);
-                    // 对方是可预测的对称型 NAT：按它的步长朝接下来的端口打（每轮都打）
+                    // 对方是可预测的对称型 NAT：按它的步长朝接下来的端口打（每轮都打）。
+                    // 对方探测之后又给别人开过端口（服务器上每个人、每个候选地址都占一个），拿到这个信息越久越可能用掉更多：
+                    // 猜的范围按人数和时间放大；前 16 个每轮都打，后面的每轮轮流打 32 个（第 62-3 项）
                     if let (Some(n), Some(public)) = (p.nat, p.cands.first().copied()) {
-                        for port in predicted_ports(n) {
+                        let age_min = p.nat_at.map(|t| now.duration_since(t).as_secs() / 60).unwrap_or(0) as usize;
+                        let ports = predicted_ports_n(n, prediction_depth(peer_count, age_min));
+                        let (near, far) = ports.split_at(ports.len().min(16));
+                        let start = if far.is_empty() { 0 } else { (p.punch_round as usize * 32) % far.len() };
+                        for port in near.iter().chain(far.iter().cycle().skip(start).take(far.len().min(32))) {
                             s.seal(p2p::PUNCH, &now_millis().to_le_bytes(), buf);
-                            self.send_raw(buf, SocketAddr::new(public.ip(), port));
+                            self.send_raw(buf, SocketAddr::new(public.ip(), *port));
                         }
                     }
                     if let (true, Some(public)) = (spray, p.cands.first().copied()) {
@@ -2818,6 +2921,7 @@ impl Link {
                     if !p.confirmed {
                         let took = p.punch_started.map(|t| t.elapsed().as_millis()).unwrap_or(0);
                         crate::applog::log(format!("线路：和 #{id} 打通直连（用时 {took} ms）"));
+                        self.report_punch(id, &mut p.reported, true, took);
                         // 断了没多久又通了（Wi-Fi 抖一下）：直接用回，不先走中转观察；真不稳的话质量统计会再判
                         if p.dropped_at.is_some_and(|t| t.elapsed() < QUICK_RECOVER) {
                             p.unstable_until = None;
@@ -4781,6 +4885,11 @@ mod tests {
         let rnd = classify_nat(a("1.2.3.4:40000"), a("1.2.3.4:61234"), &lan);
         assert_eq!(rnd.kind, voc_proto::NAT_SYM_RANDOM);
         assert!(predicted_ports(rnd).is_empty());
+        // 猜的范围（第 62-3 项）：人多、信息旧了就放大，最多 256
+        assert_eq!(prediction_depth(0, 0), 16);
+        assert_eq!(prediction_depth(5, 2), 16 + 20 + 32);
+        assert_eq!(prediction_depth(100, 100), 256);
+        assert_eq!(predicted_ports_n(pred, 40).len(), 40);
         // 两边都对称且有一边随机：不打洞；一边好打洞就照打
         assert!(hopeless_pair(Some(rnd), Some(pred)));
         assert!(!hopeless_pair(Some(pred), Some(pred)));

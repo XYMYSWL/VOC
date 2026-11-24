@@ -66,6 +66,13 @@ pub enum ClientMsg {
     },
     /// 主动退出（关闭 / 退出登录）：服务器马上把我移除，不保留 20 秒
     Bye,
+    /// 和某人第一次打洞的结果（第 62-1 项，服务器有 FEATURE_PUNCH 才发）：ok = 打通了，ms = 用了多久（没通时是放弃前打了多久）。
+    /// 服务器按双方的 NAT 类型汇总打通率，不记 IP
+    PunchResult {
+        peer: u32,
+        ok: bool,
+        ms: u32,
+    },
     /// 告诉服务器语音走 UDP 还是 TCP（UDP 被封锁/限速时自动切到 TCP）
     Transport {
         udp: bool,
@@ -278,6 +285,12 @@ pub enum ServerMsg {
         text: String,
     },
     Pong,
+    /// 和 peer 同时开始打洞（第 62-2 项）：服务器把这条同一时刻发给双方，收到后过 in_ms 毫秒、减去自己到服务器的单程延迟再开打，
+    /// 两边差不多同一刻开始（严格型 NAT、按顺序分配端口的 NAT 吃这个时机）。旧客户端不认识这条，照旧收到名单就打
+    PunchAt {
+        peer: u32,
+        in_ms: u32,
+    },
     /// 同频道、开启了 P2P 的成员
     Peers {
         peers: Vec<PeerInfo>,
@@ -455,6 +468,8 @@ pub const FEATURE_PONG_ADDR: &str = "pong_addr";
 pub const FEATURE_VIDEO_RTX: &str = "video_rtx";
 /// 服务器功能：共享声音的直连名单单独报（DirectPeers.share_audio），不跟画面的直连名单走（第 54 项）
 pub const FEATURE_SHARE_AUDIO_ROUTE: &str = "share_audio_route";
+/// 服务器收打洞结果（PunchResult）、统一通知同时开打（PunchAt）（第 62 项）
+pub const FEATURE_PUNCH: &str = "punch";
 
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
     let mut s = serde_json::to_string(msg).expect("serialize");

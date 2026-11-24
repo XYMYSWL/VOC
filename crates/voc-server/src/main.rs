@@ -256,6 +256,10 @@ struct State {
     p2p_samples: (u64, u64),
     /// 按天累计的直连率（第 47-2 项）：(日期 UTC「YYYY-MM-DD」, 总对数, 直连对数)，只留最近 7 天，存在授权码文件旁边
     p2p_days: Vec<(String, u64, u64)>,
+    /// 按天、按双方 NAT 类型的打洞结果（第 62-1 项）：只留最近 7 天，存在授权码文件旁边；只有次数，没有昵称和 IP
+    punch_days: Vec<PunchDay>,
+    /// 已经记过的一对（编号小的, 编号大的, 双方的连接计数）：每对每次登录只记第一次
+    punch_seen: HashSet<(u32, u32, u64, u64)>,
     /// 连接计数（断线恢复用，第 37-2 项）
     next_conn_gen: u64,
     /// 画面转发总带宽上限（bps）
@@ -385,6 +389,8 @@ impl State {
                 None => Vec::new(),
             };
             peers.sort_by_key(|p| p.id);
+            // 新出现、或者地址变了的人：同一时刻通知双方开打（第 62-2 项；在同一轮里给所有人发，双方收到的时间只差各自的网络延迟）
+            let fresh: Vec<u32> = peers.iter().filter(|p| !u.last_peers.contains(p)).map(|p| p.id).collect();
             if peers != u.last_peers {
                 u.direct.retain(|d| peers.iter().any(|p| p.id == *d));
                 u.direct_video.retain(|d| peers.iter().any(|p| p.id == *d));
@@ -393,11 +399,15 @@ impl State {
                 }
                 u.last_peers = peers.clone();
                 u.send(ServerMsg::Peers { peers });
+                for peer in fresh {
+                    u.send(ServerMsg::PunchAt { peer, in_ms: PUNCH_SYNC_MS });
+                }
             }
         }
     }
 
     fn remove_user(&mut self, id: u32) -> Option<User> {
+        self.punch_seen.retain(|k| k.0 != id && k.1 != id);
         let u = self.users.remove(&id)?;
         for o in self.users.values_mut() {
             o.watching.remove(&id);
@@ -900,6 +910,9 @@ impl State {
         if self.p2p_samples.0 > 0 {
             let _ = writeln!(t, "P2P：启动以来语音直连率 {}%（按时间算）", self.p2p_samples.1 * 100 / self.p2p_samples.0);
         }
+        if let Some(line) = punch_days_text(&self.punch_days) {
+            let _ = writeln!(t, "{line}");
+        }
         if let Some(line) = p2p_days_text(&self.p2p_days) {
             let _ = writeln!(t, "P2P：最近 {line}");
         }
@@ -1312,6 +1325,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         last_sec_bytes: (0, 0),
         p2p_samples: (0, 0),
         p2p_days: Vec::new(),
+        punch_days: Vec::new(),
+        punch_seen: HashSet::new(),
         next_conn_gen: 0,
         max_video_bps: cfg.max_video_bps,
         forced_low: HashSet::new(),
@@ -1665,7 +1680,13 @@ async fn handle_client(state: Shared, udp_sock: Arc<UdpSocket>, stream: TcpStrea
             user_id: id,
             udp_port: st.udp_port,
             server_name: st.server_name.clone(),
-            features: vec![voc_proto::FEATURE_DM_FILE.into(), voc_proto::FEATURE_PONG_ADDR.into(), voc_proto::FEATURE_VIDEO_RTX.into(), voc_proto::FEATURE_SHARE_AUDIO_ROUTE.into()],
+            features: vec![
+                voc_proto::FEATURE_DM_FILE.into(),
+                voc_proto::FEATURE_PONG_ADDR.into(),
+                voc_proto::FEATURE_VIDEO_RTX.into(),
+                voc_proto::FEATURE_SHARE_AUDIO_ROUTE.into(),
+                voc_proto::FEATURE_PUNCH.into(),
+            ],
             probe_port: st.probe_port,
             probe2: st.probe2.clone(),
             resume: resume_token.clone(),
@@ -2138,6 +2159,19 @@ fn handle_msg_locked(st: &mut State, uid: u32, msg: ClientMsg) {
             });
             st.check_voice_heard(uid);
         }
+        ClientMsg::PunchResult { peer, ok, ms } => {
+            let (Some(a), Some(b)) = (st.users.get(&uid), st.users.get(&peer)) else { return };
+            if !a.last_peers.iter().any(|p| p.id == peer) {
+                return;
+            }
+            let (lo, hi) = if uid < peer { ((uid, a), (peer, b)) } else { ((peer, b), (uid, a)) };
+            let key = (lo.0, hi.0, lo.1.conn_gen, hi.1.conn_gen);
+            let kinds = nat_pair(a.nat.map(|n| n.kind), b.nat.map(|n| n.kind));
+            if st.punch_seen.insert(key) {
+                let today = utc_day(voc_proto::now_millis() / 1000);
+                add_punch_day(&mut st.punch_days, &today, kinds, ok, ms.min(60_000));
+            }
+        }
         ClientMsg::DirectPeers { ids, video, share_audio } => {
             let Some(u) = st.users.get(&uid) else { return };
             let allowed: HashSet<u32> = u.last_peers.iter().map(|p| p.id).collect();
@@ -2186,7 +2220,9 @@ async fn revocation_loop(state: Shared) {
 /// 每 5 秒把运行状态写进状态文件（`voc-server status` / `voc status` 读）；按天的直连率每分钟存一次（重启不丢）
 async fn status_loop(state: Shared, path: PathBuf, port: u16) {
     let days_path = path.with_file_name(path.file_name().map(|n| n.to_string_lossy().replace(".status.txt", ".p2p-days.txt")).unwrap_or_else(|| "voc.p2p-days.txt".into()));
+    let punch_path = path.with_file_name(path.file_name().map(|n| n.to_string_lossy().replace(".status.txt", ".punch-days.txt")).unwrap_or_else(|| "voc.punch-days.txt".into()));
     state.lock().unwrap().p2p_days = std::fs::read_to_string(&days_path).map(|t| parse_p2p_days(&t)).unwrap_or_default();
+    state.lock().unwrap().punch_days = std::fs::read_to_string(&punch_path).map(|t| parse_punch_days(&t)).unwrap_or_default();
     let mut ticks = 0u32;
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2200,11 +2236,12 @@ async fn status_loop(state: Shared, path: PathBuf, port: u16) {
                 let today = utc_day(voc_proto::now_millis() / 1000);
                 add_p2p_day(&mut st.p2p_days, &today, pairs as u64, direct as u64);
             }
-            (st.status_text(port), (ticks % 12 == 0).then(|| format_p2p_days(&st.p2p_days)))
+            (st.status_text(port), (ticks % 12 == 0).then(|| (format_p2p_days(&st.p2p_days), format_punch_days(&st.punch_days))))
         };
         let _ = std::fs::write(&path, text);
-        if let Some(d) = days {
+        if let Some((d, p)) = days {
             let _ = std::fs::write(&days_path, d);
+            let _ = std::fs::write(&punch_path, p);
         }
     }
 }
@@ -2255,6 +2292,117 @@ fn parse_p2p_days(t: &str) -> Vec<(String, u64, u64)> {
     v.sort_by(|a, b| b.0.cmp(&a.0));
     v.truncate(P2P_DAYS_KEEP);
     v
+}
+
+/// 通知双方「过这么久同时开打」（第 62-2 项）：要比两边到服务器的单程延迟都长，才能都等到同一刻
+const PUNCH_SYNC_MS: u32 = 400;
+
+/// 一天、一种 NAT 组合的打洞结果
+#[derive(Clone, Debug, PartialEq)]
+struct PunchDay {
+    day: String,
+    /// 双方的 NAT 类型（小的在前；0 = 没测出来）
+    kinds: (u8, u8),
+    ok: u64,
+    fail: u64,
+    /// 打通的那些一共用了多少毫秒（算平均用）
+    ok_ms: u64,
+}
+
+fn nat_pair(a: Option<u8>, b: Option<u8>) -> (u8, u8) {
+    let (a, b) = (a.unwrap_or(0).min(9), b.unwrap_or(0).min(9));
+    (a.min(b), a.max(b))
+}
+
+fn nat_short(k: u8) -> &'static str {
+    match k {
+        voc_proto::NAT_OPEN => "公网",
+        voc_proto::NAT_CONE => "锥形",
+        voc_proto::NAT_SYM_PREDICTABLE => "对称可预测",
+        voc_proto::NAT_SYM_RANDOM => "对称随机",
+        _ => "未知",
+    }
+}
+
+fn add_punch_day(days: &mut Vec<PunchDay>, day: &str, kinds: (u8, u8), ok: bool, ms: u32) {
+    let e = match days.iter_mut().find(|d| d.day == day && d.kinds == kinds) {
+        Some(e) => e,
+        None => {
+            days.push(PunchDay { day: day.to_string(), kinds, ok: 0, fail: 0, ok_ms: 0 });
+            days.last_mut().unwrap()
+        }
+    };
+    if ok {
+        e.ok += 1;
+        e.ok_ms += ms as u64;
+    } else {
+        e.fail += 1;
+    }
+    let mut keep: Vec<String> = days.iter().map(|d| d.day.clone()).collect();
+    keep.sort_by(|a, b| b.cmp(a));
+    keep.dedup();
+    keep.truncate(P2P_DAYS_KEEP);
+    days.retain(|d| keep.contains(&d.day));
+}
+
+/// 文件格式：每行「日期 类型 类型 打通 失败 打通总毫秒」
+fn format_punch_days(days: &[PunchDay]) -> String {
+    days.iter().map(|d| format!("{} {} {} {} {} {}\n", d.day, d.kinds.0, d.kinds.1, d.ok, d.fail, d.ok_ms)).collect()
+}
+
+fn parse_punch_days(t: &str) -> Vec<PunchDay> {
+    let mut v: Vec<PunchDay> = t
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() != 6 || f[0].len() != 10 {
+                return None;
+            }
+            let n = |i: usize| f[i].parse::<u64>().ok();
+            let (a, b) = (n(1)?.min(9) as u8, n(2)?.min(9) as u8);
+            Some(PunchDay { day: f[0].to_string(), kinds: (a.min(b), a.max(b)), ok: n(3)?, fail: n(4)?, ok_ms: n(5)? })
+        })
+        .collect();
+    let mut keep: Vec<String> = v.iter().map(|d| d.day.clone()).collect();
+    keep.sort_by(|a, b| b.cmp(a));
+    keep.dedup();
+    keep.truncate(P2P_DAYS_KEEP);
+    v.retain(|d| keep.contains(&d.day));
+    v
+}
+
+/// 「7 天打洞（按 NAT 类型）：锥形×锥形 12/12 平均 1.1 秒 · 锥形×对称随机 3/7 平均 8.0 秒」
+fn punch_days_text(days: &[PunchDay]) -> Option<String> {
+    let mut by: Vec<((u8, u8), u64, u64, u64)> = Vec::new();
+    for d in days {
+        match by.iter_mut().find(|x| x.0 == d.kinds) {
+            Some(x) => {
+                x.1 += d.ok;
+                x.2 += d.fail;
+                x.3 += d.ok_ms;
+            }
+            None => by.push((d.kinds, d.ok, d.fail, d.ok_ms)),
+        }
+    }
+    by.retain(|x| x.1 + x.2 > 0);
+    if by.is_empty() {
+        return None;
+    }
+    by.sort_by_key(|x| std::cmp::Reverse(x.1 + x.2));
+    let parts: Vec<String> = by
+        .iter()
+        .map(|(k, ok, fail, ms)| {
+            let avg = if *ok > 0 { format!(" 平均 {:.1} 秒", *ms as f64 / *ok as f64 / 1000.0) } else { String::new() };
+            format!("{}×{} {}/{}{}", nat_short(k.0), nat_short(k.1), ok, ok + fail, avg)
+        })
+        .collect();
+    let days_n = {
+        let mut d: Vec<&str> = days.iter().map(|d| d.day.as_str()).collect();
+        d.sort();
+        d.dedup();
+        d.len()
+    };
+    Some(format!("{days_n} 天的打洞结果（按双方 NAT 类型，打通 / 总次数）：{}", parts.join(" · ")))
 }
 
 /// 「7 天按天的直连率：11-23 80% · 11-22 75%」（UTC 日期）
@@ -2424,6 +2572,30 @@ async fn udp_loop(state: Shared, sock: Arc<UdpSocket>) {
 #[cfg(test)]
 mod tests {
     use super::is_public;
+
+    #[test]
+    fn punch_days_roundtrip_and_text() {
+        use super::*;
+        let mut d = Vec::new();
+        add_punch_day(&mut d, "2026-11-24", nat_pair(Some(2), Some(4)), true, 3000);
+        add_punch_day(&mut d, "2026-11-24", nat_pair(Some(4), Some(2)), false, 30000);
+        add_punch_day(&mut d, "2026-11-24", nat_pair(Some(2), Some(2)), true, 1000);
+        add_punch_day(&mut d, "2026-11-23", nat_pair(None, Some(2)), true, 500);
+        assert_eq!(d.iter().find(|x| x.kinds == (2, 4)).map(|x| (x.ok, x.fail, x.ok_ms)), Some((1, 1, 3000)), "order of kinds does not matter");
+        let back = parse_punch_days(&format_punch_days(&d));
+        assert_eq!(back, d);
+        let t = punch_days_text(&d).unwrap();
+        assert!(t.starts_with("2 天"), "{t}");
+        assert!(t.contains("锥形×对称随机 1/2 平均 3.0 秒"), "{t}");
+        assert!(t.contains("未知×锥形 1/1"), "{t}");
+        for i in 0..10 {
+            add_punch_day(&mut d, &format!("2026-12-{:02}", i + 1), (2, 2), true, 1);
+        }
+        let mut days: Vec<&String> = d.iter().map(|x| &x.day).collect();
+        days.dedup();
+        assert_eq!(days.len(), P2P_DAYS_KEEP);
+        assert!(parse_punch_days("坏行\n2026-11-01 2 2 x 1 1\n").is_empty());
+    }
 
     #[test]
     fn p2p_days_keep_seven() {

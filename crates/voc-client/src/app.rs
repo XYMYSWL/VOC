@@ -69,6 +69,8 @@ struct Persisted {
     notify: bool,
     /// 外观（第 59 项）：0 跟随系统，1 浅色，2 深色
     theme: u8,
+    /// 配色风格（第 63 项）：theme::STYLES 的下标
+    palette: u8,
     /// 毛玻璃效果（第 59 项，默认关）：窗口背景用 Windows 11 的云母，弹框后面的画面模糊
     glass: bool,
     /// 全局快捷键：闭麦 / 静音（游戏里也有效）
@@ -219,6 +221,7 @@ impl Default for Persisted {
             ptt_tail_ms: 200,
             notify: true,
             theme: 0,
+            palette: 2,
             glass: false,
             mute_key: crate::hotkey::default_key(crate::hotkey::MUTE),
             deafen_key: crate::hotkey::default_key(crate::hotkey::DEAFEN),
@@ -624,6 +627,10 @@ pub struct App {
     /// 中间显示语音房间（否则显示文字聊天，第 59 项）；上次看到的语音频道（换频道时自动打开语音房间）
     room_view: bool,
     room_seen_ch: Option<u32>,
+    /// 120 帧共享时上行 / 编码跟不上（第 64 项）：从什么时候开始不够、提醒文字、通知弹过没有
+    share_bw_low_since: Option<std::time::Instant>,
+    share_bw_warn: Option<String>,
+    share_bw_toasted: bool,
     /// 毛玻璃（第 59 项）：这次启动窗口是透明的（云母）；云母已经设过；弹框后面的模糊背景；等截图回来
     glass_window: bool,
     mica_done: bool,
@@ -877,6 +884,9 @@ impl App {
             key_note: None,
             room_view: true,
             room_seen_ch: None,
+            share_bw_low_since: None,
+            share_bw_warn: None,
+            share_bw_toasted: false,
             glass_window: crate::glass::startup_enabled(),
             mica_done: false,
             glass_backdrop: None,
@@ -1107,8 +1117,55 @@ impl App {
         }
     }
 
+    /// 120 帧共享（第 64 项）：码率比例连续 5 秒低于 70%（上行在降码率）、或者采集 / 发出跟不上 100 帧，就提醒共享者改回 60 帧；
+    /// 通知只弹一次（共享者可能在游戏里看不到窗口），不会自动改帧率
+    fn check_share_bandwidth(&mut self) {
+        let Some(sh) = self.sharer.as_ref().filter(|s| s.cfg.fps > 60) else {
+            self.share_bw_low_since = None;
+            self.share_bw_warn = None;
+            self.share_bw_toasted = false;
+            return;
+        };
+        let st = &sh.stats;
+        let pct = st.rate_pct.load(Ordering::Relaxed);
+        let (cap, sent) = (st.capture_fps.load(Ordering::Relaxed), st.fps.load(Ordering::Relaxed));
+        let started = sh.started.elapsed() > Duration::from_secs(5);
+        let fec = st.fec_pct.load(Ordering::Relaxed);
+        let why = if pct > 0 && pct < 70 {
+            Some(format!("上行带宽不够 120 帧（现在只发得出设定码率的 {pct}%）"))
+        } else if st.congested.load(Ordering::Relaxed) {
+            Some("上行带宽不够 120 帧（发出去的画面在排队，延迟在涨）".to_string())
+        } else if started && fec >= 60 {
+            // 冗余包比例是按观看者报的丢包加的：加到这么高说明他们那边丢得很厉害
+            Some(format!("观看的人那边丢包很多（冗余包已经加到 {fec}%），带宽可能撑不住 120 帧"))
+        } else if started && sent > 0 && sent < 100 && cap >= 100 {
+            Some(format!("编码跟不上 120 帧（现在每秒只发出 {sent} 帧）"))
+        } else {
+            None
+        };
+        match why {
+            Some(w) => {
+                let since = *self.share_bw_low_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(5) {
+                    let text = format!("{w}，建议改回 60 帧");
+                    if !self.share_bw_toasted {
+                        self.share_bw_toasted = true;
+                        crate::applog::log(format!("屏幕共享：{text}"));
+                        crate::notify::toast("VOC 屏幕共享", &text);
+                    }
+                    self.share_bw_warn = Some(text);
+                }
+            }
+            None => {
+                self.share_bw_low_since = None;
+                self.share_bw_warn = None;
+            }
+        }
+    }
+
     /// 全局快捷键按下了：切换闭麦 / 静音，响一声提示（游戏里看不到窗口也知道切成功了）
     fn handle_hotkeys(&mut self) {
+        self.check_share_bandwidth();
         let fired = self.hotkeys.take();
         if fired == 0 {
             return;
@@ -1354,7 +1411,7 @@ impl App {
         if let Some(sh) = &self.sharer {
             let st = &sh.stats;
             line += &format!(
-                "| 共享 鼠标单独发 {} 恢复帧 {} 变化区域 {} 占 {}‰ 冗余 {} 静止跳过 {} 降到 {} {}系统给 {} fps 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} ",
+                "| 共享 鼠标单独发 {} 恢复帧 {} 变化区域 {} 占 {}‰ 冗余 {} 静止跳过 {} 降到 {} {}系统给 {} fps 采集 {} fps 发送 {} fps {} kbps {}x{} 编码器 {:?} 方式 {:?} 错误 {:?} 码率比例 {}% 120帧提醒 {:?} ",
                 st.cursor_separate.load(Ordering::Relaxed),
                 st.ltr_recovers.load(Ordering::Relaxed),
                 st.dirty_last.load(Ordering::Relaxed),
@@ -1371,7 +1428,9 @@ impl App {
                 st.height.load(Ordering::Relaxed),
                 st.encoder.lock().unwrap(),
                 st.pipeline.lock().unwrap(),
-                st.error.lock().unwrap()
+                st.error.lock().unwrap(),
+                st.rate_pct.load(Ordering::Relaxed),
+                self.share_bw_warn
             );
         }
         for (id, v) in &self.views {
@@ -1389,7 +1448,7 @@ impl App {
             // 0.6.2：显卡转颜色、共享者状态、共享声音播放情况
             let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
             line += &format!(
-                "实际显示 {} fps 间隔抖动 {:.1} ms 等着画上屏幕 {:.1} ms 弹出 {} 要补发 {} 片 显卡转颜色 {} 收到 {} fps 显示耗时 {} ms 共享者 {:?} 共享声音 {:?} ",
+                "实际显示 {} fps 间隔抖动 {:.1} ms 等着画上屏幕 {:.1} ms 弹出 {} 要补发 {} 片 显卡转颜色 {} 收到 {} fps 显示耗时 {} ms 每帧解码 {} us 共享者 {:?} 共享声音 {:?} ",
                 v.shown_stats().0,
                 v.shown_stats().1,
                 v.paint_ms,
@@ -1398,6 +1457,7 @@ impl App {
                 f.as_ref().is_some_and(|f| f.nv12.is_some()),
                 v.view.rx_fps.load(Ordering::Relaxed),
                 v.view.show_ms.load(Ordering::Relaxed),
+                v.view.decode_us.load(Ordering::Relaxed),
                 v.view.sharer_info.lock().unwrap().map(|(i, _)| i),
                 self.mixer.lock().unwrap().stream_stats(sid)
             );
@@ -2199,6 +2259,9 @@ impl App {
                         s.user_id = user_id;
                         self.voice.server_rtx.store(features.iter().any(|f| f == voc_proto::FEATURE_VIDEO_RTX), Ordering::Relaxed);
                         voice::SERVER_SHARE_AUDIO_ROUTE.store(features.iter().any(|f| f == voc_proto::FEATURE_SHARE_AUDIO_ROUTE), Ordering::Relaxed);
+                        // VOC_TEST_NO_PUNCH=1：当成旧服务器（对比测试用）
+                        let punch = features.iter().any(|f| f == voc_proto::FEATURE_PUNCH) && std::env::var_os("VOC_TEST_NO_PUNCH").is_none();
+                        voice::SERVER_PUNCH.store(punch, Ordering::Relaxed);
                         crate::applog::log(format!("登录成功：服务器「{server_name}」，功能 {features:?}，NAT 探测端口 {}", if probe_port > 0 { "有" } else { "没有" }));
                         s.features = features;
                         s.server_name = server_name;
@@ -2372,6 +2435,11 @@ impl App {
                     ServerMsg::Peers { peers } => {
                         if let Some(l) = self.voice.current_link() {
                             l.on_peers(peers);
+                        }
+                    }
+                    ServerMsg::PunchAt { peer, in_ms } => {
+                        if let Some(l) = self.voice.current_link() {
+                            l.punch_at(peer, in_ms);
                         }
                     }
                     ServerMsg::Relays { routes } => {
@@ -2649,6 +2717,9 @@ impl App {
         // VOC_THEME=1 浅色 / 2 深色（截图用）
         if let Some(t) = std::env::var("VOC_THEME").ok().and_then(|t| t.parse().ok()) {
             self.cfg.theme = t;
+        }
+        if let Some(t) = std::env::var("VOC_PALETTE").ok().and_then(|t| t.parse().ok()) {
+            self.cfg.palette = t;
         }
         // VOC_GLASS=1：弹框后面的毛玻璃（截图用）
         self.cfg.glass = std::env::var_os("VOC_GLASS").is_some();

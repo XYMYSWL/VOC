@@ -65,6 +65,31 @@ pub fn av1_only(desc: &str) -> bool {
     desc.contains(AV1_ONLY_TAG)
 }
 
+/// 显示器的刷新率（Hz；拿不到时 60）。index = 共享窗口里的显示器序号
+pub fn monitor_refresh(index: usize) -> u32 {
+    windows_capture::monitor::Monitor::from_index(index + 1).ok().and_then(|m| m.refresh_rate().ok()).filter(|r| *r > 1).unwrap_or(60)
+}
+
+/// 某个窗口现在所在的显示器的刷新率
+#[cfg(windows)]
+pub fn window_refresh(hwnd: isize) -> u32 {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    let h = unsafe { MonitorFromWindow(HWND(hwnd as *mut core::ffi::c_void), MONITOR_DEFAULTTONEAREST) };
+    windows_capture::monitor::Monitor::from_raw_hmonitor(h.0).refresh_rate().ok().filter(|r| *r > 1).unwrap_or(60)
+}
+
+/// 这台电脑所有显示器里最高的刷新率（观看端：屏幕能显示多少帧）
+pub fn max_refresh() -> u32 {
+    static R: OnceLock<u32> = OnceLock::new();
+    *R.get_or_init(|| {
+        windows_capture::monitor::Monitor::enumerate()
+            .map(|ms| ms.iter().filter_map(|m| m.refresh_rate().ok()).max().unwrap_or(60))
+            .unwrap_or(60)
+            .max(30)
+    })
+}
+
 /// 本机有 AV1 硬件编码器（没有就不能选「强制 AV1」：没有 AV1 软件编码）
 pub fn can_encode_av1() -> bool {
     hw_encoders().iter().any(|e| e.codec == Codec::Av1)
@@ -168,12 +193,16 @@ impl ShareConfig {
             c.fps = c.fps.min(30);
             c.quality = 0;
         }
+        // 120 帧（试验，第 64 项）只能用 AV1
+        if c.fps > 60 {
+            c.force_av1 = true;
+        }
         c
     }
 
-    /// 低画质层：360P，帧率同原画，标准码率
+    /// 低画质层：360P，帧率同原画（最多 60：120 帧时隔一帧编一帧），标准码率
     pub fn low_layer(&self) -> Self {
-        Self { height: 360, quality: 0, ..self.clone() }
+        Self { height: 360, quality: 0, fps: self.fps.min(60), ..self.clone() }
     }
 
     pub fn desc(&self) -> String {
@@ -201,7 +230,9 @@ impl ShareConfig {
             (_, true) => 5500,
         };
         let mult = QUALITIES.get(self.quality as usize).map(|q| q.1).unwrap_or(1.0);
-        (kbps as f32 * mult) as u32 * 1000
+        // 120 帧：约 60 帧的 1.6 倍（帧间差别更小，不用翻倍）
+        let fps_mult = if self.fps > 60 { 1.6 } else { 1.0 };
+        (kbps as f32 * mult * fps_mult) as u32 * 1000
     }
 
     /// 某种编码格式下的目标码率：同等画质下 HEVC / AV1 需要的码率更低
@@ -1150,6 +1181,8 @@ pub struct Sharer {
     /// 观看者请求关键帧的次数（丢包的信号，码率自适应用）
     key_requests: Arc<AtomicU32>,
     pub stats: Arc<ShareStats>,
+    /// 开始共享的时间（刚开始几秒帧率还没稳，不算跟不上）
+    pub started: std::time::Instant,
 }
 
 impl Sharer {
@@ -1207,7 +1240,7 @@ impl Sharer {
             .name("video-encode".into())
             .spawn(move || encode_loop(c2, rx, st, fk, sp, stx, gpu, kr, wc))
             .map_err(|e| e.to_string())?;
-        Ok(Self { cfg, state, stop, force_key, key_requests, stats })
+        Ok(Self { cfg, state, stop, force_key, key_requests, stats, started: std::time::Instant::now() })
     }
 
     pub fn request_keyframe(&self) {
@@ -1362,6 +1395,8 @@ fn encode_loop(
 ) {
     let pref = cfg.encoder.clone();
     let force_av1 = cfg.force_av1;
+    let mut tick_no: u64 = 0;
+    let enc_fps = cfg.fps;
     let (main_bps, low_bps) = (cfg.bitrate(), cfg.low_layer().bitrate());
     let (cfg_auto_res, cfg_height, cfg_delay_bwe) = (cfg.auto_res, cfg.height, cfg.delay_bwe);
     // 冗余校验包：按观看者请求补发的比例（≈丢包率）决定每几片加一个校验包，0 = 不加
@@ -1419,7 +1454,10 @@ fn encode_loop(
         let key = new_watcher || requested || last_key.elapsed() > periodic;
         // 两层：原画给大多数人，360P 低画质层给选了「流畅」的人；哪层没人看就不编码
         let (main_ids, low_ids) = (link.layer_watchers(false), link.layer_watchers(true));
-        let (want_main, want_low) = (!main_ids.is_empty(), !low_ids.is_empty());
+        let (want_main, want_low_layer) = (!main_ids.is_empty(), !low_ids.is_empty());
+        // 120 帧时低画质层最多 60 帧：隔一帧编一帧（关键帧照编）
+        tick_no = tick_no.wrapping_add(1);
+        let want_low = want_low_layer && (enc_fps <= 60 || tick_no % 2 == 0 || key);
         stats.low_watchers.store(low_ids.len() as u32, Ordering::Relaxed);
         // 长期参考帧（原画层、编码器支持时）：关键帧存进槽 0；定期存新的；有人丢帧就发恢复帧
         if want_main && enc.ltr_supported() {
@@ -1770,6 +1808,8 @@ pub struct View {
     /// 观看端这一秒：收到完整的帧、解码失败 / 等不到放弃的帧、从收到到显示的平均耗时（ms）
     pub rx_fps: AtomicU32,
     pub show_ms: AtomicU32,
+    /// 平均每帧解码耗时（微秒，含从显卡拷回内存；测试日志用）
+    pub decode_us: AtomicU32,
     /// 弹出成独立窗口时那个窗口的编号：新帧到了直接唤醒它，不唤醒主窗口（第 56-b 项）
     pub repaint_target: Mutex<Option<eframe::egui::ViewportId>>,
     /// 播放方式（第 36 项）：true = 流畅优先（默认）：帧成串到达时按原来的间隔匀速显示，缓冲自动伸缩（网络稳时一两帧）；
@@ -2027,6 +2067,9 @@ fn make_decoder(codec: Codec, hw: bool, w: u32, h: u32) -> Option<Dec> {
 fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: Option<eframe::egui::Context>) {
     let mut dec: Option<(Codec, bool, (u32, u32), Dec)> = None;
     let (mut sec_start, mut sec_frames) = (Instant::now(), 0u32);
+    let (mut sec_dec, mut sec_dec_n) = (Duration::ZERO, 0u32);
+    // 上一帧（不管显没显示）的截屏时间
+    let mut prev_cap: Option<u32> = None;
     // 这一秒收到了几帧、显示的帧从交给解码到显示一共等了多久
     let (mut sec_rx, mut sec_show) = (0u32, Duration::ZERO);
     let mut spare: Vec<u8> = Vec::new();
@@ -2059,6 +2102,16 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
         let smooth = view.smooth.load(Ordering::Relaxed);
         for (i, (cid, bits, cap)) in batch.iter().enumerate() {
             let cap = *cap;
+            // 帧里有截屏时间时，帧间隔按相邻两帧的截屏时间估（第 56-c 项：网络一串一串到时，按到达时间估会被带偏）。
+            // 要按收到的每一帧算，不能按显示出来的帧算：跳过一帧间隔就估成两倍、放得更慢、跳得更多，120 帧时会一路掉到一半（第 64 项）
+            if let (Some(c), Some(pc)) = (cap, prev_cap) {
+                let dt = (c.wrapping_sub(pc) as f32).clamp(4.0, 100.0) / 1000.0;
+                let est = interval.as_secs_f32() * 0.9 + dt * 0.1;
+                interval = Duration::from_secs_f32(est.clamp(0.004, 0.1));
+            }
+            if cap.is_some() {
+                prev_cap = cap;
+            }
             let codec = Codec::from_id(*cid);
             let Some((w0, h0, bits)) = split_dims(codec, bits) else { continue };
             let hw = HW_DECODE.load(Ordering::Relaxed) && !hw_broken;
@@ -2081,13 +2134,7 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
                     fill(&mut rgba);
                 }
                 if smooth {
-                    // 按估计的帧间隔匀速放（略快一点，缓冲会慢慢消掉、延迟不会越积越多）。
-                    // 帧里有截屏时间时，帧间隔按截屏时间估（第 56-c 项）：网络一串一串到时，按到达时间估会被带偏
-                    if let (Some(c), Some((lc, _))) = (cap, last_cap) {
-                        let dt = (c.wrapping_sub(lc) as f32).clamp(5.0, 100.0) / 1000.0;
-                        let est = interval.as_secs_f32() * 0.9 + dt * 0.1;
-                        interval = Duration::from_secs_f32(est.clamp(0.005, 0.1));
-                    }
+                    // 按估计的帧间隔匀速放（略快一点，缓冲会慢慢消掉、延迟不会越积越多）。帧间隔在下面按每一帧的截屏时间估
                     if let Some(p) = next_present {
                         let now = Instant::now();
                         if p > now {
@@ -2120,7 +2167,13 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
                     Ok(_) => {}
                     Err(_) => view.decode_failed.store(true, Ordering::Relaxed),
                 },
-                Dec::Mf(m) => match m.decode(bits) {
+                Dec::Mf(m) => match {
+                    let t = Instant::now();
+                    let r = m.decode(bits);
+                    sec_dec += t.elapsed();
+                    sec_dec_n += 1;
+                    r
+                } {
                     Ok(mut frames) => {
                         if !frames.is_empty() {
                             hw_fails = 0;
@@ -2153,6 +2206,8 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
             view.fps.store((sec_frames as f64 / secs).round() as u32, Ordering::Relaxed);
             view.rx_fps.store((sec_rx as f64 / secs).round() as u32, Ordering::Relaxed);
             view.show_ms.store((sec_show.as_secs_f64() * 1000.0 / sec_frames.max(1) as f64).round() as u32, Ordering::Relaxed);
+            view.decode_us.store((sec_dec.as_micros() as u64 / sec_dec_n.max(1) as u64) as u32, Ordering::Relaxed);
+            (sec_dec, sec_dec_n) = (Duration::ZERO, 0);
             (sec_start, sec_frames, sec_rx, sec_show) = (Instant::now(), 0, 0, Duration::ZERO);
         }
     }
