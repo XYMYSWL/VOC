@@ -44,9 +44,15 @@ fn flag_path() -> Option<PathBuf> {
     crate::applog::data_dir().map(|d| d.join("glass.on"))
 }
 
-/// 这次启动要不要做透明窗口 + 云母（开关打开过、系统支持）
+/// 这次启动要不要做透明窗口 + 云母（开关打开过、系统支持）。
+/// 第 76 项：先停用。透明窗口用默认的显卡接口（Vulkan）画时，拖动 / 放大窗口后有一块原来窗口大小的亮灰色方块，
+/// 重设云母、扩展边框都没用；换成 DX12 不出灰块，但 DX12 不支持透明，云母本来就透不出来。所以毛玻璃只留「弹框后面模糊」。
+/// VOC_TEST_MICA=1 时照旧打开（以后找到修法时测试用）
 pub fn startup_enabled() -> bool {
-    std::env::var_os("VOC_SHOT").is_none() && mica_supported() && flag_path().is_some_and(|p| p.exists())
+    std::env::var_os("VOC_TEST_MICA").is_some()
+        && std::env::var_os("VOC_SHOT").is_none()
+        && mica_supported()
+        && flag_path().is_some_and(|p| p.exists())
 }
 
 /// 开关改了：记下来，下次启动用
@@ -59,19 +65,27 @@ pub fn remember(on: bool) {
     }
 }
 
-/// 给窗口打开云母背景
+/// 给窗口打开云母背景。dark：深色界面用深色云母（不设的话系统按浅色画，透过半透明的深色面板是一片发灰）。
+/// 第 76 项：只设背景类型时，云母只铺在窗口创建时那么大的地方，拖动 / 放大后有一块亮灰色的方块；
+/// 按微软的用法把边框扩展到整个窗口（-1 边距），并在窗口移动、改大小后重新设一次（见 ui.rs）
 #[cfg(windows)]
-pub fn apply_mica(hwnd: isize) -> bool {
+pub fn apply_mica(hwnd: isize, dark: bool) -> bool {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE};
+    use windows::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    use windows::Win32::UI::Controls::MARGINS;
+    let h = HWND(hwnd as *mut core::ffi::c_void);
     let kind: i32 = 2; // DWMSBT_MAINWINDOW = 云母
+    let dark: i32 = dark as i32;
+    let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
     unsafe {
-        DwmSetWindowAttribute(HWND(hwnd as *mut core::ffi::c_void), DWMWA_SYSTEMBACKDROP_TYPE, &kind as *const i32 as *const _, 4).is_ok()
+        let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const _, 4);
+        let _ = DwmExtendFrameIntoClientArea(h, &m);
+        DwmSetWindowAttribute(h, DWMWA_SYSTEMBACKDROP_TYPE, &kind as *const i32 as *const _, 4).is_ok()
     }
 }
 
 #[cfg(not(windows))]
-pub fn apply_mica(_hwnd: isize) -> bool {
+pub fn apply_mica(_hwnd: isize, _dark: bool) -> bool {
     false
 }
 

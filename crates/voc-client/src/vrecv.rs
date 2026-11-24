@@ -192,6 +192,8 @@ pub struct Assembler {
     /// 放弃以后还晚到了多久（ms，取最近的较大值、慢慢回落）：加进放弃时限。
     /// 往返估计只看「到服务器的 ping」时，「共享者→服务器→我」整条路慢很多就会过早放弃、一直要关键帧
     late_extra_ms: f32,
+    /// 观看端开了缓冲（第 78 项）：缓冲多长（ms）。缓冲里来得及补回来的帧就多等等补发，不急着放弃、要恢复帧
+    hold_ms: f32,
 }
 
 /// 记住最近放弃的多少帧
@@ -216,6 +218,7 @@ impl Default for Assembler {
             spread_ms: 20.0,
             gave_up: VecDeque::new(),
             late_extra_ms: 0.0,
+            hold_ms: 0.0,
         }
     }
 }
@@ -238,6 +241,11 @@ impl Assembler {
         self.rtt_hint = ms as f32;
     }
 
+    /// 观看端的缓冲长度（ms，0 = 没开，第 78 项）
+    pub fn set_hold_ms(&mut self, ms: u32) {
+        self.hold_ms = ms as f32;
+    }
+
     /// 当前用的往返时间估计（ms）
     pub fn rtt(&self) -> f32 {
         self.rtt_ms.max(self.rtt_hint)
@@ -257,7 +265,9 @@ impl Assembler {
     /// 以前放弃得太早（放弃后它的包还到了）就多等那么久
     fn give_up_after(&self, rtx: bool) -> Duration {
         if rtx {
-            Duration::from_millis((self.rtt() * 2.0 + 100.0 + self.late_extra_ms).clamp(150.0, 1500.0) as u64)
+            // 开了缓冲：至少等到缓冲快用完（第 78 项）
+            let ms = (self.rtt() * 2.0 + 100.0 + self.late_extra_ms).max(self.hold_ms * 0.9);
+            Duration::from_millis(ms.clamp(150.0, 1500.0) as u64)
         } else {
             NO_RTX_WAIT + Duration::from_millis(self.late_extra_ms.min(300.0) as u64)
         }
@@ -448,7 +458,9 @@ impl Assembler {
             break;
         }
         if let Some(p) = self.pending.get(&next) {
-            if !p.complete() && next != self.newest && now.duration_since(p.first).as_secs_f32() * 1000.0 > self.rtt() * 1.2 + 40.0 {
+            // 开了缓冲时补发来得及就先不要恢复帧（第 78 项）
+            let stall_ms = (self.rtt() * 1.2 + 40.0).max(self.hold_ms * 0.6);
+            if !p.complete() && next != self.newest && now.duration_since(p.first).as_secs_f32() * 1000.0 > stall_ms {
                 out.stalled = Some(next);
             }
         }
@@ -460,6 +472,7 @@ impl Assembler {
             let retry = self.retry_after();
             let tail_wait = self.tail_wait();
             let rtt = self.rtt();
+            let hold = self.hold_ms;
             let newest = self.newest;
             let span = newest.wrapping_sub(next);
             if span < MAX_AHEAD + 1 {
@@ -480,7 +493,7 @@ impl Assembler {
                         continue;
                     }
                     // 补发回来时已经过了播放时限：不要了（等放弃后从恢复帧 / 关键帧接上）
-                    if now.duration_since(p.first).as_secs_f32() * 1000.0 + rtt > PLAY_DEADLINE_MS {
+                    if now.duration_since(p.first).as_secs_f32() * 1000.0 + rtt > PLAY_DEADLINE_MS.max(hold) {
                         continue;
                     }
                     let miss = p.missing();

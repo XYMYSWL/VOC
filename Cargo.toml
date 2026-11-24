@@ -5,7 +5,7 @@ members = ["crates/voc-proto", "crates/voc-server", "crates/voc-client", "crates
 exclude = ["crates/deep_filter"]
 
 [workspace.package]
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/XYMYSWL/VOC"

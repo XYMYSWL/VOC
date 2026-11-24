@@ -101,6 +101,9 @@ struct Persisted {
     hw_decode: bool,
     /// 观看屏幕共享：流畅优先（匀速播放，默认）/ 延迟优先
     smooth_playback: bool,
+    /// 观看缓冲（第 78 项）：0 关（默认）/ 1 自动 / 2 固定；最多缓冲多少毫秒（用户自己设）
+    view_buffer_mode: u8,
+    view_buffer_max_ms: u32,
     /// 0.5.1 起默认硬解：老配置里的「软解」迁移一次（老配置没有这个字段 → false → 迁移）
     #[serde(default)]
     hw_decode_migrated: bool,
@@ -248,6 +251,8 @@ impl Default for Persisted {
             last_channel: HashMap::new(),
             hw_decode: true,
             smooth_playback: true,
+            view_buffer_mode: 0,
+            view_buffer_max_ms: 300,
             hw_decode_migrated: true,
             auto_update: true,
             update_accel: false,
@@ -672,7 +677,10 @@ pub struct App {
     chat_search_jump: bool,
     /// 毛玻璃（第 59 项）：这次启动窗口是透明的（云母）；云母已经设过；弹框后面的模糊背景；等截图回来
     glass_window: bool,
-    mica_done: bool,
+    /// 上次设云母时的窗口位置大小、是不是深色（变了就重新设，第 76 项）
+    mica_key: Option<(Option<[i32; 4]>, bool)>,
+    /// 正在给哪些人的共享声音加额外缓冲（第 78 项；不看了要清掉）
+    share_av_ids: std::collections::HashSet<u32>,
     glass_backdrop: Option<crate::glass::Backdrop>,
     glass_pending: Option<std::time::Instant>,
     glass_shot: Arc<Mutex<Option<egui::ColorImage>>>,
@@ -730,6 +738,8 @@ pub(crate) struct ViewInfo {
 pub(crate) struct ViewOut {
     pub relayer: bool,
     pub smooth: Option<bool>,
+    /// 改了观看缓冲（第 78 项）：(档位, 最多毫秒)，记进设置
+    pub buffer: Option<(u8, u32)>,
     pub go_full: bool,
     pub toggle_pop: bool,
     pub close: bool,
@@ -737,7 +747,7 @@ pub(crate) struct ViewOut {
 
 impl ViewOut {
     pub fn any(&self) -> bool {
-        self.relayer || self.smooth.is_some() || self.go_full || self.toggle_pop || self.close
+        self.relayer || self.smooth.is_some() || self.buffer.is_some() || self.go_full || self.toggle_pop || self.close
     }
 }
 
@@ -877,6 +887,16 @@ impl App {
         }
         video::HW_DECODE.store(cfg.hw_decode, Ordering::Relaxed);
         video::SMOOTH_PLAYBACK.store(cfg.smooth_playback, Ordering::Relaxed);
+        video::BUFFER_MODE.store(cfg.view_buffer_mode.min(2), Ordering::Relaxed);
+        video::BUFFER_MAX_MS.store(cfg.view_buffer_max_ms.clamp(video::BUFFER_RANGE_MS.0, video::BUFFER_RANGE_MS.1), Ordering::Relaxed);
+        // 测试：VOC_TEST_BUFFER=档位,毫秒（例如 1,300 = 自动、最多 300 ms）
+        if let Some((m, ms)) = std::env::var("VOC_TEST_BUFFER").ok().and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.parse::<u8>().ok()?, b.parse::<u32>().ok()?))
+        }) {
+            video::BUFFER_MODE.store(m.min(2), Ordering::Relaxed);
+            video::BUFFER_MAX_MS.store(ms, Ordering::Relaxed);
+        }
         audio::LOW_LATENCY_DEVICE.store(cfg.low_latency_device, Ordering::Relaxed);
         voice.video.set_ctx(cc.egui_ctx.clone()); // 收到新视频帧时唤醒界面
         let (frames_tx, frames_rx) = mpsc::sync_channel(100);
@@ -946,7 +966,8 @@ impl App {
             chat_search_hit: 0,
             chat_search_jump: false,
             glass_window: crate::glass::startup_enabled(),
-            mica_done: false,
+            mica_key: None,
+            share_av_ids: Default::default(),
             glass_backdrop: None,
             glass_pending: None,
             glass_shot: Default::default(),
@@ -1580,6 +1601,14 @@ impl App {
                 v.view.decode_us.load(Ordering::Relaxed),
                 v.view.sharer_info.lock().unwrap().map(|(i, _)| i),
                 self.mixer.lock().unwrap().stream_stats(sid)
+            );
+            // 0.6.6 第 78 项：观看缓冲
+            line += &format!(
+                "缓冲 {} ms 画面多等 {} ms 画面停顿累计 {} 声音额外缓冲 {:.0} ms ",
+                v.view.buffer_ms.load(Ordering::Relaxed),
+                v.view.av_wait_ms.load(Ordering::Relaxed),
+                v.view.stalls.load(Ordering::Relaxed),
+                self.mixer.lock().unwrap().extra_delay(sid)
             );
         }
         if self.share_audio_src.is_some() {
@@ -2850,6 +2879,7 @@ impl App {
         s.chat_input = String::new();
         self.screen = Screen::Main(Box::new(s));
         self.show_settings = kind == "settings";
+        self.show_share = kind == "share";
         self.settings_tab = std::env::var("VOC_TAB").ok().and_then(|t| t.parse().ok()).unwrap_or(0);
         // VOC_THEME=1 浅色 / 2 深色（截图用）
         if let Some(t) = std::env::var("VOC_THEME").ok().and_then(|t| t.parse().ok()) {
@@ -2884,6 +2914,15 @@ impl App {
     fn demo_screenshot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.demo.shot.clone() else { return };
         self.demo.frames += 1;
+        // VOC_SHOT_SIZE=宽x高：截图前把窗口改成这个大小（测试窄 / 矮窗口的排版）
+        if self.demo.frames == 2 {
+            if let Some((w, h)) = std::env::var("VOC_SHOT_SIZE").ok().and_then(|v| {
+                let (w, h) = v.split_once('x')?;
+                Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))
+            }) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+            }
+        }
         if self.demo.frames >= 30 && !self.demo.shot_requested {
             self.demo.shot_requested = true;
             let c = ctx.clone();

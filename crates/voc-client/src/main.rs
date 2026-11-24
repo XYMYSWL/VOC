@@ -89,9 +89,18 @@ fn main() -> eframe::Result {
         viewport = viewport.with_visible(false);
     }
     // 毛玻璃（第 59 项）：窗口要创建时就透明，云母背景才透得出来
+    // VOC_SHOT_SIZE=宽x高：截图时的窗口大小（测试窄 / 矮窗口的排版）
+    if let Some((w, h)) = std::env::var("VOC_SHOT_SIZE").ok().and_then(|v| {
+        let (w, h) = v.split_once('x')?;
+        Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))
+    }) {
+        viewport = viewport.with_inner_size([w, h]);
+    }
     if glass::startup_enabled() {
         viewport = viewport.with_transparent(true);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // 截图指定了窗口大小时不用上次记住的窗口大小
+    let persist_window = std::env::var_os("VOC_SHOT_SIZE").is_none();
+    let options = eframe::NativeOptions { viewport, persist_window, ..Default::default() };
     eframe::run_native("voc", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
 }

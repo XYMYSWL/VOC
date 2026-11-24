@@ -418,6 +418,8 @@ struct Stream {
     stats: StreamStats,
     /// 放大后的限幅器（第 57 项）：音量 > 100% 时不再把峰值削平
     limiter: Limiter,
+    /// 额外多缓冲多久（ms）：观看屏幕共享开了缓冲时，共享声音跟着画面晚这么多（第 78 项，音画同步）
+    extra_ms: f32,
 }
 
 impl Stream {
@@ -440,13 +442,32 @@ impl Stream {
             last_out: [0.0; 2],
             stats: StreamStats::default(),
             limiter: Limiter::new(LIMIT_THRESHOLD),
+            extra_ms: 0.0,
         }
     }
 
     fn prebuffer(&self) -> usize {
         match self.kind {
             Kind::Local => LOCAL_PREBUFFER,
-            _ => ms_to_samples(self.jitter.target_ms()),
+            _ => ms_to_samples(self.jitter.target_ms() + self.extra_ms),
+        }
+    }
+
+    /// 改额外缓冲（第 78 项）。差得不多靠稍微变速慢慢跟上；一下子加了很多：淡出、静音一段攒够再淡入（和画面开缓冲那一下同时）；
+    /// 一下子减了很多：丢掉多出来的那段（旧的淡出、新的淡入），不让声音落在画面后面
+    fn set_extra(&mut self, ms: f32) {
+        let old = self.extra_ms;
+        self.extra_ms = ms;
+        if ms > old + 40.0 && self.playing {
+            self.playing = false;
+            self.tail = self.last_out;
+        } else if ms < old - 40.0 {
+            let drop = ms_to_samples(old - ms).min(self.buf.len().saturating_sub(3));
+            if drop > 0 {
+                self.buf.drain(..drop);
+                self.tail = self.last_out;
+                self.gain = 0.0;
+            }
         }
     }
 
@@ -528,6 +549,8 @@ pub struct Mixer {
     volumes: HashMap<u32, f32>,
     /// 暂时不播的通道（例如正在看某人带声音的屏幕共享时，他的伴奏已经在共享声音里了）
     suppressed: std::collections::HashSet<u32>,
+    /// 各路声音额外多缓冲多久（ms，第 78 项）：这一路还没开始时先记着
+    extra: HashMap<u32, f32>,
 }
 
 impl Mixer {
@@ -545,7 +568,12 @@ impl Mixer {
         } else {
             Kind::Voice
         };
-        let s = self.streams.entry(user).or_insert_with(|| Stream::new(kind));
+        let extra = self.extra.get(&user).copied().unwrap_or(0.0);
+        let s = self.streams.entry(user).or_insert_with(|| {
+            let mut s = Stream::new(kind);
+            s.extra_ms = extra;
+            s
+        });
         if let Some(last) = s.last_seq {
             // 乱序/重复包直接丢弃（距离太远则视为重新开始）
             if !seq_newer(seq, last) && last.wrapping_sub(seq) < 100 {
@@ -600,7 +628,7 @@ impl Mixer {
     pub fn stream_stats(&self, user: u32) -> Option<StreamStats> {
         self.streams.get(&user).map(|s| StreamStats {
             buffered_ms: (s.buf.len() as f32 * 1000.0 / SAMPLE_RATE as f32).round() as u32,
-            target_ms: s.jitter.target_ms().round() as u32,
+            target_ms: (s.jitter.target_ms() + s.extra_ms).round() as u32,
             limited_recently: s.limiter.limited_within(std::time::Duration::from_secs(2)),
             ..s.stats
         })
@@ -616,6 +644,27 @@ impl Mixer {
     /// 某人当前的抖动缓冲目标（ms），显示延迟用
     pub fn buffer_ms(&self, user: u32) -> Option<u32> {
         self.streams.get(&user).map(|s| s.jitter.target_ms().round() as u32)
+    }
+
+    /// 某一路声音额外多缓冲多久（ms，0 = 不额外缓冲；第 78 项：共享声音跟着画面的缓冲，音画同步）
+    pub fn set_extra_delay(&mut self, user: u32, ms: f32) {
+        if ms <= 0.0 {
+            self.extra.remove(&user);
+        } else {
+            self.extra.insert(user, ms);
+        }
+        if let Some(s) = self.streams.get_mut(&user) {
+            s.set_extra(ms.max(0.0));
+        }
+    }
+
+    pub fn extra_delay(&self, user: u32) -> f32 {
+        self.extra.get(&user).copied().unwrap_or(0.0)
+    }
+
+    /// 某一路自己的抖动缓冲目标（ms，不含额外缓冲）
+    pub fn base_buffer_ms(&self, user: u32) -> Option<f32> {
+        self.streams.get(&user).map(|s| s.jitter.target_ms())
     }
 
     pub fn set_volume(&mut self, user: u32, v: f32) {
@@ -1506,5 +1555,36 @@ mod tests {
         let len = m.streams[&9].buf.len();
         assert!(len <= ms_to_samples(m.streams[&9].jitter.target_ms() + JB_EXCESS_MS), "{len}");
         assert_eq!(m.stream_stats(9).unwrap().drops, 1);
+    }
+
+    /// 第 78 项：共享声音跟着画面的缓冲加额外延迟。一下子加很多：先停下攒够再播；一下子减很多：丢掉多出来的；还没开始的那一路先记着
+    #[test]
+    fn share_audio_extra_delay() {
+        let mut m = Mixer::default();
+        let sid = SHARE_FLAG | 5;
+        m.set_extra_delay(sid, 200.0);
+        let f = vec![1000i16; FRAME_SAMPLES];
+        m.push(sid, 0, &f);
+        let st = m.stream_stats(sid).unwrap();
+        assert!(st.target_ms >= 270, "{st:?}"); // 共享声音自己最少 70 ms + 额外 200 ms
+        // 攒够目标才开始播
+        for seq in 1..20u16 {
+            m.push(sid, seq, &f);
+        }
+        let s = &m.streams[&sid];
+        assert!(s.buf.len() >= ms_to_samples(250.0));
+        for _ in 0..10 {
+            m.next_frame();
+        }
+        assert!(m.streams[&sid].playing);
+        // 关掉缓冲：多出来的 200 ms 直接丢掉，不让声音落在画面后面
+        let before = m.streams[&sid].buf.len();
+        m.set_extra_delay(sid, 0.0);
+        let after = m.streams[&sid].buf.len();
+        assert!(before - after >= ms_to_samples(190.0), "{before} -> {after}");
+        // 再加回来：停下、攒够再播
+        m.set_extra_delay(sid, 150.0);
+        assert!(!m.streams[&sid].playing);
+        assert_eq!(m.extra_delay(sid), 150.0);
     }
 }

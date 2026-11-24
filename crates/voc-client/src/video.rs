@@ -13,7 +13,7 @@ use openh264::encoder::{BitRate, Complexity, Encoder, EncoderConfig, FrameRate, 
 use openh264::formats::{YUVBuffer, YUVSource};
 use openh264::OpenH264API;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -23,6 +23,11 @@ use voc_proto::udp::{self, VIDEO_KEY};
 pub static HW_DECODE: AtomicBool = AtomicBool::new(false);
 /// 新开的观看窗口默认的播放方式：true = 流畅优先（默认），false = 延迟优先（设置里记住上次的选择）
 pub static SMOOTH_PLAYBACK: AtomicBool = AtomicBool::new(true);
+/// 观看缓冲（第 78 项）：0 = 关（默认），1 = 自动，2 = 固定。所有观看窗口共用，随时生效
+pub static BUFFER_MODE: AtomicU8 = AtomicU8::new(0);
+/// 最多缓冲多少毫秒（用户自己设，50～1000）：「自动」在 60 ms 和它之间调，「固定」就用它
+pub static BUFFER_MAX_MS: AtomicU32 = AtomicU32::new(300);
+pub const BUFFER_RANGE_MS: (u32, u32) = (50, 1000);
 
 // ------------------------------------------------------------ 配置
 
@@ -782,8 +787,8 @@ struct CapFlags {
 
 struct CapHandler {
     flags: CapFlags,
-    /// 下一帧的预定时间（按时间表限帧）
-    next_due: Option<Instant>,
+    /// 限帧（攒额度，见 Pacer）
+    pacer: Pacer,
     /// 这一秒：(开始, 收下的帧, 系统给的帧)
     sec: (Instant, u32, u32),
     scratch: Vec<u8>,
@@ -795,19 +800,35 @@ struct CapHandler {
     skipped: u32,
 }
 
-/// 按时间表限帧：下一帧的预定时间 = 上一帧的**预定**时间 + 间隔（不是实际收到的时间 + 间隔）。
-/// 系统给帧的时间是一格一格的（对齐显示器刷新、只在画面变化时给），「离上一帧太近就丢」每次都要多等一格，
-/// 实际帧率总比所选的低（选 30 只有 20 多、选 60 只有 50 多）；按时间表取，早一点晚一点互相抵消，平均正好是所选帧率。
-/// 提前半个间隔以内到的也收；落后超过一个间隔（画面静止了一阵）就从现在重新排，不会一下子补一串。
-fn pace_accept(next_due: &mut Option<Instant>, now: Instant, interval: Duration) -> bool {
-    let due = match *next_due {
-        None => now,
-        Some(d) if now + interval / 2 < d => return false,
-        Some(d) if now > d + interval => now,
-        Some(d) => d,
-    };
-    *next_due = Some(due + interval);
-    true
+/// 限帧：按所选帧率攒「额度」，收一帧扣一个（第 72 项，代替第 48 项的「按时间表」）。
+/// 系统给帧不均匀：只在画面变化时给、对齐显示器刷新，播视频 / 看网页时常常两帧挨得很近、然后空一大段。
+/// 按时间表取会丢掉挨得近的那帧、空的那段又没帧可补（系统给 68 帧只采到 46 帧）；攒额度的话空着的那段攒下的额度能用在后面挨得近的帧上：
+/// 系统给的比所选少时全收，比所选多时平均正好是所选帧率。最多攒 PACE_BURST 帧（画面静止一阵后不会一下子收一串）；
+/// 额度差一点（早到不到 PACE_EARLY 个间隔）也收，免得线程调度抖动让正好按所选帧率来的帧被丢。
+#[derive(Default)]
+struct Pacer {
+    credit: f64,
+    last: Option<Instant>,
+}
+
+const PACE_BURST: f64 = 3.0;
+const PACE_EARLY: f64 = 0.25;
+
+impl Pacer {
+    fn accept(&mut self, now: Instant, interval: Duration) -> bool {
+        let iv = interval.as_secs_f64().max(1e-4);
+        self.credit = match self.last {
+            None => 1.0,
+            Some(t) => (self.credit + now.saturating_duration_since(t).as_secs_f64() / iv).min(PACE_BURST),
+        };
+        self.last = Some(now);
+        if self.credit >= 1.0 - PACE_EARLY {
+            self.credit -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// 变化面积小于这个比例（千分之几）算「变化很小」（时钟、托盘图标、光标、打字）
@@ -831,7 +852,7 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
     fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
             flags: ctx.flags,
-            next_due: None,
+            pacer: Pacer::default(),
             sec: (Instant::now(), 0, 0),
             scratch: Vec::new(),
             side: Default::default(),
@@ -850,7 +871,7 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
             control.stop();
             return Ok(());
         }
-        // 按时间表限帧（平均正好是所选帧率，见 pace_accept）
+        // 限帧（平均正好是所选帧率，见 Pacer）
         let now = Instant::now();
         self.sec.2 += 1;
         if self.sec.0.elapsed() >= Duration::from_secs(1) {
@@ -861,7 +882,7 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CapHandler {
             self.sec = (now, 0, 0);
             self.skipped = 0;
         }
-        if !pace_accept(&mut self.next_due, now, self.flags.interval) {
+        if !self.pacer.accept(now, self.flags.interval) {
             return Ok(());
         }
         self.sec.1 += 1;
@@ -968,7 +989,7 @@ impl CaptureCfg {
             cursor,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
-            // 系统这边只挡住远超所选帧率的部分，具体取哪帧由 pace_accept 按时间表决定（两道门槛叠加会少帧）
+            // 系统这边只挡住远超所选帧率的部分，具体取哪帧由 Pacer 决定（两道门槛叠加会少帧）
             min_iv,
             dirty,
             ColorFormat::Bgra8,
@@ -1819,6 +1840,104 @@ pub struct View {
     /// 播放方式（第 36 项）：true = 流畅优先（默认）：帧成串到达时按原来的间隔匀速显示，缓冲自动伸缩（网络稳时一两帧）；
     /// false = 延迟优先：到了就显示，积压时直接跳到最新一帧（0.5.x 的做法）
     pub smooth: AtomicBool,
+    /// 观看缓冲（第 78 项）：现在缓冲多长（ms，0 = 没开）；画面比到达多等了多久（ms，平均，共享声音跟着延迟这么多来对齐）
+    pub buffer_ms: AtomicU32,
+    pub av_wait_ms: AtomicU32,
+    /// 画面停住超过 150 ms 的次数（累计；测试日志 / 对比用）
+    pub stalls: AtomicU32,
+}
+
+/// 观看缓冲（第 78 项）：按共享者的截屏时间排播放。每一帧在「截屏时间 + 基准 + 缓冲」那一刻显示：
+/// 基准 = 最近 10 秒里「到达时间 − 截屏时间」的最小值（网络最快那次的单程 + 两台电脑的时钟差）。
+/// 停顿不超过缓冲长度时，补发 / 恢复帧来得及，画面照常匀速走；超过了就晚一点显示，「自动」档顺便把缓冲加长一点。
+pub(crate) struct Playout {
+    origin: Instant,
+    /// 最近 10 秒的 (到达时间 ms, 到达 − 截屏 ms)
+    samples: std::collections::VecDeque<(f64, f64)>,
+    base: Option<f64>,
+    /// 现在的缓冲长度（ms）
+    pub delay_ms: f64,
+    /// 上次有帧来晚的时间（ms，自动档用）；上次往回减缓冲的时间
+    last_late: f64,
+    last_decay: f64,
+    mode: u8,
+}
+
+/// 自动档：最少缓冲多少、一开始多少；一切顺利多久之后开始往回减、每秒减多少（共享声音每秒最多跟 5 ms，减得比它慢）。
+/// 本机测（往返 90 ms、丢包 40%、抖动 80 ms）：卡一次只加到刚好接住、5 秒后就减的话，同样的停顿过一会儿又来；
+/// 所以加到这次停顿的 1.5 倍、稳 15 秒才开始减
+const AUTO_MIN_MS: f64 = 60.0;
+const AUTO_START_MS: f64 = 150.0;
+const AUTO_CALM_MS: f64 = 15_000.0;
+const AUTO_DECAY_PER_S: f64 = 3.0;
+const AUTO_GROW: f64 = 1.5;
+
+impl Playout {
+    pub(crate) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            samples: Default::default(),
+            base: None,
+            delay_ms: 0.0,
+            last_late: 0.0,
+            last_decay: 0.0,
+            mode: 0,
+        }
+    }
+
+    fn ms(&self, t: Instant) -> f64 {
+        t.saturating_duration_since(self.origin).as_secs_f64() * 1000.0
+    }
+
+    /// 档位 / 上限改了、或者按时间往回减缓冲
+    fn update(&mut self, now_ms: f64, mode: u8, max_ms: u32) {
+        let max = (max_ms.clamp(BUFFER_RANGE_MS.0, BUFFER_RANGE_MS.1)) as f64;
+        let floor = AUTO_MIN_MS.min(max);
+        if mode != self.mode {
+            self.mode = mode;
+            self.delay_ms = if mode == 1 { AUTO_START_MS.clamp(floor, max) } else { max };
+            self.last_late = now_ms;
+            self.last_decay = now_ms;
+        }
+        match mode {
+            1 => {
+                if now_ms - self.last_late > AUTO_CALM_MS {
+                    let secs = (now_ms - self.last_decay) / 1000.0;
+                    self.delay_ms -= secs * AUTO_DECAY_PER_S;
+                }
+                self.last_decay = now_ms;
+                self.delay_ms = self.delay_ms.clamp(floor, max);
+            }
+            _ => self.delay_ms = max,
+        }
+    }
+
+    /// 一帧到了（带截屏时间 cap，共享开始后的毫秒数）：返回它该显示的时刻
+    pub(crate) fn on_arrival(&mut self, arrival: Instant, cap: u32, mode: u8, max_ms: u32) -> Instant {
+        let a = self.ms(arrival);
+        self.update(a, mode, max_ms);
+        let off = a - cap as f64;
+        // 偏差一下子差了好几秒：共享者重新开了共享（截屏时间从 0 重来），重新估
+        if self.base.is_some_and(|b| (off - b).abs() > 3000.0) {
+            self.samples.clear();
+            self.base = None;
+        }
+        self.samples.push_back((a, off));
+        while self.samples.front().is_some_and(|s| a - s.0 > 10_000.0) {
+            self.samples.pop_front();
+        }
+        let base = self.samples.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+        self.base = Some(base);
+        let mut due = cap as f64 + base + self.delay_ms;
+        // 来晚了（停顿比缓冲还长）：自动档把缓冲加长（晚了多少的 1.5 倍 + 20 ms），之后的帧按新的缓冲排，画面接着匀速走，不跳
+        if a > due + 5.0 && mode == 1 {
+            let max = (max_ms.clamp(BUFFER_RANGE_MS.0, BUFFER_RANGE_MS.1)) as f64;
+            self.delay_ms = (self.delay_ms + (a - due) * AUTO_GROW + 20.0).min(max);
+            self.last_late = a;
+            due = cap as f64 + base + self.delay_ms;
+        }
+        self.origin + Duration::from_secs_f64(due.max(0.0) / 1000.0)
+    }
 }
 
 /// 流畅优先时最多攒几帧匀速放（再多就跳过旧的，延迟不会越积越大）
@@ -1982,6 +2101,8 @@ impl Stream {
     ) {
         let rtx = info.rtx;
         self.asm.set_rtt_hint(info.rtt_hint);
+        // 观看端开了缓冲：缓冲里来得及补的帧多等等补发（第 78 项）
+        self.asm.set_hold_ms(self.view.buffer_ms.load(Ordering::Relaxed));
         if self.view.decode_failed.swap(false, Ordering::Relaxed) {
             self.need_key = true;
         }
@@ -2103,11 +2224,68 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
     let mut next_present: Option<Instant> = None;
     // 按截屏时间放（第 56-c 项）：上一帧的截屏时间和显示时间
     let mut last_cap: Option<(u32, Instant)> = None;
-    while let Ok(first) = rx.recv() {
+    // 观看缓冲（第 78 项）：收到的帧先放在这里，到了排好的时刻再解码显示。(格式, 数据, 截屏时间, 到达时间, 该显示的时刻)
+    let mut held: std::collections::VecDeque<(u8, Vec<u8>, Option<u32>, Instant, Instant)> = Default::default();
+    let mut playout = Playout::new();
+    let mut wait_ema = 0.0f32;
+    let mut last_shown: Option<Instant> = None;
+    loop {
+        let (mode, max_ms) = (BUFFER_MODE.load(Ordering::Relaxed), BUFFER_MAX_MS.load(Ordering::Relaxed));
+        let buffering = mode != 0;
+        // 这一批要解码的帧（, 该显示的时刻）
+        let mut batch: Vec<(u8, Vec<u8>, Option<u32>)> = Vec::new();
+        let mut dues: Vec<Option<Instant>> = Vec::new();
+        if !buffering && held.is_empty() {
+            let Ok(first) = rx.recv() else { break };
+            batch.push(first);
+            batch.extend(rx.try_iter());
+            dues.resize(batch.len(), None);
+            view.buffer_ms.store(0, Ordering::Relaxed);
+            view.av_wait_ms.store(0, Ordering::Relaxed);
+            wait_ema = 0.0;
+        } else {
+            // 等到队头该显示、或者来了新帧
+            let wait = held.front().map(|h| h.4.saturating_duration_since(Instant::now())).unwrap_or(Duration::from_millis(200));
+            let mut incoming = Vec::new();
+            match rx.recv_timeout(wait) {
+                Ok(x) => incoming.push(x),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            incoming.extend(rx.try_iter());
+            for (cid, bits, cap) in incoming {
+                let arrival = Instant::now();
+                let due = match (buffering, cap) {
+                    (true, Some(c)) => playout.on_arrival(arrival, c, mode, max_ms),
+                    _ => arrival, // 共享者是旧版本（不带截屏时间）：没法排，到了就放
+                };
+                held.push_back((cid, bits, cap, arrival, due));
+            }
+            if buffering {
+                view.buffer_ms.store(playout.delay_ms.round() as u32, Ordering::Relaxed);
+            }
+            // 到时间的（提前 2 ms，留给解码）都拿出来；关了缓冲就把剩下的一次放完
+            let now = Instant::now();
+            while let Some(h) = held.front() {
+                if buffering && h.4 > now + Duration::from_millis(2) {
+                    break;
+                }
+                let (cid, bits, cap, arrival, due) = held.pop_front().unwrap();
+                if buffering && cap.is_some() {
+                    // 画面比到达多等了多久（平均）：共享声音跟着晚这么多，音画对齐
+                    let w = now.saturating_duration_since(arrival).as_secs_f32() * 1000.0;
+                    wait_ema = if wait_ema == 0.0 { w } else { wait_ema * 0.95 + w * 0.05 };
+                    view.av_wait_ms.store(wait_ema.round() as u32, Ordering::Relaxed);
+                }
+                batch.push((cid, bits, cap));
+                dues.push(buffering.then_some(due));
+            }
+            if batch.is_empty() {
+                continue;
+            }
+        }
         // 必须每帧都解码（P 帧依赖前一帧）。延迟优先：积压时只把最新一帧转成 RGBA 显示；
-        // 流畅优先：最后几帧按间隔匀速显示，更早的跳过
-        let mut batch = vec![first];
-        batch.extend(rx.try_iter());
+        // 流畅优先：最后几帧按间隔匀速显示，更早的跳过；开了缓冲：按排好的时刻显示，晚了一个半间隔以上的跳过（只解码）
         let last = batch.len() - 1;
         let now = Instant::now();
         let has_cap = batch.iter().all(|b| b.2.is_some());
@@ -2120,7 +2298,7 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
         }
         last_arrival = Some(now);
         sec_rx += batch.len() as u32;
-        let smooth = view.smooth.load(Ordering::Relaxed);
+        let smooth = view.smooth.load(Ordering::Relaxed) && !buffering;
         // 帧间隔（第 69-a 项）：优先按共享者每秒报的「发出几帧」算——丢帧、等恢复帧时扔掉的帧都不会把间隔估长
         let sent_fps = view.sharer_info.lock().unwrap().filter(|(_, t)| t.elapsed() < Duration::from_secs(3)).map(|(i, _)| i.sent_fps as f32).filter(|f| *f >= 5.0);
         if let Some(f) = sent_fps {
@@ -2157,7 +2335,11 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
                 view.decode_failed.store(true, Ordering::Relaxed); // 新解码器要从关键帧开始
             }
             let Some((_, _, _, d)) = dec.as_mut() else { continue };
-            let show = if smooth { i + SMOOTH_MAX_BACKLOG > last } else { i == last };
+            let show = match dues[i] {
+                Some(due) => i == last || now.saturating_duration_since(due) < interval.mul_f32(1.5),
+                None if smooth => i + SMOOTH_MAX_BACKLOG > last,
+                None => i == last,
+            };
             let mut publish = |w: usize, h: usize, nv12: Option<Vec<u8>>, fill: &mut dyn FnMut(&mut Vec<u8>)| {
                 let mut rgba = std::mem::take(&mut spare);
                 if nv12.is_none() {
@@ -2175,6 +2357,15 @@ fn decode_loop(rx: Receiver<(u8, Vec<u8>, Option<u32>)>, view: Arc<View>, ctx: O
                     next_present = Some(Instant::now() + interval.mul_f32(0.85));
                 }
                 last_cap = cap.map(|c| (c, Instant::now()));
+                // 画面停住超过 150 ms（而且比正常间隔长得多）记一次（对比用）
+                let t = Instant::now();
+                if let Some(p) = last_shown {
+                    let gap = t.duration_since(p);
+                    if gap > Duration::from_millis(150) && gap > interval * 4 {
+                        view.stalls.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                last_shown = Some(t);
                 let seq = view.seq.fetch_add(1, Ordering::Relaxed) + 1;
                 let nv12 = nv12.map(Arc::new);
                 if let Some(o) = view.frame.lock().unwrap().replace(DecodedFrame { width: w, height: h, rgba, nv12, seq, at: Instant::now() }) {
@@ -2307,7 +2498,12 @@ mod tests {
                 key_requests += rx.on_packet(&udp::server_video(7, &f), |_| SenderInfo::default(), |from, b| rk.decrypt_video(from, b)).keyframes.len();
             }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        // 解码在另一个线程：最多等 5 秒（第 75 项：GitHub 的机器慢，以前固定等 500 ms 偶尔不够）
+        let t0 = Instant::now();
+        while view.frame.lock().unwrap().is_none() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(100));
         let fr = view.frame.lock().unwrap();
         let fr = fr.as_ref().expect("decoded at least one frame");
         assert_eq!((fr.width, fr.height), (854, 480));
@@ -2449,38 +2645,144 @@ mod tests {
         assert_eq!(fec_ratio(500), 2.0);
     }
 
-    /// 系统给帧的间隔是一格一格的（这里模拟 144 / 70 / 60 帧的源，带一点抖动），按时间表限帧后平均帧率要接近所选值
+    /// 系统给帧的间隔是一格一格的（这里模拟 144 / 70 / 60 帧的源，带一点抖动），限帧后平均帧率要接近所选值
     #[test]
     fn pacing_reaches_target_fps() {
         let run = |source_hz: f64, target: u32| -> f64 {
             let interval = Duration::from_secs_f64(1.0 / target as f64);
             let t0 = Instant::now();
-            let mut due = None;
+            let mut p = super::Pacer::default();
             let mut n = 0u32;
             let mut seed = 12345u32;
             for i in 0..(source_hz as u32 * 10) {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 let jitter = (seed >> 16) as f64 / 65536.0 * 0.002; // 0～2 ms 线程调度抖动
                 let t = t0 + Duration::from_secs_f64(i as f64 / source_hz + jitter);
-                if super::pace_accept(&mut due, t, interval) {
+                if p.accept(t, interval) {
                     n += 1;
                 }
             }
             n as f64 / 10.0
         };
-        for (src, target) in [(144.0, 60), (144.0, 30), (70.0, 30), (180.0, 60), (60.0, 60), (60.0, 30), (61.0, 60)] {
+        for (src, target) in [(144.0, 60), (144.0, 30), (70.0, 30), (180.0, 60), (60.0, 60), (60.0, 30), (61.0, 60), (240.0, 120)] {
             let fps = run(src, target);
             assert!(fps >= target as f64 * 0.97 && fps <= target as f64 * 1.02, "source {src} target {target}: got {fps}");
         }
         // 源本身不够快时：有多少给多少
-        assert!(run(40.0, 60) >= 39.0);
-        // 画面静止一阵后恢复：不会一下子补一串
+        assert!(run(40.0, 60) >= 39.5);
+        // 画面静止一阵后恢复：最多一下子收 PACE_BURST 帧，不会补一串
         let interval = Duration::from_millis(33);
         let t0 = Instant::now();
-        let mut due = None;
-        assert!(super::pace_accept(&mut due, t0, interval));
-        assert!(super::pace_accept(&mut due, t0 + Duration::from_secs(5), interval));
-        assert!(!super::pace_accept(&mut due, t0 + Duration::from_secs(5) + Duration::from_millis(7), interval));
+        let mut p = super::Pacer::default();
+        assert!(p.accept(t0, interval));
+        let t1 = t0 + Duration::from_secs(5);
+        let burst = (0..10).filter(|k| p.accept(t1 + Duration::from_millis(*k), interval)).count();
+        assert_eq!(burst, 3);
+    }
+
+    /// 第 72 项：系统给帧不均匀（只在画面变化时给，对齐 180 Hz 刷新，两帧至少隔 8.3 ms）——平均 68 帧时要采到接近 60 帧，
+    /// 平均 26 帧时要几乎全收（以前按时间表：68 → 46、26 → 18）
+    #[test]
+    fn pacing_irregular_source() {
+        let run = |rate: f64, target: u32| -> (u32, u32) {
+            let interval = Duration::from_secs_f64(1.0 / target as f64);
+            let tick = 1.0 / 180.0;
+            let min_gap = interval.as_secs_f64() / 2.0; // 系统截屏的最小间隔（见 start_with）
+            let t0 = Instant::now();
+            let mut p = super::Pacer::default();
+            let (mut src, mut n) = (0u32, 0u32);
+            let mut seed = 777u32;
+            let mut last = -1.0f64;
+            let mut k = 0u32;
+            while (k as f64) * tick < 20.0 {
+                k += 1;
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let r = (seed >> 8) as f64 / 16777216.0;
+                let t = k as f64 * tick;
+                // 每个刷新格子按概率出一帧（画面变化），离上一帧太近的系统不给
+                if r < rate * tick * 1.6 && t - last >= min_gap - 1e-9 {
+                    last = t;
+                    src += 1;
+                    if p.accept(t0 + Duration::from_secs_f64(t), interval) {
+                        n += 1;
+                    }
+                }
+            }
+            (src / 20, n / 20)
+        };
+        let (src, n) = run(68.0, 60);
+        assert!(src >= 60 && n >= 57 && n <= 61, "source {src}, captured {n}");
+        let (src, n) = run(22.0, 60);
+        assert!(n + 1 >= src, "source {src}, captured {n}");
+        let (src, n) = run(40.0, 30);
+        assert!(src > 30 && n >= 28 && n <= 31, "source {src}, captured {n}");
+    }
+
+    /// 第 78 项：固定缓冲 200 ms 时，停顿 150 ms 的那一串帧也都在排好的时刻之前到（画面不停）；排的时刻匀速、和截屏间隔一致
+    #[test]
+    fn playout_fixed_buffer_absorbs_stall() {
+        let mut p = super::Playout::new();
+        let t0 = p.origin;
+        let mut dues = Vec::new();
+        for k in 0..300u32 {
+            let cap = 1000 + k * 16;
+            let jitter = (k * 7919 % 20) as u64;
+            // 第 100～109 帧卡住：第 100 帧本该到的时候过了 150 ms 才一起到
+            let arrive_ms = if (100..110).contains(&k) { 1000 + 100 * 16 + 50 + 150 } else { cap as u64 + 50 + jitter };
+            let arrival = t0 + Duration::from_millis(arrive_ms);
+            let due = p.on_arrival(arrival, cap, 2, 200);
+            assert!(due + Duration::from_millis(1) >= arrival || k < 5, "frame {k} late");
+            dues.push(due);
+        }
+        // 匀速：相邻两帧排的时刻差 16 ms（基准稳定后）
+        for w in dues[20..].windows(2) {
+            let d = w[1].duration_since(w[0]).as_millis();
+            assert!((15..=17).contains(&d), "{d}");
+        }
+    }
+
+    /// 自动档：从 150 ms 起；停顿比缓冲长时加长（不超过上限）；稳了以后慢慢减，最少 60 ms
+    #[test]
+    fn playout_auto_grows_and_decays() {
+        let mut p = super::Playout::new();
+        let t0 = p.origin;
+        let at = |p: &mut super::Playout, cap: u32, arrive: u64, max: u32| p.on_arrival(t0 + Duration::from_millis(arrive), cap, 1, max);
+        for k in 0..60u32 {
+            at(&mut p, k * 16, k as u64 * 16 + 40, 300);
+        }
+        assert!((p.delay_ms - 150.0).abs() < 1.0, "{}", p.delay_ms);
+        // 停 200 ms（比缓冲长 50 ms）：加 50 × 1.5 + 20
+        at(&mut p, 60 * 16, 60 * 16 + 40 + 200, 400);
+        assert!((p.delay_ms - 245.0).abs() < 2.0, "{}", p.delay_ms);
+        // 停 2 秒：最多加到上限
+        at(&mut p, 61 * 16, 61 * 16 + 40 + 2000, 300);
+        assert_eq!(p.delay_ms, 300.0);
+        // 之后 2 分钟都顺：慢慢减回最少 60 ms
+        let start = 61 * 16 + 2040u64;
+        for k in 0..(150_000 / 16) {
+            let cap = 62 * 16 + 2000 + k * 16;
+            at(&mut p, cap, start + 16 + k as u64 * 16, 300);
+        }
+        assert!(p.delay_ms <= 61.0, "{}", p.delay_ms);
+        // 上限设得比 60 还小：按上限
+        let mut q = super::Playout::new();
+        let t1 = q.origin;
+        q.on_arrival(t1 + Duration::from_millis(40), 0, 1, 50);
+        assert_eq!(q.delay_ms, 50.0);
+    }
+
+    /// 共享者重新开了共享（截屏时间从 0 重来）：重新估基准，不会把所有帧都当成晚到 / 排到很久以后
+    #[test]
+    fn playout_resets_on_share_restart() {
+        let mut p = super::Playout::new();
+        let t0 = p.origin;
+        for k in 0..100u32 {
+            p.on_arrival(t0 + Duration::from_millis(500_000 + k as u64 * 16), 400_000 + k * 16, 2, 200);
+        }
+        let arrival = t0 + Duration::from_millis(600_000);
+        let due = p.on_arrival(arrival, 0, 2, 200);
+        let d = due.duration_since(arrival).as_millis();
+        assert!((195..=205).contains(&d), "{d}");
     }
 
     #[test]

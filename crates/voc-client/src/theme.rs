@@ -392,14 +392,29 @@ fn visuals() -> egui::Visuals {
 // ---------------------------------------------------------------- 小组件
 
 /// 圆角小标签
+/// 先量好整块的大小再占位（第 73 项）：一行放不下时整个换到下一行，不会被挤成一个字一行
 pub fn pill(ui: &mut egui::Ui, text: impl Into<String>, fg: Color32, bg: Color32) -> egui::Response {
-    egui::Frame::new()
-        .fill(bg)
-        .stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 38)))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(8, 2))
-        .show(ui, |ui| ui.label(RichText::new(text.into()).size(12.0).color(fg)))
-        .response
+    let galley = egui::WidgetText::from(RichText::new(text.into()).size(12.0).color(fg)).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    );
+    let pad = egui::vec2(8.0, 2.0);
+    let size = galley.size() + pad * 2.0 + egui::vec2(2.0, 2.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect(
+            rect,
+            CornerRadius::same(6),
+            bg,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 38)),
+            egui::StrokeKind::Inside,
+        );
+        p.galley(rect.min + pad + egui::vec2(1.0, 1.0), galley, fg);
+    }
+    resp
 }
 
 /// 分区标题（小号、偏灰）
