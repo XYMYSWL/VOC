@@ -104,6 +104,10 @@ struct Persisted {
     /// 观看缓冲（第 78 项）：0 关（默认）/ 1 自动 / 2 固定；最多缓冲多少毫秒（用户自己设）
     view_buffer_mode: u8,
     view_buffer_max_ms: u32,
+    /// 记住的每个人的音量（第 80 项）：键 = 「服务器|#授权码编号」（旧服务器没有编号时用「服务器|名字」），值 = (说话, 共享声音, 伴奏)；都是 100% 的不存
+    user_volumes: HashMap<String, [f32; 3]>,
+    /// 界面大小（第 84 项）：0 = 自动（按窗口大小），否则固定百分比（90 / 100 / 110 / 125 / 150）
+    ui_scale: u32,
     /// 0.5.1 起默认硬解：老配置里的「软解」迁移一次（老配置没有这个字段 → false → 迁移）
     #[serde(default)]
     hw_decode_migrated: bool,
@@ -253,6 +257,8 @@ impl Default for Persisted {
             smooth_playback: true,
             view_buffer_mode: 0,
             view_buffer_max_ms: 300,
+            user_volumes: HashMap::new(),
+            ui_scale: 0,
             hw_decode_migrated: true,
             auto_update: true,
             update_accel: false,
@@ -681,6 +687,10 @@ pub struct App {
     mica_key: Option<(Option<[i32; 4]>, bool)>,
     /// 正在给哪些人的共享声音加额外缓冲（第 78 项；不看了要清掉）
     share_av_ids: std::collections::HashSet<u32>,
+    /// 已经套上记住的音量的人：编号 → 用的键（第 80 项）
+    vol_applied: HashMap<u32, String>,
+    /// 迷你模式（第 84 项：窗口小到界面要缩到 50% 以下时，只留频道里的人和闭麦 / 静音 / 挂断）
+    pub(crate) mini: bool,
     glass_backdrop: Option<crate::glass::Backdrop>,
     glass_pending: Option<std::time::Instant>,
     glass_shot: Arc<Mutex<Option<egui::ColorImage>>>,
@@ -855,6 +865,9 @@ impl App {
         settings.ptt_tail_ms.store(cfg.ptt_tail_ms, Ordering::Relaxed);
         crate::audio::LOW_BANDWIDTH.store(cfg.low_bandwidth, Ordering::Relaxed);
         crate::audio::VOICE_BITRATE.store(cfg.voice_kbps.clamp(16, 128) * 1000, Ordering::Relaxed);
+        // 第 86 项：麦克风音量最高 200%（以前设置里能到 400%）
+        cfg.input_gain = cfg.input_gain.clamp(0.0, 2.0);
+        cfg.output_volume = cfg.output_volume.clamp(0.0, 2.0);
         settings.input_gain.set(cfg.input_gain);
         settings.output_volume.set(cfg.output_volume);
         // 测试：VOC_TEST_TONE=1 时不用麦克风、自己「一直说话」（见 voice.rs），也不从音箱放声音
@@ -968,6 +981,8 @@ impl App {
             glass_window: crate::glass::startup_enabled(),
             mica_key: None,
             share_av_ids: Default::default(),
+            vol_applied: HashMap::new(),
+            mini: false,
             glass_backdrop: None,
             glass_pending: None,
             glass_shot: Default::default(),
@@ -1033,6 +1048,42 @@ impl App {
             app.updater.check(cc.egui_ctx.clone());
         }
         app
+    }
+
+    /// 第 80 项：每个人的音量记住（按授权码编号，改名也不丢）。每一帧：新出现的人先套上记住的音量；
+    /// 套过的人，音量被改了（右键名单、看共享时的滑块、卡片上，哪里改的都一样）就记下来
+    fn sync_user_volumes(&mut self) {
+        use crate::audio::stream_mixer_id;
+        use voc_proto::udp::{MUSIC, SHARE_AUDIO};
+        let Screen::Main(s) = &self.screen else {
+            self.vol_applied.clear();
+            return;
+        };
+        let mut m = self.mixer.lock().unwrap();
+        for u in &s.users {
+            if u.id == s.user_id {
+                continue;
+            }
+            let key = if u.tag.is_empty() { format!("{}|{}", s.server_key, u.name) } else { format!("{}|#{}", s.server_key, u.tag) };
+            let ids = [u.id, stream_mixer_id(SHARE_AUDIO, u.id), stream_mixer_id(MUSIC, u.id)];
+            let saved = self.cfg.user_volumes.get(&key).copied().unwrap_or([1.0; 3]);
+            if self.vol_applied.get(&u.id) == Some(&key) {
+                let cur = [m.volume(ids[0]), m.volume(ids[1]), m.volume(ids[2])];
+                if cur != saved {
+                    if cur == [1.0; 3] {
+                        self.cfg.user_volumes.remove(&key);
+                    } else {
+                        self.cfg.user_volumes.insert(key, cur);
+                    }
+                }
+            } else {
+                for (id, v) in ids.iter().zip(saved) {
+                    m.set_volume(*id, v);
+                }
+                self.vol_applied.insert(u.id, key);
+            }
+        }
+        self.vol_applied.retain(|id, _| s.users.iter().any(|u| u.id == *id));
     }
 
     fn apply_denoise(&mut self) {

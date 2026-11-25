@@ -392,6 +392,51 @@ fn visuals() -> egui::Visuals {
 // ---------------------------------------------------------------- 小组件
 
 /// 圆角小标签
+/// 音量滑块按人耳感觉走（第 80 项）：滑块正中 = 100%，右端 = 200%（+6 dB），左半段按平方往下（25% 处约 −12 dB）。
+/// 线性滑块的毛病：0～50% 那一小段声音变化很大，100～200% 那一大段听起来差不多
+pub fn gain_to_pos(g: f32) -> f32 {
+    if g <= 1.0 {
+        0.5 * g.max(0.0).sqrt()
+    } else {
+        0.5 + 0.5 * g.log2().min(1.0)
+    }
+}
+
+pub fn pos_to_gain(p: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    if p <= 0.5 {
+        (2.0 * p) * (2.0 * p)
+    } else {
+        2f32.powf(2.0 * p - 1.0)
+    }
+}
+
+/// 音量滑块（0～200%，gain 是倍数 0～2）：按人耳感觉走，数值框里写百分比（也能直接输入）；靠近 100% 时吸到 100%。
+/// 只是一个控件（不包子区域），放在会换行的一行里也能整个换行
+pub fn vol_slider(ui: &mut egui::Ui, gain: &mut f32, text: &str, width: f32) -> egui::Response {
+    vol_slider_ex(ui, gain, text, width, true)
+}
+
+pub fn vol_slider_ex(ui: &mut egui::Ui, gain: &mut f32, text: &str, width: f32, enabled: bool) -> egui::Response {
+    let mut p = gain_to_pos(*gain) as f64;
+    let old_w = ui.spacing().slider_width;
+    ui.spacing_mut().slider_width = width;
+    let mut slider = egui::Slider::new(&mut p, 0.0..=1.0)
+        .custom_formatter(|p, _| format!("{:.0}%", pos_to_gain(p as f32) * 100.0))
+        .custom_parser(|t| t.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|g| gain_to_pos((g / 100.0).clamp(0.0, 2.0) as f32) as f64));
+    if !text.is_empty() {
+        slider = slider.text(text);
+    }
+    let r = ui.add_enabled(enabled, slider);
+    ui.spacing_mut().slider_width = old_w;
+    if r.changed() {
+        let g = pos_to_gain(p as f32);
+        *gain = if (g - 1.0).abs() < 0.04 { 1.0 } else { (g * 100.0).round() / 100.0 };
+    }
+    let db = if *gain > 0.0 { 20.0 * gain.log10() } else { f32::NEG_INFINITY };
+    r.on_hover_text(if db.is_finite() { format!("{:.0}%（{:+.1} dB）", *gain * 100.0, db) } else { "0%（静音）".into() })
+}
+
 /// 先量好整块的大小再占位（第 73 项）：一行放不下时整个换到下一行，不会被挤成一个字一行
 pub fn pill(ui: &mut egui::Ui, text: impl Into<String>, fg: Color32, bg: Color32) -> egui::Response {
     let galley = egui::WidgetText::from(RichText::new(text.into()).size(12.0).color(fg)).into_galley(
@@ -864,5 +909,20 @@ mod tests {
         assert!(relay_compare("阿豪", 62, 148, Some(&q)).contains("直连：不稳定（161 ms · 丢包 22% · 抖动 95 ms）"));
         let q = PeerQuality { rtt_ms: 40, loss_pct: 0, jitter_ms: 2, unstable: false };
         assert!(relay_compare("阿豪", 62, 148, Some(&q)).contains("直连：已打通 40 ms，但超出你的上行预算"));
+    }
+}
+
+#[cfg(test)]
+mod vol_tests {
+    use super::*;
+    #[test]
+    fn vol_curve_roundtrip() {
+        assert_eq!(pos_to_gain(0.5), 1.0);
+        assert_eq!(pos_to_gain(1.0), 2.0);
+        assert_eq!(pos_to_gain(0.0), 0.0);
+        assert!((pos_to_gain(0.25) - 0.25).abs() < 1e-6);
+        for g in [0.0f32, 0.1, 0.5, 1.0, 1.4, 2.0] {
+            assert!((pos_to_gain(gain_to_pos(g)) - g).abs() < 1e-4, "{g}");
+        }
     }
 }

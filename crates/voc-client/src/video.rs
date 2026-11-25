@@ -715,6 +715,39 @@ impl VideoEncoder {
 
 // ------------------------------------------------------------ 共享者
 
+/// 这台电脑的 Windows 支不支持截屏的几项设置（第 79 项）：(鼠标开关, 不画黄框, 最小更新间隔)。
+/// 老一点的系统（Windows 10、早期 Windows 11）没有这些，硬设的话整个截屏开不起来。测试：VOC_TEST_CAP_OLD=1 假装都不支持
+pub fn capture_support() -> (bool, bool, bool) {
+    use windows_capture::graphics_capture_api::GraphicsCaptureApi as G;
+    static S: OnceLock<(bool, bool, bool)> = OnceLock::new();
+    *S.get_or_init(|| {
+        if std::env::var_os("VOC_TEST_CAP_OLD").is_some() {
+            return (false, false, false);
+        }
+        (
+            G::is_cursor_settings_supported().unwrap_or(false),
+            G::is_border_settings_supported().unwrap_or(false),
+            G::is_minimum_update_interval_supported().unwrap_or(false),
+        )
+    })
+}
+
+/// 不支持的那几项（给共享者看的提醒）；都支持时为空
+pub fn capture_limits() -> Vec<&'static str> {
+    let (cursor, border, min_iv) = capture_support();
+    let mut v = Vec::new();
+    if !border {
+        v.push("共享时屏幕边上会有一圈黄框（只有你看得到，不会进画面）");
+    }
+    if !min_iv {
+        v.push("系统会多给一些画面，帧率由 VOC 自己控制（多占一点点 CPU）");
+    }
+    if !cursor {
+        v.push("鼠标总会画进画面里");
+    }
+    v
+}
+
 #[derive(Default)]
 pub struct ShareStats {
     /// 实际采集到的帧率
@@ -970,15 +1003,22 @@ impl CaptureCfg {
             stop: f.stop.clone(),
             interval: f.interval,
         };
-        let cursor = if with_cursor { CursorCaptureSettings::WithCursor } else { CursorCaptureSettings::WithoutCursor };
-        let min_iv = MinimumUpdateIntervalSettings::Custom(self.interval / 2);
+        // 系统不支持的设置不设（第 79 项：硬设的话老系统上整个截屏开不起来，报「not supported by the Graphics Capture API」）
+        let (cursor_ok, border_ok, min_iv_ok) = capture_support();
+        let cursor = match (cursor_ok, with_cursor) {
+            (false, _) => CursorCaptureSettings::Default,
+            (true, true) => CursorCaptureSettings::WithCursor,
+            (true, false) => CursorCaptureSettings::WithoutCursor,
+        };
+        let border = if border_ok { DrawBorderSettings::WithoutBorder } else { DrawBorderSettings::Default };
+        let min_iv = if min_iv_ok { MinimumUpdateIntervalSettings::Custom(self.interval / 2) } else { MinimumUpdateIntervalSettings::Default };
         let dirty = if skip { DirtyRegionSettings::ReportOnly } else { DirtyRegionSettings::Default };
         if let Some(h) = self.window {
             let w = windows_capture::window::Window::from_raw_hwnd(h as *mut core::ffi::c_void);
             if !w.is_valid() {
                 return Err("要共享的窗口已经关了或者看不见".into());
             }
-            let settings = Settings::new(w, cursor, DrawBorderSettings::WithoutBorder, SecondaryWindowSettings::Default, min_iv, dirty, ColorFormat::Bgra8, flags);
+            let settings = Settings::new(w, cursor, border, SecondaryWindowSettings::Default, min_iv, dirty, ColorFormat::Bgra8, flags);
             return CapHandler::start_free_threaded(settings).map_err(|e| e.to_string());
         }
         let monitor = windows_capture::monitor::Monitor::from_index(self.monitor_index + 1)
@@ -987,7 +1027,7 @@ impl CaptureCfg {
         let settings = Settings::new(
             monitor,
             cursor,
-            DrawBorderSettings::WithoutBorder,
+            border,
             SecondaryWindowSettings::Default,
             // 系统这边只挡住远超所选帧率的部分，具体取哪帧由 Pacer 决定（两道门槛叠加会少帧）
             min_iv,
@@ -1009,7 +1049,8 @@ fn capture_manager(cap: CaptureCfg, mut ctl: CapControl, skip_ok: bool, stop: Ar
             let _ = ctl.stop();
             return;
         }
-        let w = want.load(Ordering::Relaxed);
+        // 系统不支持关掉截屏里的鼠标（第 79 项）：鼠标一直在画面里，不单独发（不然看的人会看到两个鼠标）
+        let w = want.load(Ordering::Relaxed) || !capture_support().0;
         if w == now.load(Ordering::Relaxed) {
             continue;
         }

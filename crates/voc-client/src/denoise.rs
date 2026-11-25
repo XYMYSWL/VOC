@@ -64,7 +64,8 @@ pub fn create(mode: DenoiseMode, plugin_path: &str, model_path: &str, dfn_level:
 pub struct Dfn3 {
     tx: std::sync::mpsc::Sender<Vec<f32>>,
     rx: std::sync::mpsc::Receiver<Vec<f32>>,
-    status: std::sync::mpsc::Receiver<Result<(), String>>,
+    /// 模型线程加载的结果（第 82 项：界面随时能读到，不用等处理声音）：None = 还在加载
+    status: Arc<Mutex<Option<Result<(), String>>>>,
     ready: bool,
     fallback: Rnnoise2,
     level: u8,
@@ -80,7 +81,8 @@ impl Dfn3 {
         let (_, lim, pf) = DFN_LEVELS[level as usize];
         let (tx, frames_rx) = std::sync::mpsc::channel::<Vec<f32>>();
         let (out_tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        let (st_tx, status) = std::sync::mpsc::channel();
+        let status: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        let st_tx = status.clone();
         std::thread::Builder::new()
             .name("dfn3".into())
             .spawn(move || {
@@ -94,11 +96,11 @@ impl Dfn3 {
                     .and_then(|m| if m.hop_size == CAPTURE_FRAME && m.sr == 48_000 { Ok(m) } else { Err(format!("模型帧长 {} / 采样率 {} 不对", m.hop_size, m.sr)) });
                 let mut m = match m {
                     Ok(m) => {
-                        let _ = st_tx.send(Ok(()));
+                        *st_tx.lock().unwrap() = Some(Ok(()));
                         m
                     }
                     Err(e) => {
-                        let _ = st_tx.send(Err(e));
+                        *st_tx.lock().unwrap() = Some(Err(e));
                         return;
                     }
                 };
@@ -128,11 +130,10 @@ impl Dfn3 {
 impl Denoiser for Dfn3 {
     fn process(&mut self, frame: &mut [f32]) {
         if !self.ready && self.gave_up.is_none() {
-            match self.status.try_recv() {
-                Ok(Ok(())) => self.ready = true,
-                Ok(Err(e)) => self.gave_up = Some(e),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.gave_up = Some("模型线程退出了".into()),
-                Err(_) => {}
+            match self.status.lock().unwrap().clone() {
+                Some(Ok(())) => self.ready = true,
+                Some(Err(e)) => self.gave_up = Some(e),
+                None => {}
             }
         }
         if !self.ready || self.gave_up.is_some() {
@@ -168,10 +169,13 @@ impl Denoiser for Dfn3 {
     }
     fn name(&self) -> String {
         let lv = DFN_LEVELS[self.level as usize].0;
-        match (&self.gave_up, self.ready) {
-            (Some(e), _) => format!("RNNoise 新版（DeepFilterNet3 退回了：{e}）"),
-            (None, true) => format!("DeepFilterNet3 · {lv}"),
-            (None, false) => format!("DeepFilterNet3 · {lv}（加载中，先用 RNNoise 新版）"),
+        // 还没处理过声音（没进语音频道）时也按模型线程的结果显示（第 82 项）
+        let loaded = self.status.lock().unwrap().clone();
+        match (&self.gave_up, self.ready, loaded) {
+            (Some(e), _, _) => format!("RNNoise 新版（DeepFilterNet3 退回了：{e}）"),
+            (None, _, Some(Err(e))) => format!("RNNoise 新版（DeepFilterNet3 加载失败：{e}）"),
+            (None, true, _) | (None, false, Some(Ok(()))) => format!("DeepFilterNet3 · {lv}"),
+            (None, false, None) => format!("DeepFilterNet3 · {lv}（加载中，先用 RNNoise 新版）"),
         }
     }
 }
@@ -470,6 +474,19 @@ mod rnnoise2_tests {
         let old = energy(&mut Rnnoise::new());
         eprintln!("白噪声剩下：新版 {:.1} dB，老版 {:.1} dB", 10.0 * (new / input).log10(), 10.0 * (old / input).log10());
         assert!(new < input * 0.1, "new RNNoise should cut white noise by >10 dB");
+    }
+
+    /// 第 82 项：没处理过声音（没进语音频道）时，名字也要从「加载中」变成加载好
+    #[test]
+    fn dfn3_status_without_audio() {
+        let d = Dfn3::new(1).unwrap();
+        assert!(d.name().contains("加载中") || d.name() == "DeepFilterNet3 · 高", "{}", d.name());
+        let t = Instant::now();
+        while d.name().contains("加载中") {
+            assert!(t.elapsed() < Duration::from_secs(30), "{}", d.name());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(d.name(), "DeepFilterNet3 · 高");
     }
 
     /// DeepFilterNet3：加载好之后压白噪声，并量每帧多久（一帧 10 ms，要远小于它）

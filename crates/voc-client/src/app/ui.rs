@@ -220,6 +220,8 @@ impl App {
         let my_channel = me.as_ref().and_then(|u| u.channel_id);
         let mut disconnect = false;
         let mut toggled_state = false;
+        // 左下角麦克风 / 耳机菜单里换了设备、要列设备（第 86 项）
+        let (mut restart_audio_req, mut dev_refresh_req) = (false, false);
         let mut trust_id: Option<u32> = None;
         let mut watch_toggle: Option<(u32, bool)> = None;
         // 右键「私聊」打开的对话、点 ✕ 关闭的对话、切换到的标签（Some(None) = 频道聊天）
@@ -453,7 +455,7 @@ impl App {
                             let talking = me.as_ref().is_some_and(|u| speaking(u.id));
                             th::avatar(ui, name, 36.0, talking);
                             // 右边留出三个按钮的位置，名字 / 状态太长时截断（第 77 项：以前会压到按钮底下）
-                            let text_w = (ui.available_width() - 3.0 * 34.0 - 8.0).max(40.0);
+                            let text_w = (ui.available_width() - 3.0 * 34.0 - 2.0 * 18.0 - 8.0).max(40.0);
                             ui.vertical(|ui| {
                                 ui.set_max_width(text_w);
                                 ui.add_space(1.0);
@@ -478,11 +480,58 @@ impl App {
                                 let deaf = self.settings.deafened.load(Ordering::Relaxed);
                                 let (mk, dk) = (self.cfg.mute_key.label(), self.cfg.deafen_key.label());
                                 let dt = if deaf { format!("取消静音（{dk}）") } else { format!("静音：听不到别人（{dk}）") };
+                                // 耳机旁边的小菜单（第 86 项，像 Discord）：输出设备、所有人的音量
+                                ui.menu_button(RichText::new("⌃").size(11.0).color(th::TEXT_DIM()), |ui| {
+                                    ui.set_min_width(270.0);
+                                    if self.output_devices.is_empty() {
+                                        dev_refresh_req = true;
+                                    }
+                                    ui.label(RichText::new("输出设备").size(12.0).color(th::TEXT_DIM()));
+                                    restart_audio_req |= device_combo_w(ui, "pop_out", &mut self.cfg.output_device, &self.output_devices, 250.0);
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new("输出音量（所有人）").size(12.0).color(th::TEXT_DIM()));
+                                    if th::vol_slider(ui, &mut self.cfg.output_volume, "", 190.0).changed() {
+                                        self.settings.output_volume.set(self.cfg.output_volume);
+                                    }
+                                    ui.separator();
+                                    if ui.button("语音设置 →").clicked() {
+                                        self.show_settings = true;
+                                        self.settings_tab = 0;
+                                        ui.close();
+                                    }
+                                })
+                                .response
+                                .on_hover_text("输出设备、所有人的音量");
                                 if th::icon_button(ui, if deaf { Icon::HeadphonesOff } else { Icon::Headphones }, &dt, if deaf { Tone::Danger } else { Tone::Normal }).clicked() {
                                     self.settings.deafened.store(!deaf, Ordering::Relaxed);
                                     toggled_state = true;
                                 }
                                 let mt = if muted { format!("取消闭麦（{mk}）") } else { format!("闭麦（{mk}）") };
+                                // 麦克风旁边的小菜单：输入设备、麦克风音量（带实时电平）
+                                ui.menu_button(RichText::new("⌃").size(11.0).color(th::TEXT_DIM()), |ui| {
+                                    ui.set_min_width(270.0);
+                                    if self.input_devices.is_empty() {
+                                        dev_refresh_req = true;
+                                    }
+                                    ui.label(RichText::new("输入设备").size(12.0).color(th::TEXT_DIM()));
+                                    restart_audio_req |= device_combo_w(ui, "pop_in", &mut self.cfg.input_device, &self.input_devices, 250.0);
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new("麦克风音量").size(12.0).color(th::TEXT_DIM()));
+                                    if th::vol_slider(ui, &mut self.cfg.input_gain, "", 190.0).changed() {
+                                        self.settings.input_gain.set(self.cfg.input_gain);
+                                    }
+                                    // 说话时动的电平条（白线 = 语音激活的门槛），方便边说边调
+                                    level_meter(ui, self.settings.input_level_db.get(), self.cfg.vad_threshold_db, self.settings.transmitting.load(Ordering::Relaxed));
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                                    ui.separator();
+                                    if ui.button("语音设置 →").clicked() {
+                                        self.show_settings = true;
+                                        self.settings_tab = 0;
+                                        ui.close();
+                                    }
+                                })
+                                .response
+                                .on_hover_text("输入设备、麦克风音量");
                                 if th::icon_button(ui, if muted { Icon::MicOff } else { Icon::Mic }, &mt, if muted { Tone::Danger } else { Tone::Normal }).clicked() {
                                     self.settings.muted.store(!muted, Ordering::Relaxed);
                                     toggled_state = true;
@@ -748,29 +797,25 @@ impl App {
                                     }
                                     {
                                         let mut m = self.mixer.lock().unwrap();
-                                        let mut v = m.volume(u.id) * 100.0;
-                                        if ui.add(egui::Slider::new(&mut v, 0.0..=200.0).suffix("%").text("音量")).changed() {
-                                            m.set_volume(u.id, v / 100.0);
+                                        let mut v = m.volume(u.id);
+                                        if th::vol_slider(ui, &mut v, "音量", 130.0).changed() {
+                                            m.set_volume(u.id, v);
                                         }
                                     }
                                     if u.sharing.is_some() && u.share_audio {
                                         let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, u.id);
                                         let mut m = self.mixer.lock().unwrap();
-                                        let mut v = m.volume(sid) * 100.0;
-                                        if ui
-                                            .add(egui::Slider::new(&mut v, 0.0..=200.0).suffix("%").fixed_decimals(0).text("共享声音音量"))
-                                            .on_hover_text("看他的屏幕共享时听到的游戏、视频声音，和他说话的音量分开调")
-                                            .changed()
-                                        {
-                                            m.set_volume(sid, v / 100.0);
+                                        let mut v = m.volume(sid);
+                                        if th::vol_slider(ui, &mut v, "共享声音", 130.0).changed() {
+                                            m.set_volume(sid, v);
                                         }
                                     }
                                     if u.music.is_some() {
                                         let mid = crate::audio::stream_mixer_id(voc_proto::udp::MUSIC, u.id);
                                         let mut m = self.mixer.lock().unwrap();
-                                        let mut v = m.volume(mid) * 100.0;
-                                        if ui.add(egui::Slider::new(&mut v, 0.0..=200.0).suffix("%").text("伴奏音量")).changed() {
-                                            m.set_volume(mid, v / 100.0);
+                                        let mut v = m.volume(mid);
+                                        if th::vol_slider(ui, &mut v, "伴奏", 130.0).changed() {
+                                            m.set_volume(mid, v);
                                         }
                                     }
                                     // 嘴到耳延迟：按实际走的线路估算
@@ -1011,7 +1056,8 @@ impl App {
                                         }
                                     };
                                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(tw, 132.0), Sense::hover());
-                                    let p = ui.painter();
+                                    let p = ui.painter().clone();
+                                    let p = &p;
                                     p.rect_filled(rect, CornerRadius::same(14), th::BG_BASE());
                                     p.rect_stroke(rect, CornerRadius::same(14), Stroke::new(2.0, if talking { th::GREEN() } else { th::BORDER() }), egui::StrokeKind::Inside);
                                     let c = rect.center() - Vec2::new(0.0, 12.0);
@@ -1036,7 +1082,32 @@ impl App {
                                     let nr = egui::Rect::from_min_size(rect.left_bottom() + Vec2::new(10.0, -30.0), g.size() + Vec2::new(14.0, 6.0));
                                     p.rect_filled(nr, CornerRadius::same(8), th::BG_PANEL());
                                     p.galley(nr.min + Vec2::new(7.0, 3.0), g, th::TEXT());
-                                    p.text(rect.right_top() + Vec2::new(-10.0, 10.0), Align2::RIGHT_TOP, route, egui::FontId::proportional(11.0), rc);
+                                    // 鼠标放在别人的卡片上：顶上那行换成他的音量滑块，滚轮也能调（第 80 项）
+                                    let hover = !is_me && ui.rect_contains_pointer(rect);
+                                    if hover {
+                                        let mut m = self.mixer.lock().unwrap();
+                                        let mut v = m.volume(u.id);
+                                        let scroll: f32 = ui.input(|i| {
+                                            i.events.iter().filter_map(|e| if let egui::Event::MouseWheel { delta, .. } = e { Some(delta.y) } else { None }).sum()
+                                        });
+                                        if scroll != 0.0 {
+                                            let pos = th::gain_to_pos(v) + if scroll > 0.0 { 0.025 } else { -0.025 };
+                                            v = th::pos_to_gain(pos);
+                                            if (v - 1.0).abs() < 0.04 {
+                                                v = 1.0;
+                                            }
+                                            m.set_volume(u.id, v);
+                                        }
+                                        // 滚轮在卡片上用来调音量，不再滚动整个房间
+                                        ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
+                                        let sr = egui::Rect::from_min_max(rect.left_top() + Vec2::new(8.0, 6.0), rect.right_top() + Vec2::new(-8.0, 28.0));
+                                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr).layout(Layout::left_to_right(Align::Center)));
+                                        if th::vol_slider(&mut child, &mut v, "", (sr.width() - 56.0).max(40.0)).changed() {
+                                            m.set_volume(u.id, v);
+                                        }
+                                    } else {
+                                        p.text(rect.right_top() + Vec2::new(-10.0, 10.0), Align2::RIGHT_TOP, route, egui::FontId::proportional(11.0), rc);
+                                    }
                                     if u.muted || u.deafened {
                                         let b = egui::Rect::from_center_size(rect.right_bottom() + Vec2::new(-22.0, -22.0), Vec2::splat(24.0));
                                         p.circle_filled(b.center(), 12.0, th::RED_SOFT());
@@ -1049,7 +1120,7 @@ impl App {
                                     } else if talking {
                                         "正在说话"
                                     } else {
-                                        "右键左侧名单里的名字可以调音量、线路、私聊"
+                                        "鼠标放在卡片上可以调他的音量（拖滑块或滚轮）；右键左侧名单里的名字可以调线路、私聊"
                                     });
                                 }
                             });
@@ -1472,6 +1543,12 @@ impl App {
         if toggled_state {
             self.sync_voice_state();
         }
+        if dev_refresh_req {
+            self.refresh_devices();
+        }
+        if restart_audio_req {
+            self.restart_audio();
+        }
         if disconnect {
             self.go_login(None);
         }
@@ -1504,7 +1581,10 @@ impl App {
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            // 第一次打开在正中间，之后可以拖（第 83 项：以前钉在中间拖不动）
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .constrain(true)
             .show(ctx, |ui| {
                 // 左侧分类导航、右侧内容（第 59 项）
                 const NAV: [(u8, Icon, &str); 8] = [
@@ -1619,14 +1699,11 @@ impl App {
                     ui.checkbox(&mut self.cfg.voice_10ms, "低延迟语音（10 ms 一包）").on_hover_text(
                         "语音少 10 ms 延迟；每条线路多占约 30 kbps 上行。\n频道里有人用旧版本时自动按 20 ms 一包发（他那边才听得顺）",
                     );
-                    let mut gain = self.cfg.input_gain * 100.0;
-                    if ui.add(egui::Slider::new(&mut gain, 0.0..=400.0).suffix("%").text("麦克风增益")).changed() {
-                        self.cfg.input_gain = gain / 100.0;
+                    // 第 80 / 86 项：按人耳感觉走，最高 200%（和左下角麦克风 / 耳机菜单里的是同一个值）
+                    if th::vol_slider(ui, &mut self.cfg.input_gain, "麦克风音量", 200.0).changed() {
                         self.settings.input_gain.set(self.cfg.input_gain);
                     }
-                    let mut vol = self.cfg.output_volume * 100.0;
-                    if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").text("输出音量")).changed() {
-                        self.cfg.output_volume = vol / 100.0;
+                    if th::vol_slider(ui, &mut self.cfg.output_volume, "输出音量（所有人）", 200.0).changed() {
                         self.settings.output_volume.set(self.cfg.output_volume);
                     }
                     ui.checkbox(&mut self.cfg.notify, "被 @ 或收到私聊时弹出 Windows 通知（VOC 不在前台时）")
@@ -1701,6 +1778,13 @@ impl App {
                             ui.end_row();
                         });
                         apply_dn |= ui.button("加载插件").clicked();
+                    }
+                    // 降噪器的名字随时读（第 82 项：DeepFilterNet3 加载好以前是「加载中」，以前这里停在选它那一刻）；
+                    // 编码线程正拿着锁时用上次的
+                    if let (Ok(_), Ok(slot)) = (&self.denoise_status, self.denoise.try_lock()) {
+                        if let Some(d) = slot.as_ref() {
+                            self.denoise_status = Ok(format!("已启用：{}", d.name()));
+                        }
                     }
                     match &self.denoise_status {
                         Ok(st) => ui.label(RichText::new(st).size(12.0).color(th::GREEN())),
@@ -2136,6 +2220,101 @@ impl App {
         ui.add_space(8.0);
     }
 
+    // ============================================================ 界面大小 / 迷你模式（第 84 项）
+
+    /// 按窗口大小缩放界面：默认窗口（1180 × 760）= 100%，按宽、高里比例小的那个算，25%～160%（在 Windows 显示缩放之上再乘）；
+    /// 变化不到 5% 不改（拖窗口边时字不会一直抖）。要缩到 50% 以下就换迷你模式（字保持正常大小）。设置里选了固定大小就不跟窗口变
+    fn auto_zoom(&mut self, ctx: &egui::Context) {
+        let cur = ctx.zoom_factor();
+        // 窗口本身有多大（按 100% 算的点数）
+        let size = ctx.content_rect().size() * cur;
+        if size.x < 10.0 || size.y < 10.0 {
+            return;
+        }
+        let raw = (size.x / BASE_W).min(size.y / BASE_H);
+        let mini = raw < MINI_BELOW && matches!(self.screen, Screen::Main(_));
+        let want = if mini {
+            // 迷你模式按它自己的大小（约 300 × 240）缩，最多 100%
+            (size.x / 300.0).min(size.y / 240.0).clamp(0.6, 1.0)
+        } else if self.cfg.ui_scale == 0 {
+            raw.clamp(0.25, 1.6)
+        } else {
+            self.cfg.ui_scale.clamp(50, 200) as f32 / 100.0
+        };
+        if mini != self.mini {
+            self.mini = mini;
+            ctx.set_zoom_factor(want);
+            return;
+        }
+        if ((want - cur) / cur).abs() > 0.05 || (self.cfg.ui_scale != 0 && (want - cur).abs() > 0.001) {
+            ctx.set_zoom_factor(want);
+        }
+    }
+
+    /// 迷你模式：频道名、这个频道里的人（说话时亮起、闭麦 / 静音的标记）、闭麦 / 静音 / 挂断
+    fn ui_mini(&mut self, ui: &mut egui::Ui) {
+        let Screen::Main(s) = &mut self.screen else { return };
+        let me = s.me().cloned();
+        let my_ch = me.as_ref().and_then(|u| u.channel_id);
+        let mut toggled = false;
+        egui::Frame::new().fill(th::BG_PANEL()).inner_margin(Margin::same(8)).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            let Some(ch) = my_ch else {
+                ui.label(RichText::new("没在语音频道").strong());
+                ui.label(RichText::new(&s.server_name).size(12.0).color(th::TEXT_DIM()));
+                ui.label(RichText::new("把窗口拉大可以看到完整界面").size(11.0).color(th::TEXT_FAINT()));
+                return;
+            };
+            let ch_name = s.channels.iter().find(|c| c.id == ch).map(|c| c.name.clone()).unwrap_or_default();
+            ui.horizontal(|ui| {
+                crate::icons::show(ui, Icon::Speaker, 14.0, th::TEXT_FAINT());
+                ui.add(egui::Label::new(RichText::new(ch_name).strong()).truncate());
+            });
+            ui.separator();
+            let members: Vec<UserInfo> = s.users.iter().filter(|u| u.channel_id == Some(ch)).cloned().collect();
+            let bar_h = 44.0;
+            egui::ScrollArea::vertical().max_height((ui.available_height() - bar_h).max(20.0)).auto_shrink([false, true]).show(ui, |ui| {
+                for u in &members {
+                    let is_me = Some(u.id) == me.as_ref().map(|m| m.id);
+                    let talking = if is_me { self.settings.transmitting.load(Ordering::Relaxed) } else { self.voice.is_speaking(u.id) };
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.5, if talking { th::GREEN() } else { th::BG_ACTIVE() });
+                        let name = if is_me { format!("{}（我）", u.name) } else { u.name.clone() };
+                        ui.add(egui::Label::new(RichText::new(name).color(if talking { th::GREEN() } else { th::TEXT() })).truncate());
+                        if u.deafened {
+                            crate::icons::show(ui, Icon::HeadphonesOff, 13.0, th::RED());
+                        } else if u.muted {
+                            crate::icons::show(ui, Icon::MicOff, 13.0, th::RED());
+                        }
+                    });
+                }
+            });
+            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                ui.horizontal(|ui| {
+                    let muted = self.settings.muted.load(Ordering::Relaxed);
+                    let deaf = self.settings.deafened.load(Ordering::Relaxed);
+                    if th::icon_button(ui, if muted { Icon::MicOff } else { Icon::Mic }, if muted { "取消闭麦" } else { "闭麦" }, if muted { Tone::Danger } else { Tone::Normal }).clicked() {
+                        self.settings.muted.store(!muted, Ordering::Relaxed);
+                        toggled = true;
+                    }
+                    if th::icon_button(ui, if deaf { Icon::HeadphonesOff } else { Icon::Headphones }, if deaf { "取消静音" } else { "静音：听不到别人" }, if deaf { Tone::Danger } else { Tone::Normal }).clicked() {
+                        self.settings.deafened.store(!deaf, Ordering::Relaxed);
+                        toggled = true;
+                    }
+                    if th::icon_button(ui, Icon::Leave, "挂断（离开语音频道）", Tone::Danger).clicked() {
+                        s.send(ClientMsg::LeaveChannel);
+                    }
+                });
+            });
+        });
+        // 说话的人亮起来要及时刷新
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        if toggled {
+            self.sync_voice_state();
+        }
+    }
+
     // ============================================================ 外观页（第 59 项）
 
     fn ui_appearance_page(&mut self, ui: &mut egui::Ui) {
@@ -2146,6 +2325,15 @@ impl App {
         th::section(ui, "配色");
         let opts: Vec<(u8, &str)> = th::STYLES.iter().enumerate().map(|(i, s)| (i as u8, s.0)).collect();
         th::segmented(ui, &mut self.cfg.palette, &opts);
+        ui.add_space(10.0);
+        // 界面大小（第 84 项）
+        th::section(ui, "界面大小");
+        th::segmented(ui, &mut self.cfg.ui_scale, &[(0u32, "自动"), (90, "90%"), (100, "100%"), (110, "110%"), (125, "125%"), (150, "150%")]);
+        ui.label(
+            RichText::new("「自动」：窗口拉大字和按钮跟着变大，拉小跟着变小（25%～160%）；小到一定程度换成迷你模式，只留频道里的人和闭麦 / 静音 / 挂断。")
+                .size(11.5)
+                .color(th::TEXT_FAINT()),
+        );
         ui.add_space(10.0);
         th::section(ui, "毛玻璃效果");
         let r = ui.checkbox(&mut self.cfg.glass, "毛玻璃效果").on_hover_text(
@@ -2500,12 +2688,23 @@ impl App {
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .constrain(true)
             .show(ctx, |ui| {
                 ui.set_width(400.0);
                 // 内容放进滚动区（第 74 项：VOC 窗口不够高时以前上下被截掉，标题和「开始共享」都看不到）；「开始共享」固定在下面
                 let max_h = (ctx.content_rect().height() - 150.0).max(160.0);
                 egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    // 系统不支持的截屏设置（第 79 项）：照样能共享，告诉共享者有什么不一样
+                    let limits = video::capture_limits();
+                    if !limits.is_empty() {
+                        let text = format!("你的 Windows 版本较旧，有几项截屏设置用不了（照样能共享）：
+· {}", limits.join("
+· "));
+                        ui.label(RichText::new(text).size(11.5).color(th::YELLOW()));
+                        ui.add_space(6.0);
+                    }
                     if let Some(sh) = &self.sharer {
                         let st = &sh.stats;
                         th::pill(ui, format!("● 正在共享 {}", sh.cfg.desc()), th::GREEN(), th::GREEN_SOFT());
@@ -2843,9 +3042,9 @@ impl App {
                                 if v.info.share_audio {
                                     let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, *id);
                                     let mut m = mixer.lock().unwrap();
-                                    let mut vol = m.volume(sid) * 100.0;
-                                    if ui.add(egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").text("🔊")).changed() {
-                                        m.set_volume(sid, vol / 100.0);
+                                    let mut vol = m.volume(sid);
+                                    if th::vol_slider(ui, &mut vol, "🔊", 110.0).changed() {
+                                        m.set_volume(sid, vol);
                                     }
                                 }
                             });
@@ -3092,9 +3291,13 @@ fn member_row(ui: &mut egui::Ui, u: &UserInfo, speaking: bool, right: impl FnOnc
 }
 
 fn device_combo(ui: &mut egui::Ui, id: &str, sel: &mut Option<String>, list: &[String]) -> bool {
+    device_combo_w(ui, id, sel, list, 330.0)
+}
+
+fn device_combo_w(ui: &mut egui::Ui, id: &str, sel: &mut Option<String>, list: &[String], width: f32) -> bool {
     let before = sel.clone();
     egui::ComboBox::from_id_salt(id)
-        .width(330.0)
+        .width(width)
         .selected_text(sel.clone().unwrap_or_else(|| "系统默认".into()))
         .show_ui(ui, |ui| {
             ui.selectable_value(sel, None, "系统默认");
@@ -3149,6 +3352,8 @@ impl eframe::App for App {
         }
         // 闭麦 / 静音快捷键由后台线程全局检测（hotkey.rs），窗口在不在前台都一样
         self.handle_hotkeys();
+        self.sync_user_volumes();
+        self.auto_zoom(ui.ctx());
 
         match &self.screen {
             Screen::Login { error } => {
@@ -3156,6 +3361,7 @@ impl eframe::App for App {
                 self.ui_login(ui, e, false);
             }
             Screen::Connecting(_) => self.ui_login(ui, None, true),
+            Screen::Main(_) if self.mini => self.ui_mini(ui),
             Screen::Main(_) => self.ui_main(ui),
             Screen::Reconnecting(_) => self.ui_reconnecting(ui),
         }
@@ -3323,217 +3529,209 @@ fn viewer_body(
     let info = v.info.clone();
     let desc = info.desc.clone();
     let (shown_fps, jitter) = v.shown_stats();
-    ui.horizontal_wrapped(|ui| {
-        th::pill(ui, desc.clone(), th::ACCENT_HOVER(), th::ACCENT_SOFT());
-        th::pill(ui, format!("{}×{}", v.size.0, v.size.1), th::TEXT_DIM(), th::BG_ELEVATED());
-        // 每秒更新一次这一秒的收包情况（掉帧原因用）
-        if let Some((now_st, _, _)) = voice.video.rx_stats(id) {
-            match v.rx_prev {
-                Some((prev, at)) if at.elapsed() >= std::time::Duration::from_secs(1) => {
-                    let lost = now_st.data_lost.saturating_sub(prev.data_lost) as f32;
-                    let total = now_st.data_total.saturating_sub(prev.data_total).max(1) as f32;
-                    v.rates = th::ViewRates {
-                        rx_fps: v.view.rx_fps.load(Ordering::Relaxed),
-                        // 实际换上屏幕的帧数（不是解码交出的帧数，第 56-a 项）
-                        shown_fps,
-                        loss_pct: lost * 100.0 / total,
-                        gaps: now_st.gaps.saturating_sub(prev.gaps),
-                        fec: now_st.fec_recovered.saturating_sub(prev.fec_recovered),
-                        rtx: now_st.rtx_recovered.saturating_sub(prev.rtx_recovered),
-                    };
-                    v.rx_prev = Some((now_st, std::time::Instant::now()));
-                }
-                None => v.rx_prev = Some((now_st, std::time::Instant::now())),
-                _ => {}
+    // 每秒更新一次这一秒的收包情况（掉帧原因用）
+    if let Some((now_st, _, _)) = voice.video.rx_stats(id) {
+        match v.rx_prev {
+            Some((prev, at)) if at.elapsed() >= std::time::Duration::from_secs(1) => {
+                let lost = now_st.data_lost.saturating_sub(prev.data_lost) as f32;
+                let total = now_st.data_total.saturating_sub(prev.data_total).max(1) as f32;
+                v.rates = th::ViewRates {
+                    rx_fps: v.view.rx_fps.load(Ordering::Relaxed),
+                    // 实际换上屏幕的帧数（不是解码交出的帧数，第 56-a 项）
+                    shown_fps,
+                    loss_pct: lost * 100.0 / total,
+                    gaps: now_st.gaps.saturating_sub(prev.gaps),
+                    fec: now_st.fec_recovered.saturating_sub(prev.fec_recovered),
+                    rtx: now_st.rtx_recovered.saturating_sub(prev.rtx_recovered),
+                };
+                v.rx_prev = Some((now_st, std::time::Instant::now()));
             }
-        }
-        let sinfo = v.view.sharer_info.lock().unwrap().filter(|(_, t)| t.elapsed() < std::time::Duration::from_secs(3)).map(|(i, _)| i);
-        let why = th::drop_reason(sinfo.as_ref(), &v.rates);
-        let (fg, bg) = if why.is_some() { (th::YELLOW(), th::BG_ELEVATED()) } else { (th::TEXT_DIM(), th::BG_ELEVATED()) };
-        let mut tip = String::new();
-        if let Some(i) = &sinfo {
-            tip.push_str(&format!(
-                "共享者：选了 {} 帧 · 屏幕 / 游戏给了 {} 帧 · 采集 {} 帧 · 编码发出 {} 帧\n  画面没变少发 {} 帧 · 码率控制跳过 {} 帧 · 每帧编码 {} ms · 码率 {:.1} Mbps（设定值的 {}%）{}\n",
-                i.target_fps, i.source_fps, i.capture_fps, i.sent_fps, i.static_skipped, i.rate_skipped, i.encode_ms,
-                i.kbps as f32 / 1000.0, i.rate_pct, if i.congested { " · 上行拥塞" } else { "" }
-            ));
-        } else {
-            tip.push_str("共享者是旧版本，看不到他那边的采集 / 编码帧数\n");
-        }
-        let r = v.rates;
-        tip.push_str(&format!(
-            "你这边：收到 {} 帧 · 解码交出 {} 帧 · 实际显示 {} 帧 · 画面间隔抖动 {:.0} ms\n  原始丢包 {:.1}% · 冗余救回 {} 片 · 补发收回 {} 片 · 放弃 {} 帧",
-            r.rx_fps,
-            v.view.fps.load(Ordering::Relaxed),
-            shown_fps,
-            jitter,
-            r.loss_pct,
-            r.fec,
-            r.rtx,
-            r.gaps
-        ));
-        // 大概的延迟：共享者编码 + 单程网络（往返的一半）+ 本机解码 + 等着画上屏幕（第 36-6 / 56-a 项）
-        let rtt = voice.video.rx_stats(id).map(|s| s.2).unwrap_or(0);
-        let show = v.view.show_ms.load(Ordering::Relaxed);
-        let paint = v.paint_ms.round() as u32;
-        let buf_wait = v.view.av_wait_ms.load(Ordering::Relaxed);
-        let lat = sinfo.map(|i| i.encode_ms as u32).unwrap_or(0) + rtt / 2 + show + paint + buf_wait;
-        tip.push_str(&format!(
-            "\n延迟大约 {lat} ms（共享者编码 + 网络单程约 {} ms + 缓冲 {buf_wait} ms + 本机解码 {show} ms + 等着画上屏幕 {paint} ms；不含截屏和显示器本身）",
-            rtt / 2
-        ));
-        if let Some(w) = &why {
-            tip = format!("掉帧原因：{w}\n\n{tip}");
-        }
-        // 画面间隔忽长忽短（抖动 > 8 ms）时也标黄：平均帧数够，看着也会一顿一顿
-        let (fg, bg) = if jitter > 8.0 && why.is_none() { (th::YELLOW(), th::BG_ELEVATED()) } else { (fg, bg) };
-        th::pill(ui, format!("{shown_fps} fps · 约 {lat} ms"), fg, bg).on_hover_text(tip);
-        let dec = v.view.decoder.lock().unwrap().clone();
-        if !dec.is_empty() {
-            th::pill(ui, dec, th::TEXT_DIM(), th::BG_ELEVATED());
-        }
-        th::pill(ui, "🔒 端到端加密", th::GREEN(), th::GREEN_SOFT());
-        {
-            // 画质 / 线路 / 播放方式收进「⚙」菜单（第 53-4 项：顶栏一行按钮太挤，窗口小了会折行）
-            ui.menu_button("⚙ 画质 · 线路", |ui| {
-                if info.simulcast {
-                    ui.label(RichText::new("画质").size(12.0).color(th::TEXT_DIM()));
-                    let before = v.low;
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut v.low, false, "原画").on_hover_text(format!("按共享者设置的 {desc} 观看"));
-                        ui.selectable_value(&mut v.low, true, "流畅").on_hover_text("360P 低画质，省流量、网络差时更不容易卡");
-                    });
-                    if v.low != before {
-                        v.out.relayer = true;
-                    }
-                    ui.separator();
-                }
-                ui.label(RichText::new("画面线路").size(12.0).color(th::TEXT_DIM()));
-                let before = v.route;
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut v.route, 0, "自动").on_hover_text("能直连就直连，否则经服务器（推荐）");
-                    ui.selectable_value(&mut v.route, 1, "P2P").on_hover_text(
-                        "画面直接从共享者发给你，不受对方上行预算限制；和对方打不通时仍经服务器。\n双方都要 0.4.2 以上，服务器也要升级",
-                    );
-                    ui.selectable_value(&mut v.route, 2, "服务器")
-                        .on_hover_text("画面经服务器转给你。直连卡顿、花屏或一直等待画面时试试\n双方都要 0.4.2 以上，服务器也要升级");
-                });
-                if v.route != before {
-                    v.out.relayer = true;
-                }
-                // 播放方式：流畅优先（匀速，默认）/ 延迟优先（到了就显示）
-                ui.separator();
-                ui.label(RichText::new("播放方式").size(12.0).color(th::TEXT_DIM()));
-                let mut smooth = v.view.smooth.load(Ordering::Relaxed);
-                let was = smooth;
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut smooth, true, "流畅优先")
-                        .on_hover_text("画面按共享者截屏时的节奏匀速显示，看着更顺；网络稳时只多一两帧的延迟");
-                    ui.selectable_value(&mut smooth, false, "延迟优先").on_hover_text("画面一到就显示，延迟最低；网络抖时会一顿一顿的");
-                });
-                if smooth != was {
-                    v.view.smooth.store(smooth, Ordering::Relaxed);
-                    v.out.smooth = Some(smooth);
-                }
-                // 观看缓冲（第 78 项）：先攒一点再放，网络停一下画面不停；共享声音跟着一起晚，音画对齐
-                ui.separator();
-                ui.label(RichText::new("缓冲（防卡顿）").size(12.0).color(th::TEXT_DIM()));
-                let mut mode = video::BUFFER_MODE.load(Ordering::Relaxed);
-                let mut max_ms = video::BUFFER_MAX_MS.load(Ordering::Relaxed);
-                let (m0, x0) = (mode, max_ms);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut mode, 0, "关").on_hover_text("不加缓冲，延迟最低（默认）");
-                    ui.selectable_value(&mut mode, 1, "自动")
-                        .on_hover_text("按你这边的网络自己调：卡过就加一点，稳了慢慢减；不超过下面设的上限");
-                    ui.selectable_value(&mut mode, 2, "固定").on_hover_text("一直缓冲下面设的这么多");
-                });
-                let label = if mode == 2 { "缓冲" } else { "最多缓冲" };
-                ui.add_enabled(
-                    mode != 0,
-                    egui::Slider::new(&mut max_ms, video::BUFFER_RANGE_MS.0..=video::BUFFER_RANGE_MS.1).suffix(" ms").step_by(10.0).text(label),
-                );
-                if mode != 0 {
-                    let now_ms = v.view.buffer_ms.load(Ordering::Relaxed);
-                    ui.label(
-                        RichText::new(format!("现在缓冲 {now_ms} ms：网络停顿不超过这么久，画面照常走；画面会晚这么多，共享声音跟着一起晚（音画同步）"))
-                            .size(11.5)
-                            .color(th::TEXT_FAINT()),
-                    );
-                    ui.label(RichText::new("开了缓冲时不用上面的「播放方式」").size(11.5).color(th::TEXT_FAINT()));
-                }
-                if (mode, max_ms) != (m0, x0) {
-                    video::BUFFER_MODE.store(mode, Ordering::Relaxed);
-                    video::BUFFER_MAX_MS.store(max_ms, Ordering::Relaxed);
-                    v.out.buffer = Some((mode, max_ms));
-                }
-            });
-            match voice.video_direct(id) {
-                Some(true) => th::pill(ui, "⇄ 直连中", th::GREEN(), th::GREEN_SOFT()),
-                // 经别的观看者转来的（只走 P2P 时不会经服务器）
-                Some(false) if info.p2p_only => th::pill(ui, "经队友转发", th::TEXT_DIM(), th::BG_ELEVATED()),
-                Some(false) => th::pill(ui, "经服务器", th::TEXT_DIM(), th::BG_ELEVATED()),
-                None => th::pill(ui, "没收到画面", th::YELLOW(), th::BG_ELEVATED()),
-            }
-            .on_hover_text(th::video_route_explain(voice.video_direct(id), voice.current_link().and_then(|l| l.direct_peers().get(&id).copied()).as_ref(), v.route, info.p2p_only));
-            if info.p2p_only {
-                th::pill(ui, "共享者只走 P2P", th::TEXT_DIM(), th::BG_ELEVATED())
-                    .on_hover_text("共享者设置了画面不经服务器：和他打不通直连、也没有别的观看者能转给你时看不了");
-            }
-        }
-        // 共享者开了 120 帧、这台电脑的屏幕显示不了那么多（第 64 项）
-        if let Some(t) = sinfo.map(|i| i.target_fps as u32).filter(|t| *t > 60) {
-            let r = video::max_refresh();
-            if r + 1 < t {
-                ui.label(RichText::new(format!("对方在用 {t} 帧共享（试验），你的屏幕最多显示 {r} 帧")).size(12.0).color(th::TEXT_FAINT()));
-            }
-        }
-        // 共享的是窗口：最小化 / 关掉了（第 60-1 项）
-        match sinfo.map(|i| i.window_state) {
-            Some(1) => {
-                ui.label(RichText::new("共享的窗口被最小化了，对方把它恢复后画面就会回来").size(12.0).color(th::YELLOW()));
-            }
-            Some(2) => {
-                ui.label(RichText::new("共享的窗口已经关了").size(12.0).color(th::YELLOW()));
-            }
+            None => v.rx_prev = Some((now_st, std::time::Instant::now())),
             _ => {}
         }
-        // 选项冲突时以更保守的一方为准，并说明原因（第 46 / 44 项）
-        if info.p2p_only && voice.video_direct(id).is_none() {
-            let why = if v.route == 2 {
-                "共享者设置了「只走 P2P」，而你选了画面「服务器」：两边都按更保守的来，这样看不了。改选「自动」或「P2P」试试。"
-            } else {
-                "共享者设置了「只走 P2P」（画面不经服务器），你和他之间还没打通直连，也没有别的观看者能转给你。打洞成功后会自动出画面。"
-            };
-            ui.label(RichText::new(why).size(12.0).color(th::YELLOW()));
+    }
+    let sinfo = v.view.sharer_info.lock().unwrap().filter(|(_, t)| t.elapsed() < std::time::Duration::from_secs(3)).map(|(i, _)| i);
+    let why = th::drop_reason(sinfo.as_ref(), &v.rates);
+    let (fg, bg) = if why.is_some() { (th::YELLOW(), th::BG_ELEVATED()) } else { (th::TEXT_DIM(), th::BG_ELEVATED()) };
+    let mut tip = String::new();
+    if let Some(i) = &sinfo {
+        tip.push_str(&format!(
+            "共享者：选了 {} 帧 · 屏幕 / 游戏给了 {} 帧 · 采集 {} 帧 · 编码发出 {} 帧\n  画面没变少发 {} 帧 · 码率控制跳过 {} 帧 · 每帧编码 {} ms · 码率 {:.1} Mbps（设定值的 {}%）{}\n",
+            i.target_fps, i.source_fps, i.capture_fps, i.sent_fps, i.static_skipped, i.rate_skipped, i.encode_ms,
+            i.kbps as f32 / 1000.0, i.rate_pct, if i.congested { " · 上行拥塞" } else { "" }
+        ));
+    } else {
+        tip.push_str("共享者是旧版本，看不到他那边的采集 / 编码帧数\n");
+    }
+    let r = v.rates;
+    tip.push_str(&format!(
+        "你这边：收到 {} 帧 · 解码交出 {} 帧 · 实际显示 {} 帧 · 画面间隔抖动 {:.0} ms\n  原始丢包 {:.1}% · 冗余救回 {} 片 · 补发收回 {} 片 · 放弃 {} 帧",
+        r.rx_fps,
+        v.view.fps.load(Ordering::Relaxed),
+        shown_fps,
+        jitter,
+        r.loss_pct,
+        r.fec,
+        r.rtx,
+        r.gaps
+    ));
+    // 大概的延迟：共享者编码 + 单程网络（往返的一半）+ 本机解码 + 等着画上屏幕（第 36-6 / 56-a 项）
+    let rtt = voice.video.rx_stats(id).map(|s| s.2).unwrap_or(0);
+    let show = v.view.show_ms.load(Ordering::Relaxed);
+    let paint = v.paint_ms.round() as u32;
+    let buf_wait = v.view.av_wait_ms.load(Ordering::Relaxed);
+    let lat = sinfo.map(|i| i.encode_ms as u32).unwrap_or(0) + rtt / 2 + show + paint + buf_wait;
+    tip.push_str(&format!(
+        "\n延迟大约 {lat} ms（共享者编码 + 网络单程约 {} ms + 缓冲 {buf_wait} ms + 本机解码 {show} ms + 等着画上屏幕 {paint} ms；不含截屏和显示器本身）",
+        rtt / 2
+    ));
+    if let Some(w) = &why {
+        tip = format!("掉帧原因：{w}\n\n{tip}");
+    }
+    // 画面间隔忽长忽短（抖动 > 8 ms）时也标黄：平均帧数够，看着也会一顿一顿
+    let (fg, bg) = if jitter > 8.0 && why.is_none() { (th::YELLOW(), th::BG_ELEVATED()) } else { (fg, bg) };
+    let dec = v.view.decoder.lock().unwrap().clone();
+    let route_now = voice.video_direct(id);
+    let route_txt = match route_now {
+        Some(true) => "直连",
+        // 经别的观看者转来的（只走 P2P 时不会经服务器）
+        Some(false) if info.p2p_only => "经队友转发",
+        Some(false) => "经服务器",
+        None => "没收到画面",
+    };
+    let route_tip = th::video_route_explain(route_now, voice.current_link().and_then(|l| l.direct_peers().get(&id).copied()).as_ref(), v.route, info.p2p_only);
+    let full_tip = format!(
+        "{tip}\n\n分辨率 {}×{} · 解码 {} · 🔒 端到端加密 · 画面线路：{route_txt}{}",
+        v.size.0,
+        v.size.1,
+        if dec.is_empty() { "-" } else { dec.as_str() },
+        if info.p2p_only { " · 共享者设置了只走 P2P" } else { "" }
+    );
+    // 标题栏（第 85 项）：左边是谁的屏幕 + 一个状态小标签（详细数字在悬停提示里），右边 声音 · ⚙ · 弹出 · 全屏 · 关闭
+    ui.horizontal(|ui| {
+        let title = if info.name.is_empty() { "屏幕共享".to_string() } else { format!("{} 的屏幕", info.name) };
+        ui.label(RichText::new(title).strong());
+        th::pill(ui, format!("{desc} · {shown_fps} fps · 约 {lat} ms"), fg, bg).on_hover_text(full_tip);
+        if route_now.is_none() {
+            th::pill(ui, "没收到画面", th::YELLOW(), th::BG_ELEVATED()).on_hover_text(route_tip.clone());
         }
-        // 共享声音的音量：只影响你自己听到的大小，和他说话的音量分开调
-        {
-            // 竖线固定高度（第 73 项：ui.separator() 在这一行里会按剩下的高度往下撑）
-            let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 20.0), Sense::hover());
-            ui.painter().rect_filled(r, CornerRadius::ZERO, th::BORDER());
-            let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, id);
-            let mut m = mixer.lock().unwrap();
-            let mut vol = m.volume(sid) * 100.0;
-            // 一个个控件直接放在这一行里（不包一层子区域），放不下时整个换到下一行，不会跑出窗口
-            let on = info.share_audio;
-            {
-                let ui = &mut *ui;
-                ui.spacing_mut().slider_width = 110.0;
-                let icon = if vol < 0.5 { "🔇" } else { "🔊" };
-                if ui.add_enabled(on, egui::Button::new(icon)).on_hover_text("静音 / 恢复共享声音").on_disabled_hover_text("对方没有勾选「同时共享电脑声音」").clicked() {
-                    vol = if vol < 0.5 { 100.0 } else { 0.0 };
-                    m.set_volume(sid, vol / 100.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if th::icon_button(ui, Icon::Close, "关闭画面（不看了）", Tone::Normal).clicked() {
+                v.out.close = true;
+            }
+            if th::icon_button(ui, Icon::Fullscreen, "全屏观看（双击画面也可以；Esc 退出）", Tone::Normal).clicked() {
+                v.out.go_full = true;
+            }
+            let pop_tip = if v.popped { "收回到 VOC 主窗口里" } else { "弹出成独立窗口：可以拖到另一个显示器、置顶，主窗口照常聊天" };
+            if th::icon_button(ui, if v.popped { Icon::Back } else { Icon::PopOut }, pop_tip, Tone::Normal).clicked() {
+                v.out.toggle_pop = true;
+            }
+            if v.popped && ui.checkbox(&mut v.on_top, "置顶").on_hover_text("这个窗口总在最前面（打游戏时也看得到）").changed() {
+                let level = if v.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            }
+            // 画质 / 线路 / 播放方式 / 缓冲收进「⚙」菜单（第 53-4 项）；线路状态也写在最上面
+            ui.menu_button(RichText::new("⚙").size(16.0), |ui| {
+                ui.set_min_width(300.0);
+                ui.label(RichText::new(format!("画面线路：{route_txt}")).size(12.0).color(th::TEXT())).on_hover_text(route_tip.clone());
+                if info.p2p_only {
+                    ui.label(RichText::new("共享者设置了只走 P2P（画面不经服务器）").size(11.5).color(th::TEXT_FAINT()));
                 }
-                ui.add_enabled(on, egui::Label::new(RichText::new("共享声音").size(12.0).color(th::TEXT_DIM())));
-                // 共享声音的播放情况（第 54-d 项）：分清杂音是网络丢包、播放缓冲见底，还是共享者那边录音丢数据
-                let a = m.stream_stats(sid).unwrap_or_default();
-                let glitch = v.view.sharer_info.lock().unwrap().map(|(i, _)| i.audio_glitches).unwrap_or(0);
-                let audio_tip = format!(
+                ui.separator();
+
+                    if info.simulcast {
+                        ui.label(RichText::new("画质").size(12.0).color(th::TEXT_DIM()));
+                        let before = v.low;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut v.low, false, "原画").on_hover_text(format!("按共享者设置的 {desc} 观看"));
+                            ui.selectable_value(&mut v.low, true, "流畅").on_hover_text("360P 低画质，省流量、网络差时更不容易卡");
+                        });
+                        if v.low != before {
+                            v.out.relayer = true;
+                        }
+                        ui.separator();
+                    }
+                    ui.label(RichText::new("画面线路").size(12.0).color(th::TEXT_DIM()));
+                    let before = v.route;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut v.route, 0, "自动").on_hover_text("能直连就直连，否则经服务器（推荐）");
+                        ui.selectable_value(&mut v.route, 1, "P2P").on_hover_text(
+                            "画面直接从共享者发给你，不受对方上行预算限制；和对方打不通时仍经服务器。\n双方都要 0.4.2 以上，服务器也要升级",
+                        );
+                        ui.selectable_value(&mut v.route, 2, "服务器")
+                            .on_hover_text("画面经服务器转给你。直连卡顿、花屏或一直等待画面时试试\n双方都要 0.4.2 以上，服务器也要升级");
+                    });
+                    if v.route != before {
+                        v.out.relayer = true;
+                    }
+                    // 播放方式：流畅优先（匀速，默认）/ 延迟优先（到了就显示）
+                    ui.separator();
+                    ui.label(RichText::new("播放方式").size(12.0).color(th::TEXT_DIM()));
+                    let mut smooth = v.view.smooth.load(Ordering::Relaxed);
+                    let was = smooth;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut smooth, true, "流畅优先")
+                            .on_hover_text("画面按共享者截屏时的节奏匀速显示，看着更顺；网络稳时只多一两帧的延迟");
+                        ui.selectable_value(&mut smooth, false, "延迟优先").on_hover_text("画面一到就显示，延迟最低；网络抖时会一顿一顿的");
+                    });
+                    if smooth != was {
+                        v.view.smooth.store(smooth, Ordering::Relaxed);
+                        v.out.smooth = Some(smooth);
+                    }
+                    // 观看缓冲（第 78 项）：先攒一点再放，网络停一下画面不停；共享声音跟着一起晚，音画对齐
+                    ui.separator();
+                    ui.label(RichText::new("缓冲（防卡顿）").size(12.0).color(th::TEXT_DIM()));
+                    let mut mode = video::BUFFER_MODE.load(Ordering::Relaxed);
+                    let mut max_ms = video::BUFFER_MAX_MS.load(Ordering::Relaxed);
+                    let (m0, x0) = (mode, max_ms);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut mode, 0, "关").on_hover_text("不加缓冲，延迟最低（默认）");
+                        ui.selectable_value(&mut mode, 1, "自动")
+                            .on_hover_text("按你这边的网络自己调：卡过就加一点，稳了慢慢减；不超过下面设的上限");
+                        ui.selectable_value(&mut mode, 2, "固定").on_hover_text("一直缓冲下面设的这么多");
+                    });
+                    let label = if mode == 2 { "缓冲" } else { "最多缓冲" };
+                    ui.add_enabled(
+                        mode != 0,
+                        egui::Slider::new(&mut max_ms, video::BUFFER_RANGE_MS.0..=video::BUFFER_RANGE_MS.1).suffix(" ms").step_by(10.0).text(label),
+                    );
+                    if mode != 0 {
+                        let now_ms = v.view.buffer_ms.load(Ordering::Relaxed);
+                        ui.label(
+                            RichText::new(format!("现在缓冲 {now_ms} ms：网络停顿不超过这么久，画面照常走；画面会晚这么多，共享声音跟着一起晚（音画同步）"))
+                                .size(11.5)
+                                .color(th::TEXT_FAINT()),
+                        );
+                        ui.label(RichText::new("开了缓冲时不用上面的「播放方式」").size(11.5).color(th::TEXT_FAINT()));
+                    }
+                    if (mode, max_ms) != (m0, x0) {
+                        video::BUFFER_MODE.store(mode, Ordering::Relaxed);
+                        video::BUFFER_MAX_MS.store(max_ms, Ordering::Relaxed);
+                        v.out.buffer = Some((mode, max_ms));
+                    }
+            })
+            .response
+            .on_hover_text("画质 · 线路 · 播放方式 · 缓冲");
+            // 共享声音：点开调音量（只影响你自己听到的，和他说话的音量分开）
+            let sid = crate::audio::stream_mixer_id(voc_proto::udp::SHARE_AUDIO, id);
+            let on = info.share_audio;
+            let vol_now = mixer.lock().unwrap().volume(sid);
+            let icon = if !on || vol_now < 0.005 { "🔇" } else { "🔊" };
+            ui.add_enabled_ui(on, |ui| {
+                ui.menu_button(RichText::new(icon).size(15.0), |ui| {
+                    ui.set_min_width(260.0);
+                    let mut m = mixer.lock().unwrap();
+
+                    // 共享声音的播放情况（第 54-d 项）：分清杂音是网络丢包、播放缓冲见底，还是共享者那边录音丢数据
+                    let a = m.stream_stats(sid).unwrap_or_default();
+                    let glitch = v.view.sharer_info.lock().unwrap().map(|(i, _)| i.audio_glitches).unwrap_or(0);
+                    let audio_tip = format!(
                     "只调你听到的共享声音大小（游戏、视频的声音），不影响他说话的音量；右键他的名字也能调\n\n\
-                     共享声音：缓冲 {} ms（目标 {}）· 丢包补音 {} 帧 · 播空 {} 次 · 积压丢弃 {} 次 · 播放速度 {:+.1}%\n\
-                     音量太大、峰值被压低：{} 次\n\
-                     共享者那边录音没跟上：最近一秒 {glitch} 次\n\
-                     有「咔哒」声时：补音、播空多 = 网络问题；录音没跟上 = 共享者电脑太忙",
+                    共享声音：缓冲 {} ms（目标 {}）· 丢包补音 {} 帧 · 播空 {} 次 · 积压丢弃 {} 次 · 播放速度 {:+.1}%\n\
+                    音量太大、峰值被压低：{} 次\n\
+                    共享者那边录音没跟上：最近一秒 {glitch} 次\n\
+                    有「咔哒」声时：补音、播空多 = 网络问题；录音没跟上 = 共享者电脑太忙",
                     a.buffered_ms,
                     a.target_ms,
                     a.concealed,
@@ -3541,34 +3739,55 @@ fn viewer_body(
                     a.drops,
                     a.rate_permille as f32 / 10.0,
                     a.limited
-                );
-                let resp = ui.add_enabled(on, egui::Slider::new(&mut vol, 0.0..=200.0).suffix("%").fixed_decimals(0)).on_hover_text(audio_tip);
-                // 第 57 项：真的在压峰值时提示（不压就不显示）
-                if a.limited_recently && vol > 100.0 {
-                    ui.label(RichText::new("音量过大").size(12.0).color(th::YELLOW()))
-                        .on_hover_text("共享声音开得太大，响的地方正在被压低（不会破音，但会忽大忽小）。调到 100% 左右更自然");
-                }
-                if resp.on_disabled_hover_text("对方没有勾选「同时共享电脑声音」").changed() {
-                    m.set_volume(sid, vol / 100.0);
-                }
-            }
-        }
-        if ui.button("全屏").on_hover_text("全屏观看（双击画面也可以；Esc 退出）").clicked() {
-            v.out.go_full = true;
-        }
-        let (pop_text, pop_tip) = if v.popped {
-            ("⤓ 收回", "收回到 VOC 主窗口里")
-        } else {
-            ("⤢ 弹出", "弹出成独立窗口：可以拖到另一个显示器、置顶，主窗口照常聊天")
-        };
-        if ui.button(pop_text).on_hover_text(pop_tip).clicked() {
-            v.out.toggle_pop = true;
-        }
-        if v.popped && ui.checkbox(&mut v.on_top, "置顶").on_hover_text("这个窗口总在最前面（打游戏时也看得到）").changed() {
-            let level = if v.on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
-        }
+                    );
+                    ui.label(RichText::new("共享声音（游戏、视频的声音）").size(12.0).color(th::TEXT_DIM()));
+                    let mut g = m.volume(sid);
+                    if th::vol_slider(ui, &mut g, "", 180.0).on_hover_text(audio_tip).changed() {
+                        m.set_volume(sid, g);
+                    }
+                    // 第 57 项：真的在压峰值时提示（不压就不显示）
+                    if a.limited_recently && g > 1.0 {
+                        ui.label(RichText::new("音量过大：响的地方正在被压低，调到 100% 左右更自然").size(11.5).color(th::YELLOW()));
+                    }
+                    let muted = g < 0.005;
+                    if ui.button(if muted { "恢复共享声音" } else { "共享声音静音" }).clicked() {
+                        m.set_volume(sid, if muted { 1.0 } else { 0.0 });
+                    }
+                })
+                .response
+                .on_hover_text("共享声音音量")
+            })
+            .response
+            .on_disabled_hover_text("对方没有勾选「同时共享电脑声音」");
+        });
     });
+
+    // 共享者开了 120 帧、这台电脑的屏幕显示不了那么多（第 64 项）
+    if let Some(t) = sinfo.map(|i| i.target_fps as u32).filter(|t| *t > 60) {
+        let r = video::max_refresh();
+        if r + 1 < t {
+            ui.label(RichText::new(format!("对方在用 {t} 帧共享（试验），你的屏幕最多显示 {r} 帧")).size(12.0).color(th::TEXT_FAINT()));
+        }
+    }
+    // 共享的是窗口：最小化 / 关掉了（第 60-1 项）
+    match sinfo.map(|i| i.window_state) {
+        Some(1) => {
+            ui.label(RichText::new("共享的窗口被最小化了，对方把它恢复后画面就会回来").size(12.0).color(th::YELLOW()));
+        }
+        Some(2) => {
+            ui.label(RichText::new("共享的窗口已经关了").size(12.0).color(th::YELLOW()));
+        }
+        _ => {}
+    }
+    // 选项冲突时以更保守的一方为准，并说明原因（第 46 / 44 项）
+    if info.p2p_only && voice.video_direct(id).is_none() {
+        let why = if v.route == 2 {
+            "共享者设置了「只走 P2P」，而你选了画面「服务器」：两边都按更保守的来，这样看不了。改选「自动」或「P2P」试试。"
+        } else {
+            "共享者设置了「只走 P2P」（画面不经服务器），你和他之间还没打通直连，也没有别的观看者能转给你。打洞成功后会自动出画面。"
+        };
+        ui.label(RichText::new(why).size(12.0).color(th::YELLOW()));
+    }
     let mut full = false;
     let draw = |ui: &mut egui::Ui, v: &mut crate::app::Viewer, full: &mut bool| match (&v.gpu, &v.tex) {
         (Some(g), _) => {
@@ -3654,3 +3873,9 @@ fn draw_remote_cursor(p: &egui::Painter, img: egui::Rect, view: &crate::video::V
         }
     }
 }
+
+/// 界面缩放的基准窗口大小（第 84 项）：这么大 = 100%
+const BASE_W: f32 = 1180.0;
+const BASE_H: f32 = 760.0;
+/// 按比例要缩到这以下就换迷你模式（用户定 50%）
+const MINI_BELOW: f32 = 0.5;

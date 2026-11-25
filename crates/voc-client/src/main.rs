@@ -79,7 +79,7 @@ fn main() -> eframe::Result {
         .with_title("VOC")
         .with_icon(window_icon())
         .with_inner_size([1180.0, 760.0])
-        .with_min_inner_size([760.0, 480.0]);
+        .with_min_inner_size([220.0, 180.0]);
     // VOC_TEST_OFFSCREEN=1：测试客户端放到屏幕外、不抢焦点（不打扰正在用电脑的人）
     if std::env::var("VOC_SHOT").is_ok() || std::env::var_os("VOC_TEST_OFFSCREEN").is_some() {
         // 截图模式：窗口放到屏幕外、不抢焦点

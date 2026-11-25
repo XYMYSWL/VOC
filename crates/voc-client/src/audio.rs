@@ -977,6 +977,40 @@ pub fn start_streams(
 }
 
 /// small = 先试 10 ms 小缓冲（扛不住时调用方传 false 重开）
+/// 第 81 项：告诉 Windows「VOC 的声音不算通话、不要因此压低别的程序」。
+/// Windows 把用默认通信设备的程序当成在打电话，默认把游戏等其他声音压低 80%（声音设置 → 通信），用户听起来就是游戏突然变小变闷。
+/// 对每个可用的声卡（输入、输出）把本程序的声音会话设成不参与自动压低（IAudioSessionControl2::SetDuckingPreference，微软给通话软件的做法）。
+/// 在打开声卡之前调；单独开一个线程做（COM 用多线程模式，不影响界面线程）
+#[cfg(windows)]
+pub fn opt_out_ducking() {
+    let _ = std::thread::Builder::new()
+        .name("ducking".into())
+        .spawn(|| unsafe {
+            use windows::core::Interface;
+            use windows::Win32::Media::Audio::{eAll, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE};
+            use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else { return };
+            let Ok(list) = en.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) else { return };
+            let mut done = 0;
+            for i in 0..list.GetCount().unwrap_or(0) {
+                let Ok(dev) = list.Item(i) else { continue };
+                let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+                let Ok(c) = mgr.GetAudioSessionControl(None, 0) else { continue };
+                if let Ok(c2) = c.cast::<IAudioSessionControl2>() {
+                    if c2.SetDuckingPreference(true).is_ok() {
+                        done += 1;
+                    }
+                }
+            }
+            crate::applog::log(format!("声音：{done} 个声卡上设了「不触发通话时压低其他声音」"));
+        })
+        .map(|h| h.join());
+}
+
+#[cfg(not(windows))]
+pub fn opt_out_ducking() {}
+
 pub fn start_streams_with(
     input_name: Option<&str>,
     output_name: Option<&str>,
@@ -989,6 +1023,7 @@ pub fn start_streams_with(
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let xruns = Arc::new(AtomicU32::new(0));
     let health = StreamHealth { failed: failed.clone(), xruns: xruns.clone() };
+    opt_out_ducking();
     let (input, input_desc, in_name) = match start_input(input_name, frames_tx, health.clone(), small) {
         Ok((s, d, n)) => (Some(s), d, n),
         Err(e) => {
