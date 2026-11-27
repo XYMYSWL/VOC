@@ -983,9 +983,12 @@ pub fn start_streams(
 /// 在打开声卡之前调；单独开一个线程做（COM 用多线程模式，不影响界面线程）
 #[cfg(windows)]
 pub fn opt_out_ducking() {
+    // 第 89 项：在后台做，最多等 1 秒（某个声卡驱动卡住也不挡着窗口出来）
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let _ = std::thread::Builder::new()
         .name("ducking".into())
-        .spawn(|| unsafe {
+        .spawn(move || unsafe {
+            let _done = done_tx;
             use windows::core::Interface;
             use windows::Win32::Media::Audio::{eAll, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE};
             use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
@@ -1004,8 +1007,10 @@ pub fn opt_out_ducking() {
                 }
             }
             crate::applog::log(format!("声音：{done} 个声卡上设了「不触发通话时压低其他声音」"));
-        })
-        .map(|h| h.join());
+        });
+    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+        crate::applog::log("声音：设「不压低其他声音」超过 1 秒，放到后台继续");
+    }
 }
 
 #[cfg(not(windows))]

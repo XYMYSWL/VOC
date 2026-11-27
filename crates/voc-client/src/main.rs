@@ -75,6 +75,11 @@ pub fn window_icon() -> egui::IconData {
 
 fn main() -> eframe::Result {
     applog::init();
+    applog::install_crash_restart();
+    applog::start_watchdog();
+    if applog::crash_count() > 0 {
+        applog::log(format!("这是崩溃后自动重开的（第 {} 次）", applog::crash_count()));
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("VOC")
         .with_icon(window_icon())
@@ -101,6 +106,15 @@ fn main() -> eframe::Result {
     }
     // 截图指定了窗口大小时不用上次记住的窗口大小
     let persist_window = std::env::var_os("VOC_SHOT_SIZE").is_none();
-    let options = eframe::NativeOptions { viewport, persist_window, ..Default::default() };
+    // 第 88 项：界面用 DX12 画（Windows 自己的图形接口；打游戏把显卡占满、驱动重置时一般比默认挑到的 Vulkan 稳），没有 DX12 时用 OpenGL；
+    // 设了 WGPU_BACKEND 环境变量就照它的
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut wgpu_options.wgpu_setup {
+        if eframe::egui_wgpu::wgpu::Backends::from_env().is_none() {
+            c.instance_descriptor.backends = eframe::egui_wgpu::wgpu::Backends::DX12 | eframe::egui_wgpu::wgpu::Backends::GL;
+        }
+    }
+    let options = eframe::NativeOptions { viewport, persist_window, wgpu_options, ..Default::default() };
+    applog::step("建窗口、初始化显卡");
     eframe::run_native("voc", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
 }

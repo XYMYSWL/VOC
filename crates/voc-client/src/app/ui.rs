@@ -3354,6 +3354,22 @@ impl eframe::App for App {
         self.handle_hotkeys();
         self.sync_user_volumes();
         self.auto_zoom(ui.ctx());
+        if !crate::applog::FIRST_FRAME.swap(true, Ordering::Relaxed) {
+            crate::applog::step("窗口已显示");
+        }
+        // 测试：VOC_TEST_CRASH=秒 → 开了这么久后界面线程故意崩一次（测崩溃后自动重开，第 88 项）
+        if let Some(s) = std::env::var("VOC_TEST_CRASH").ok().and_then(|v| v.parse::<f64>().ok()) {
+            if ui.ctx().input(|i| i.time) > s {
+                panic!("测试：故意崩溃");
+            }
+            ui.ctx().request_repaint();
+        }
+        // 第 87 项保险：窗口是全屏、但没在全屏看共享时，Esc / F11 退出全屏
+        if self.fullscreen.is_none()
+            && ui.ctx().input(|i| i.viewport().fullscreen == Some(true) && (i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::F11)))
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
 
         match &self.screen {
             Screen::Login { error } => {

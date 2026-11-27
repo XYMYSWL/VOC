@@ -109,6 +109,55 @@ pub fn init() {
     log(format!("启动 VOC {}（{}）", env!("CARGO_PKG_VERSION"), if crate::update::is_packaged() { "安装版" } else { "绿色版" }));
 }
 
+/// 启动进行到哪一步（第 89 项：启动卡住时知道卡在哪）；界面画出第一帧以后不再记
+static STEP: Mutex<&str> = Mutex::new("开始");
+pub static FIRST_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 启动的一步（写一行日志，并记下来给「启动卡住」用）
+pub fn step(s: &'static str) {
+    *STEP.lock().unwrap() = s;
+    log(format!("启动：{s}"));
+}
+
+/// 启动 10 秒还没画出窗口：写一行卡在哪一步（第 89 项）
+pub fn start_watchdog() {
+    let _ = std::thread::Builder::new().name("start-watchdog".into()).spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        if !FIRST_FRAME.load(std::sync::atomic::Ordering::Relaxed) {
+            log(format!("启动 10 秒还没显示窗口，卡在：{}", *STEP.lock().unwrap()));
+        }
+    });
+}
+
+/// 第 88 项：界面线程崩溃（例如打游戏时显卡驱动重置）后自动重开 VOC，回到原来的服务器和频道。
+/// 只在主线程崩溃时重开（别的线程出错程序还在跑，不能再开一个）；连续 3 次都是开了不到 10 分钟就崩，就不再重开，免得一直闪
+pub fn install_crash_restart() {
+    let started = std::time::Instant::now();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        prev(info);
+        if std::thread::current().name() != Some("main") || std::env::var_os("VOC_NO_CRASH_RESTART").is_some() {
+            return;
+        }
+        let n = crash_count();
+        let n = if started.elapsed() < std::time::Duration::from_secs(600) { n + 1 } else { 1 };
+        if n > 3 {
+            log("崩溃后不再自动重开（连续 3 次开了不到 10 分钟就崩）");
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        match std::process::Command::new(exe).arg(format!("--after-crash={n}")).spawn() {
+            Ok(_) => log(format!("崩溃后自动重开 VOC（第 {n} 次）")),
+            Err(e) => log(format!("崩溃后重开 VOC 失败：{e}")),
+        }
+    }));
+}
+
+/// 这次是崩溃后第几次自动重开（命令行 --after-crash=N；0 = 不是）
+pub fn crash_count() -> u32 {
+    std::env::args().find_map(|a| a.strip_prefix("--after-crash=").and_then(|n| n.parse().ok())).unwrap_or(0)
+}
+
 /// 记一行（带时间）
 pub fn log(msg: impl AsRef<str>) {
     let Some(path) = PATH.lock().unwrap().clone() else { return };

@@ -828,6 +828,11 @@ impl Viewer {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::setup_fonts(&cc.egui_ctx);
+        // 界面用的是哪块显卡、哪种图形接口（第 88 项：排查打游戏时崩溃）
+        if let Some(rs) = &cc.wgpu_render_state {
+            let i = rs.adapter.get_info();
+            crate::applog::log(format!("界面：{}（{:?}，驱动 {} {}）", i.name, i.backend, i.driver, i.driver_info));
+        }
         crate::nv12view::init(cc);
         crate::theme::apply(&cc.egui_ctx);
         // 测试模式（VOC_AUTOLOGIN）从默认配置开始、每次新身份：不受本机真实设置影响（例如真实配置开着「只走 P2P」），
@@ -1009,8 +1014,14 @@ impl App {
             fs_mouse_at: std::time::Instant::now(),
             last_xruns: 0,
         };
+        crate::applog::step("打开声卡");
         app.restart_audio();
+        crate::applog::step("加载降噪");
         app.apply_denoise();
+        // 第 87 项：VOC 只在全屏看共享时才全屏，不该跨重启保留（上次在全屏看共享时关掉 / 崩溃，窗口设置里存的是全屏，
+        // 打开就全屏、又没有退出全屏的按钮）
+        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        crate::applog::step("托盘图标、开机自启");
         if std::env::var("VOC_DEMO").is_err() {
             let icon = crate::window_icon();
             app.tray = crate::tray::Tray::new(&cc.egui_ctx, icon.rgba, icon.width, icon.height);
@@ -1026,8 +1037,8 @@ impl App {
         }
         if let Ok(kind) = std::env::var("VOC_DEMO") {
             app.load_demo(&kind);
-        } else if at_startup && !app.cfg.server.trim().is_empty() && !app.code_input.trim().is_empty() {
-            // 开机自启：自动登录上次的服务器并回到上次的频道
+        } else if (at_startup || crate::applog::crash_count() > 0) && !app.cfg.server.trim().is_empty() && !app.code_input.trim().is_empty() {
+            // 开机自启、崩溃后自动重开（第 88 项）：自动登录上次的服务器并回到上次的频道
             app.start_connect(&cc.egui_ctx);
             app.rejoin = app.cfg.last_channel.get(app.cfg.server.trim()).copied();
         } else if let Ok(spec) = std::env::var("VOC_AUTOLOGIN") {
